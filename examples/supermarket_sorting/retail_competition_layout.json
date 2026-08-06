@@ -1,0 +1,632 @@
+[
+  {
+    "shelf": "A",
+    "level": "L1",
+    "column": "C1",
+    "aruco_id": 0,
+    "body": "product_001",
+    "object_kind": "sanmingzhi",
+    "gs_ply": "shentoon/sanmingzhi_fit.ply",
+    "world_position": [
+      -1.955,
+      3.243,
+      0.5484
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L1",
+    "column": "C2",
+    "aruco_id": 1,
+    "body": "product_002",
+    "object_kind": "heweidao",
+    "gs_ply": "shentoon/heweidao_fit.ply",
+    "world_position": [
+      -1.735,
+      3.243,
+      0.5515
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L1",
+    "column": "C3",
+    "aruco_id": 2,
+    "body": "product_003",
+    "object_kind": "shupian",
+    "gs_ply": "shentoon/shupian_fit.ply",
+    "world_position": [
+      -1.515,
+      3.243,
+      0.604
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L2",
+    "column": "C1",
+    "aruco_id": 3,
+    "body": "product_004",
+    "object_kind": "zhijin",
+    "gs_ply": "shentoon/zhijin_fit.ply",
+    "world_position": [
+      -1.955,
+      3.243,
+      0.895
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L2",
+    "column": "C2",
+    "aruco_id": 4,
+    "body": "product_005",
+    "object_kind": "maidong",
+    "gs_ply": "shentoon/maidong_fit.ply",
+    "world_position": [
+      -1.735,
+      3.243,
+      0.956
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L2",
+    "column": "C3",
+    "aruco_id": 5,
+    "body": "product_006",
+    "object_kind": "maidong",
+    "gs_ply": "shentoon/maidong_fit.ply",
+    "world_position": [
+      -1.515,
+      3.243,
+      0.956
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L3",
+    "column": "C1",
+    "aruco_id": 6,
+    "body": "product_007",
+    "object_kind": "kouxiangtang",
+    "gs_ply": "shentoon/kouxiangtang_fit.ply",
+    "world_position": [
+      -1.955,
+      3.243,
+      1.229
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L3",
+    "column": "C2",
+    "aruco_id": 7,
+    "body": "product_008",
+    "object_kind": "pingguo",
+    "gs_ply": "shentoon/pingguo_fit.ply",
+    "world_position": [
+      -1.735,
+      3.243,
+      1.224
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L3",
+    "column": "C3",
+    "aruco_id": 8,
+    "body": "product_009",
+    "object_kind": "chengzi",
+    "gs_ply": "shentoon/chengzi_fit.ply",
+    "world_position": [
+      -1.515,
+      3.243,
+      1.226
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L1",
+    "column": "C1",
+    "aruco_id": 9,
+    "body": "product_010",
+    "object_kind": "sanmingzhi",
+    "gs_ply": "shentoon/sanmingzhi_fit.ply",
+    "world_position": [
+      -1.07,
+      3.243,
+      0.5484
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L1",
+    "column": "C2",
+    "aruco_id": 10,
+    "body": "product_011",
+    "object_kind": "heweidao",
+    "gs_ply": "shentoon/heweidao_fit.ply",
+    "world_position": [
+      -0.85,
+      3.243,
+      0.5515
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L1",
+    "column": "C3",
+    "aruco_id": 11,
+    "body": "product_012",
+    "object_kind": "shupian",
+    "gs_ply": "shentoon/shupian_fit.ply",
+    "world_position": [
+      -0.63,
+      3.243,
+      0.604
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L2",
+    "column": "C1",
+    "aruco_id": 12,
+    "body": "product_013",
+    "object_kind": "zhijin",
+    "gs_ply": "shentoon/zhijin_fit.ply",
+    "world_position": [
+      -1.07,
+      3.243,
+      0.895
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L2",
+    "column": "C2",
+    "aruco_id": 13,
+    "body": "product_014",
+    "object_kind": "maidong",
+    "gs_ply": "shentoon/maidong_fit.ply",
+    "world_position": [
+      -0.85,
+      3.243,
+      0.956
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L2",
+    "column": "C3",
+    "aruco_id": 14,
+    "body": "product_015",
+    "object_kind": "kele",
+    "gs_ply": "shentoon/kele_fit.ply",
+    "world_position": [
+      -0.63,
+      3.243,
+      0.9235
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L3",
+    "column": "C1",
+    "aruco_id": 15,
+    "body": "product_016",
+    "object_kind": "kouxiangtang",
+    "gs_ply": "shentoon/kouxiangtang_fit.ply",
+    "world_position": [
+      -1.07,
+      3.243,
+      1.229
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L3",
+    "column": "C2",
+    "aruco_id": 16,
+    "body": "product_017",
+    "object_kind": "pingguo",
+    "gs_ply": "shentoon/pingguo_fit.ply",
+    "world_position": [
+      -0.85,
+      3.243,
+      1.224
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L3",
+    "column": "C3",
+    "aruco_id": 17,
+    "body": "product_018",
+    "object_kind": "chengzi",
+    "gs_ply": "shentoon/chengzi_fit.ply",
+    "world_position": [
+      -0.63,
+      3.243,
+      1.226
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L1",
+    "column": "C1",
+    "aruco_id": 18,
+    "body": "product_019",
+    "object_kind": "sanmingzhi",
+    "gs_ply": "shentoon/sanmingzhi_fit.ply",
+    "world_position": [
+      -0.185,
+      3.243,
+      0.5484
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L1",
+    "column": "C2",
+    "aruco_id": 19,
+    "body": "product_020",
+    "object_kind": "heweidao",
+    "gs_ply": "shentoon/heweidao_fit.ply",
+    "world_position": [
+      0.035,
+      3.243,
+      0.5515
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L1",
+    "column": "C3",
+    "aruco_id": 20,
+    "body": "product_021",
+    "object_kind": "shupian",
+    "gs_ply": "shentoon/shupian_fit.ply",
+    "world_position": [
+      0.255,
+      3.243,
+      0.604
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L2",
+    "column": "C1",
+    "aruco_id": 21,
+    "body": "product_022",
+    "object_kind": "zhijin",
+    "gs_ply": "shentoon/zhijin_fit.ply",
+    "world_position": [
+      -0.185,
+      3.243,
+      0.895
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L2",
+    "column": "C2",
+    "aruco_id": 22,
+    "body": "product_023",
+    "object_kind": "maidong",
+    "gs_ply": "shentoon/maidong_fit.ply",
+    "world_position": [
+      0.035,
+      3.243,
+      0.956
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L2",
+    "column": "C3",
+    "aruco_id": 23,
+    "body": "product_024",
+    "object_kind": "kele",
+    "gs_ply": "shentoon/kele_fit.ply",
+    "world_position": [
+      0.255,
+      3.243,
+      0.9235
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L3",
+    "column": "C1",
+    "aruco_id": 24,
+    "body": "product_025",
+    "object_kind": "kouxiangtang",
+    "gs_ply": "shentoon/kouxiangtang_fit.ply",
+    "world_position": [
+      -0.185,
+      3.243,
+      1.229
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L3",
+    "column": "C2",
+    "aruco_id": 25,
+    "body": "product_026",
+    "object_kind": "pingguo",
+    "gs_ply": "shentoon/pingguo_fit.ply",
+    "world_position": [
+      0.035,
+      3.243,
+      1.224
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L3",
+    "column": "C3",
+    "aruco_id": 26,
+    "body": "product_027",
+    "object_kind": "chengzi",
+    "gs_ply": "shentoon/chengzi_fit.ply",
+    "world_position": [
+      0.255,
+      3.243,
+      1.226
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L1",
+    "column": "C1",
+    "aruco_id": 27,
+    "body": "product_028",
+    "object_kind": "sanmingzhi",
+    "gs_ply": "shentoon/sanmingzhi_fit.ply",
+    "world_position": [
+      0.7,
+      3.243,
+      0.5484
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L1",
+    "column": "C2",
+    "aruco_id": 28,
+    "body": "product_029",
+    "object_kind": "heweidao",
+    "gs_ply": "shentoon/heweidao_fit.ply",
+    "world_position": [
+      0.92,
+      3.243,
+      0.5515
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L1",
+    "column": "C3",
+    "aruco_id": 29,
+    "body": "product_030",
+    "object_kind": "shupian",
+    "gs_ply": "shentoon/shupian_fit.ply",
+    "world_position": [
+      1.14,
+      3.243,
+      0.604
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L2",
+    "column": "C1",
+    "aruco_id": 30,
+    "body": "product_031",
+    "object_kind": "zhijin",
+    "gs_ply": "shentoon/zhijin_fit.ply",
+    "world_position": [
+      0.7,
+      3.243,
+      0.895
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L2",
+    "column": "C2",
+    "aruco_id": 31,
+    "body": "product_032",
+    "object_kind": "kele",
+    "gs_ply": "shentoon/kele_fit.ply",
+    "world_position": [
+      0.92,
+      3.243,
+      0.9235
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L2",
+    "column": "C3",
+    "aruco_id": 32,
+    "body": "product_033",
+    "object_kind": "kele",
+    "gs_ply": "shentoon/kele_fit.ply",
+    "world_position": [
+      1.14,
+      3.243,
+      0.9235
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L3",
+    "column": "C1",
+    "aruco_id": 33,
+    "body": "product_034",
+    "object_kind": "kouxiangtang",
+    "gs_ply": "shentoon/kouxiangtang_fit.ply",
+    "world_position": [
+      0.7,
+      3.243,
+      1.229
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L3",
+    "column": "C2",
+    "aruco_id": 34,
+    "body": "product_035",
+    "object_kind": "pingguo",
+    "gs_ply": "shentoon/pingguo_fit.ply",
+    "world_position": [
+      0.92,
+      3.243,
+      1.224
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L3",
+    "column": "C3",
+    "aruco_id": 35,
+    "body": "product_036",
+    "object_kind": "chengzi",
+    "gs_ply": "shentoon/chengzi_fit.ply",
+    "world_position": [
+      1.14,
+      3.243,
+      1.226
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L1",
+    "column": "C1",
+    "aruco_id": 36,
+    "body": "product_037",
+    "object_kind": "sanmingzhi",
+    "gs_ply": "shentoon/sanmingzhi_fit.ply",
+    "world_position": [
+      1.585,
+      3.243,
+      0.5484
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L1",
+    "column": "C2",
+    "aruco_id": 37,
+    "body": "product_038",
+    "object_kind": "heweidao",
+    "gs_ply": "shentoon/heweidao_fit.ply",
+    "world_position": [
+      1.805,
+      3.243,
+      0.5515
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L1",
+    "column": "C3",
+    "aruco_id": 38,
+    "body": "product_039",
+    "object_kind": "shupian",
+    "gs_ply": "shentoon/shupian_fit.ply",
+    "world_position": [
+      2.025,
+      3.243,
+      0.604
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L2",
+    "column": "C1",
+    "aruco_id": 39,
+    "body": "product_040",
+    "object_kind": "zhijin",
+    "gs_ply": "shentoon/zhijin_fit.ply",
+    "world_position": [
+      1.585,
+      3.243,
+      0.895
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L2",
+    "column": "C2",
+    "aruco_id": 40,
+    "body": "product_041",
+    "object_kind": "maidong",
+    "gs_ply": "shentoon/maidong_fit.ply",
+    "world_position": [
+      1.805,
+      3.243,
+      0.956
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L2",
+    "column": "C3",
+    "aruco_id": 41,
+    "body": "product_042",
+    "object_kind": "kele",
+    "gs_ply": "shentoon/kele_fit.ply",
+    "world_position": [
+      2.025,
+      3.243,
+      0.9235
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L3",
+    "column": "C1",
+    "aruco_id": 42,
+    "body": "product_043",
+    "object_kind": "kouxiangtang",
+    "gs_ply": "shentoon/kouxiangtang_fit.ply",
+    "world_position": [
+      1.585,
+      3.243,
+      1.229
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L3",
+    "column": "C2",
+    "aruco_id": 43,
+    "body": "product_044",
+    "object_kind": "pingguo",
+    "gs_ply": "shentoon/pingguo_fit.ply",
+    "world_position": [
+      1.805,
+      3.243,
+      1.224
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L3",
+    "column": "C3",
+    "aruco_id": 44,
+    "body": "product_045",
+    "object_kind": "chengzi",
+    "gs_ply": "shentoon/chengzi_fit.ply",
+    "world_position": [
+      2.025,
+      3.243,
+      1.226
+    ]
+  }
+]

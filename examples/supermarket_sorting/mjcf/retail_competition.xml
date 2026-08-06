@@ -1,0 +1,568 @@
+<mujoco model="retail_competition_scene">
+  <include file="__REPO_ROOT__/models/mjcf/mobile_chassis/mmk2/mmk2_options.xml"/>
+  <include file="__REPO_ROOT__/models/mjcf/mobile_chassis/mmk2/mmk2_dependencies.xml"/>
+
+  <visual>
+    <global offwidth="1920" offheight="1080"/>
+    <quality shadowsize="4096" offsamples="4"/>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <scale com="0.05" camera="0.08" framelength="0.5" framewidth="0.02" forcewidth="0.1" contactwidth="0.01" contactheight="0.05"/>
+  </visual>
+
+  <compiler angle="radian" meshdir="__REPO_ROOT__/models/meshes" texturedir="__REPO_ROOT__/models/textures/"/>
+
+  <asset>
+    <texture type="2d" name="warehouse_floor_tex" builtin="checker" mark="edge" rgb1="0.78 0.80 0.78" rgb2="0.62 0.65 0.63" markrgb="0.2 0.2 0.2" width="500" height="500"/>
+    <material name="warehouse_floor" texture="warehouse_floor_tex" texuniform="true" texrepeat="8 12" reflectance="0.1"/>
+    <material name="zone_yellow" rgba="0.95 0.75 0.1 0.35"/>
+    <material name="boundary_red" rgba="0.85 0.2 0.2 0.55"/>
+    <material name="wall_mat" rgba="0.88 0.88 0.84 1"/>
+    <material name="shelf_frame" rgba="0.18 0.2 0.22 1"/>
+    <material name="shelf_board" rgba="0.72 0.72 0.68 1"/>
+    <material name="obstacle_mat" rgba="0.55 0.34 0.16 1"/>
+    <material name="platform_mat" rgba="0.25 0.25 0.28 1"/>
+    <texture type="2d" name="retail_aruco_4x4_id_00_tex" file="aruco/retail_aruco_4x4_id_00.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_01_tex" file="aruco/retail_aruco_4x4_id_01.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_02_tex" file="aruco/retail_aruco_4x4_id_02.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_03_tex" file="aruco/retail_aruco_4x4_id_03.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_04_tex" file="aruco/retail_aruco_4x4_id_04.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_05_tex" file="aruco/retail_aruco_4x4_id_05.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_06_tex" file="aruco/retail_aruco_4x4_id_06.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_07_tex" file="aruco/retail_aruco_4x4_id_07.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_08_tex" file="aruco/retail_aruco_4x4_id_08.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_09_tex" file="aruco/retail_aruco_4x4_id_09.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_10_tex" file="aruco/retail_aruco_4x4_id_10.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_11_tex" file="aruco/retail_aruco_4x4_id_11.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_12_tex" file="aruco/retail_aruco_4x4_id_12.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_13_tex" file="aruco/retail_aruco_4x4_id_13.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_14_tex" file="aruco/retail_aruco_4x4_id_14.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_15_tex" file="aruco/retail_aruco_4x4_id_15.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_16_tex" file="aruco/retail_aruco_4x4_id_16.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_17_tex" file="aruco/retail_aruco_4x4_id_17.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_18_tex" file="aruco/retail_aruco_4x4_id_18.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_19_tex" file="aruco/retail_aruco_4x4_id_19.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_20_tex" file="aruco/retail_aruco_4x4_id_20.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_21_tex" file="aruco/retail_aruco_4x4_id_21.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_22_tex" file="aruco/retail_aruco_4x4_id_22.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_23_tex" file="aruco/retail_aruco_4x4_id_23.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_24_tex" file="aruco/retail_aruco_4x4_id_24.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_25_tex" file="aruco/retail_aruco_4x4_id_25.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_26_tex" file="aruco/retail_aruco_4x4_id_26.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_27_tex" file="aruco/retail_aruco_4x4_id_27.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_28_tex" file="aruco/retail_aruco_4x4_id_28.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_29_tex" file="aruco/retail_aruco_4x4_id_29.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_30_tex" file="aruco/retail_aruco_4x4_id_30.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_31_tex" file="aruco/retail_aruco_4x4_id_31.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_32_tex" file="aruco/retail_aruco_4x4_id_32.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_33_tex" file="aruco/retail_aruco_4x4_id_33.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_34_tex" file="aruco/retail_aruco_4x4_id_34.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_35_tex" file="aruco/retail_aruco_4x4_id_35.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_36_tex" file="aruco/retail_aruco_4x4_id_36.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_37_tex" file="aruco/retail_aruco_4x4_id_37.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_38_tex" file="aruco/retail_aruco_4x4_id_38.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_39_tex" file="aruco/retail_aruco_4x4_id_39.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_40_tex" file="aruco/retail_aruco_4x4_id_40.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_41_tex" file="aruco/retail_aruco_4x4_id_41.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_42_tex" file="aruco/retail_aruco_4x4_id_42.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_43_tex" file="aruco/retail_aruco_4x4_id_43.png"/>
+    <texture type="2d" name="retail_aruco_4x4_id_44_tex" file="aruco/retail_aruco_4x4_id_44.png"/>
+    <mesh name="aruco_marker_3cm_mesh"
+          inertia="shell"
+          vertex="-0.015 -0.015 0  0.015 -0.015 0  0.015 0.015 0  -0.015 0.015 0"
+          texcoord="0 0  1 0  1 1  0 1"
+          face="0 1 2  0 2 3"/>
+    <material name="retail_aruco_4x4_id_00" texture="retail_aruco_4x4_id_00_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_01" texture="retail_aruco_4x4_id_01_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_02" texture="retail_aruco_4x4_id_02_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_03" texture="retail_aruco_4x4_id_03_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_04" texture="retail_aruco_4x4_id_04_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_05" texture="retail_aruco_4x4_id_05_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_06" texture="retail_aruco_4x4_id_06_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_07" texture="retail_aruco_4x4_id_07_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_08" texture="retail_aruco_4x4_id_08_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_09" texture="retail_aruco_4x4_id_09_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_10" texture="retail_aruco_4x4_id_10_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_11" texture="retail_aruco_4x4_id_11_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_12" texture="retail_aruco_4x4_id_12_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_13" texture="retail_aruco_4x4_id_13_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_14" texture="retail_aruco_4x4_id_14_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_15" texture="retail_aruco_4x4_id_15_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_16" texture="retail_aruco_4x4_id_16_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_17" texture="retail_aruco_4x4_id_17_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_18" texture="retail_aruco_4x4_id_18_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_19" texture="retail_aruco_4x4_id_19_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_20" texture="retail_aruco_4x4_id_20_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_21" texture="retail_aruco_4x4_id_21_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_22" texture="retail_aruco_4x4_id_22_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_23" texture="retail_aruco_4x4_id_23_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_24" texture="retail_aruco_4x4_id_24_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_25" texture="retail_aruco_4x4_id_25_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_26" texture="retail_aruco_4x4_id_26_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_27" texture="retail_aruco_4x4_id_27_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_28" texture="retail_aruco_4x4_id_28_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_29" texture="retail_aruco_4x4_id_29_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_30" texture="retail_aruco_4x4_id_30_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_31" texture="retail_aruco_4x4_id_31_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_32" texture="retail_aruco_4x4_id_32_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_33" texture="retail_aruco_4x4_id_33_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_34" texture="retail_aruco_4x4_id_34_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_35" texture="retail_aruco_4x4_id_35_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_36" texture="retail_aruco_4x4_id_36_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_37" texture="retail_aruco_4x4_id_37_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_38" texture="retail_aruco_4x4_id_38_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_39" texture="retail_aruco_4x4_id_39_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_40" texture="retail_aruco_4x4_id_40_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_41" texture="retail_aruco_4x4_id_41_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_42" texture="retail_aruco_4x4_id_42_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_43" texture="retail_aruco_4x4_id_43_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <material name="retail_aruco_4x4_id_44" texture="retail_aruco_4x4_id_44_tex" texuniform="true" texrepeat="1 1" rgba="1 1 1 1"/>
+    <mesh name="sanmingzhi_mesh" vertex="-0.0325 -0.0500 -0.0494 -0.0325 0.0500 -0.0494 -0.0325 0.0345 0.0494 0.0325 -0.0500 -0.0494 0.0325 0.0500 -0.0494 0.0325 0.0345 0.0494"/>
+    <mesh name="heweidao_mesh" vertex="0.03250 0.00000 -0.05250 0.03003 0.01244 -0.05250 0.02298 0.02298 -0.05250 0.01244 0.03003 -0.05250 0.00000 0.03250 -0.05250 -0.01244 0.03003 -0.05250 -0.02298 0.02298 -0.05250 -0.03003 0.01244 -0.05250 -0.03250 0.00000 -0.05250 -0.03003 -0.01244 -0.05250 -0.02298 -0.02298 -0.05250 -0.01244 -0.03003 -0.05250 -0.00000 -0.03250 -0.05250 0.01244 -0.03003 -0.05250 0.02298 -0.02298 -0.05250 0.03003 -0.01244 -0.05250 0.04750 0.00000 0.05250 0.04388 0.01818 0.05250 0.03359 0.03359 0.05250 0.01818 0.04388 0.05250 0.00000 0.04750 0.05250 -0.01818 0.04388 0.05250 -0.03359 0.03359 0.05250 -0.04388 0.01818 0.05250 -0.04750 0.00000 0.05250 -0.04388 -0.01818 0.05250 -0.03359 -0.03359 0.05250 -0.01818 -0.04388 0.05250 -0.00000 -0.04750 0.05250 0.01818 -0.04388 0.05250 0.03359 -0.03359 0.05250 0.04388 -0.01818 0.05250"/>
+  </asset>
+
+  <default>
+    <default class="static_box">
+      <geom type="box" contype="1" conaffinity="1" condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001"/>
+    </default>
+    <default class="visual_zone">
+      <geom type="box" contype="0" conaffinity="0" group="2"/>
+    </default>
+    <default class="aruco_tile">
+      <geom contype="0" conaffinity="0" group="2" euler="1.5708 0 0"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light castshadow="false" directional="true" diffuse="0.35 0.35 0.35" specular="0.25 0.25 0.25" pos="-3 -4 5" dir="1 1 -1"/>
+    <light castshadow="false" directional="true" diffuse="0.35 0.35 0.35" specular="0.25 0.25 0.25" pos="4 3 5" dir="-1 -1 -1"/>
+    <light castshadow="false" directional="true" diffuse="0.25 0.25 0.25" specular="0.2 0.2 0.2" pos="0 0 5" dir="0 0 -1"/>
+
+    <geom name="floor" type="plane" size="2.5 3.75 0.01" material="warehouse_floor" pos="0 0 0"/>
+
+    <body name="competition_boundary_stickers">
+      <geom class="visual_zone" name="boundary_north" size="2.5 0.05 0.00025" pos="0 3.7 0.00025" material="boundary_red"/>
+      <geom class="visual_zone" name="boundary_south" size="2.5 0.05 0.00025" pos="0 -3.7 0.00025" material="boundary_red"/>
+      <geom class="visual_zone" name="boundary_west" size="0.05 3.75 0.00025" pos="-2.45 0 0.00025" material="boundary_red"/>
+      <geom class="visual_zone" name="boundary_east" size="0.05 3.75 0.00025" pos="2.45 0 0.00025" material="boundary_red"/>
+    </body>
+    <body name="perimeter_walls">
+      <geom class="static_box" name="north_wall" size="2.5 0.03 0.75" pos="0 3.75 0.75" material="wall_mat"/>
+      <geom class="static_box" name="south_wall" size="2.5 0.03 0.75" pos="0 -3.75 0.75" material="wall_mat"/>
+      <geom class="static_box" name="west_wall" size="0.03 3.75 0.75" pos="-2.5 0 0.75" material="wall_mat"/>
+      <geom class="static_box" name="east_wall" size="0.03 3.75 0.75" pos="2.5 0 0.75" material="wall_mat"/>
+    </body>
+    <body name="start_zone" pos="1.92 -3.17 0">
+      <geom class="visual_zone" name="start_zone_north_mark" size="0.5 0.05 0.00025" pos="0 0.5 0.00025" material="zone_yellow"/>
+      <geom class="visual_zone" name="start_zone_west_mark" size="0.05 0.5 0.00025" pos="-0.5 0 0.00025" material="zone_yellow"/>
+    </body>
+    <body name="mmk2" pos="1.92 -3.17 0" euler="0 0 1.5708">
+      <joint type="free" frictionloss="0.0001"/>
+      <include file="__REPO_ROOT__/models/mjcf/mobile_chassis/mmk2/mmk2.xml"/>
+    </body>
+    <body name="picking_zone" pos="0 2.475 0">
+      <geom class="visual_zone" name="picking_zone_north_mark" size="2.5 0.05 0.00025" pos="0 0.775 0.00025" material="zone_yellow"/>
+      <geom class="visual_zone" name="picking_zone_south_mark" size="2.5 0.05 0.00025" pos="0 -0.775 0.00025" material="zone_yellow"/>
+    </body>
+    <body name="delivery_zone" pos="-1.940 -3.410 0">
+      <geom class="visual_zone" name="delivery_zone_north_mark" size="0.48 0.05 0.00025" pos="0 0.22 0.00025" material="zone_yellow"/>
+      <geom class="visual_zone" name="delivery_zone_east_mark" size="0.05 0.22 0.00025" pos="0.48 0 0.00025" material="zone_yellow"/>
+    </body>
+    <body name="delivery_table" pos="-1.940 -3.410 0">
+      <geom class="static_box" name="delivery_table_top" size="0.48 0.22 0.025" pos="0 0 0.742" material="platform_mat" priority="1" condim="3" solref="0.04 1.5" solimp="0.6 0.9 0.01"/>
+      <geom class="static_box" name="delivery_table_leg_1" size="0.025 0.025 0.3585" pos="-0.43 -0.17 0.3585" material="platform_mat"/>
+      <geom class="static_box" name="delivery_table_leg_2" size="0.025 0.025 0.3585" pos="0.43 -0.17 0.3585" material="platform_mat"/>
+      <geom class="static_box" name="delivery_table_leg_3" size="0.025 0.025 0.3585" pos="-0.43 0.17 0.3585" material="platform_mat"/>
+      <geom class="static_box" name="delivery_table_leg_4" size="0.025 0.025 0.3585" pos="0.43 0.17 0.3585" material="platform_mat"/>
+      <site name="delivery_target" pos="0 0 0.807" size="0.04" rgba="0.8 0 0 1" type="sphere"/>
+    </body>
+    <body name="dynamic_obstacle_corridor" pos="-0.96 -1.01 0">
+      <body name="dynamic_obstacle_zone" pos="0 0 0">
+        <geom class="visual_zone" name="dynamic_obstacle_zone_north_mark" size="1.46 0.05 0.00025" pos="0 2.71 0.00025" material="zone_yellow"/>
+        <geom class="visual_zone" name="dynamic_obstacle_zone_east_mark" size="0.05 2.71 0.00025" pos="1.46 0 0.00025" material="zone_yellow"/>
+      </body>
+      <geom class="static_box" name="corridor_right_board" size="0.03 2.71 0.75" pos="1.49 0 0.75" material="wall_mat"/>
+      <body name="dynamic_obstacle_box_01" pos="0.622 -0.859 0.25">
+        <geom class="static_box" name="dynamic_obstacle_box_01_collision" size="0.3 0.2 0.25" euler="0 0 0" material="obstacle_mat"/>
+      </body>
+      <body name="dynamic_obstacle_box_02" pos="0.950 1.840 0.25">
+        <geom class="static_box" name="dynamic_obstacle_box_02_collision" size="0.3 0.2 0.25" euler="0 0 1.5708" material="obstacle_mat"/>
+      </body>
+      <body name="dynamic_obstacle_box_03" pos="-1.050 -0.104 0.25">
+        <geom class="static_box" name="dynamic_obstacle_box_03_collision" size="0.3 0.2 0.25" euler="0 0 0" material="obstacle_mat"/>
+      </body>
+      <body name="dynamic_obstacle_box_04" pos="-1.162 2.425 0.25">
+        <geom class="static_box" name="dynamic_obstacle_box_04_collision" size="0.3 0.2 0.25" euler="0 0 1.5708" material="obstacle_mat"/>
+      </body>
+      <body name="dynamic_obstacle_box_05" pos="-0.110 0.813 0.25">
+        <geom class="static_box" name="dynamic_obstacle_box_05_collision" size="0.3 0.2 0.25" euler="0 0 0" material="obstacle_mat"/>
+      </body>
+    </body>
+    <body name="shelf_A" pos="-1.735 3.323 0">
+      <geom class="static_box" name="shelf_A_left_front_post" size="0.02 0.02 0.65" pos="-0.430 -0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_A_right_front_post" size="0.02 0.02 0.65" pos="0.430 -0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_A_left_back_post" size="0.02 0.02 0.65" pos="-0.430 0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_A_right_back_post" size="0.02 0.02 0.65" pos="0.430 0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_A_board_L1" size="0.430 0.150 0.01" pos="0 0 0.489" material="shelf_board"/>
+      <geom class="static_box" name="shelf_A_board_L2" size="0.430 0.150 0.01" pos="0 0 0.841" material="shelf_board"/>
+      <geom class="static_box" name="shelf_A_board_L3" size="0.430 0.150 0.01" pos="0 0 1.179" material="shelf_board"/>
+      <body name="aruco_A_L1_C1" pos="-0.220 -0.155 0.500">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_A_L1_C1_marker" material="retail_aruco_4x4_id_00"/>
+      </body>
+      <body name="aruco_A_L1_C2" pos="0.000 -0.155 0.500">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_A_L1_C2_marker" material="retail_aruco_4x4_id_01"/>
+      </body>
+      <body name="aruco_A_L1_C3" pos="0.220 -0.155 0.500">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_A_L1_C3_marker" material="retail_aruco_4x4_id_02"/>
+      </body>
+      <body name="aruco_A_L2_C1" pos="-0.220 -0.155 0.852">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_A_L2_C1_marker" material="retail_aruco_4x4_id_03"/>
+      </body>
+      <body name="aruco_A_L2_C2" pos="0.000 -0.155 0.852">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_A_L2_C2_marker" material="retail_aruco_4x4_id_04"/>
+      </body>
+      <body name="aruco_A_L2_C3" pos="0.220 -0.155 0.852">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_A_L2_C3_marker" material="retail_aruco_4x4_id_05"/>
+      </body>
+      <body name="aruco_A_L3_C1" pos="-0.220 -0.155 1.190">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_A_L3_C1_marker" material="retail_aruco_4x4_id_06"/>
+      </body>
+      <body name="aruco_A_L3_C2" pos="0.000 -0.155 1.190">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_A_L3_C2_marker" material="retail_aruco_4x4_id_07"/>
+      </body>
+      <body name="aruco_A_L3_C3" pos="0.220 -0.155 1.190">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_A_L3_C3_marker" material="retail_aruco_4x4_id_08"/>
+      </body>
+    </body>
+    <body name="shelf_B" pos="-0.850 3.323 0">
+      <geom class="static_box" name="shelf_B_left_front_post" size="0.02 0.02 0.65" pos="-0.430 -0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_B_right_front_post" size="0.02 0.02 0.65" pos="0.430 -0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_B_left_back_post" size="0.02 0.02 0.65" pos="-0.430 0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_B_right_back_post" size="0.02 0.02 0.65" pos="0.430 0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_B_board_L1" size="0.430 0.150 0.01" pos="0 0 0.489" material="shelf_board"/>
+      <geom class="static_box" name="shelf_B_board_L2" size="0.430 0.150 0.01" pos="0 0 0.841" material="shelf_board"/>
+      <geom class="static_box" name="shelf_B_board_L3" size="0.430 0.150 0.01" pos="0 0 1.179" material="shelf_board"/>
+      <body name="aruco_B_L1_C1" pos="-0.220 -0.155 0.500">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_B_L1_C1_marker" material="retail_aruco_4x4_id_09"/>
+      </body>
+      <body name="aruco_B_L1_C2" pos="0.000 -0.155 0.500">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_B_L1_C2_marker" material="retail_aruco_4x4_id_10"/>
+      </body>
+      <body name="aruco_B_L1_C3" pos="0.220 -0.155 0.500">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_B_L1_C3_marker" material="retail_aruco_4x4_id_11"/>
+      </body>
+      <body name="aruco_B_L2_C1" pos="-0.220 -0.155 0.852">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_B_L2_C1_marker" material="retail_aruco_4x4_id_12"/>
+      </body>
+      <body name="aruco_B_L2_C2" pos="0.000 -0.155 0.852">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_B_L2_C2_marker" material="retail_aruco_4x4_id_13"/>
+      </body>
+      <body name="aruco_B_L2_C3" pos="0.220 -0.155 0.852">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_B_L2_C3_marker" material="retail_aruco_4x4_id_14"/>
+      </body>
+      <body name="aruco_B_L3_C1" pos="-0.220 -0.155 1.190">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_B_L3_C1_marker" material="retail_aruco_4x4_id_15"/>
+      </body>
+      <body name="aruco_B_L3_C2" pos="0.000 -0.155 1.190">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_B_L3_C2_marker" material="retail_aruco_4x4_id_16"/>
+      </body>
+      <body name="aruco_B_L3_C3" pos="0.220 -0.155 1.190">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_B_L3_C3_marker" material="retail_aruco_4x4_id_17"/>
+      </body>
+    </body>
+    <body name="shelf_C" pos="0.035 3.323 0">
+      <geom class="static_box" name="shelf_C_left_front_post" size="0.02 0.02 0.65" pos="-0.430 -0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_C_right_front_post" size="0.02 0.02 0.65" pos="0.430 -0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_C_left_back_post" size="0.02 0.02 0.65" pos="-0.430 0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_C_right_back_post" size="0.02 0.02 0.65" pos="0.430 0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_C_board_L1" size="0.430 0.150 0.01" pos="0 0 0.489" material="shelf_board"/>
+      <geom class="static_box" name="shelf_C_board_L2" size="0.430 0.150 0.01" pos="0 0 0.841" material="shelf_board"/>
+      <geom class="static_box" name="shelf_C_board_L3" size="0.430 0.150 0.01" pos="0 0 1.179" material="shelf_board"/>
+      <body name="aruco_C_L1_C1" pos="-0.220 -0.155 0.500">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_C_L1_C1_marker" material="retail_aruco_4x4_id_18"/>
+      </body>
+      <body name="aruco_C_L1_C2" pos="0.000 -0.155 0.500">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_C_L1_C2_marker" material="retail_aruco_4x4_id_19"/>
+      </body>
+      <body name="aruco_C_L1_C3" pos="0.220 -0.155 0.500">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_C_L1_C3_marker" material="retail_aruco_4x4_id_20"/>
+      </body>
+      <body name="aruco_C_L2_C1" pos="-0.220 -0.155 0.852">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_C_L2_C1_marker" material="retail_aruco_4x4_id_21"/>
+      </body>
+      <body name="aruco_C_L2_C2" pos="0.000 -0.155 0.852">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_C_L2_C2_marker" material="retail_aruco_4x4_id_22"/>
+      </body>
+      <body name="aruco_C_L2_C3" pos="0.220 -0.155 0.852">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_C_L2_C3_marker" material="retail_aruco_4x4_id_23"/>
+      </body>
+      <body name="aruco_C_L3_C1" pos="-0.220 -0.155 1.190">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_C_L3_C1_marker" material="retail_aruco_4x4_id_24"/>
+      </body>
+      <body name="aruco_C_L3_C2" pos="0.000 -0.155 1.190">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_C_L3_C2_marker" material="retail_aruco_4x4_id_25"/>
+      </body>
+      <body name="aruco_C_L3_C3" pos="0.220 -0.155 1.190">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_C_L3_C3_marker" material="retail_aruco_4x4_id_26"/>
+      </body>
+    </body>
+    <body name="shelf_D" pos="0.920 3.323 0">
+      <geom class="static_box" name="shelf_D_left_front_post" size="0.02 0.02 0.65" pos="-0.430 -0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_D_right_front_post" size="0.02 0.02 0.65" pos="0.430 -0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_D_left_back_post" size="0.02 0.02 0.65" pos="-0.430 0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_D_right_back_post" size="0.02 0.02 0.65" pos="0.430 0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_D_board_L1" size="0.430 0.150 0.01" pos="0 0 0.489" material="shelf_board"/>
+      <geom class="static_box" name="shelf_D_board_L2" size="0.430 0.150 0.01" pos="0 0 0.841" material="shelf_board"/>
+      <geom class="static_box" name="shelf_D_board_L3" size="0.430 0.150 0.01" pos="0 0 1.179" material="shelf_board"/>
+      <body name="aruco_D_L1_C1" pos="-0.220 -0.155 0.500">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_D_L1_C1_marker" material="retail_aruco_4x4_id_27"/>
+      </body>
+      <body name="aruco_D_L1_C2" pos="0.000 -0.155 0.500">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_D_L1_C2_marker" material="retail_aruco_4x4_id_28"/>
+      </body>
+      <body name="aruco_D_L1_C3" pos="0.220 -0.155 0.500">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_D_L1_C3_marker" material="retail_aruco_4x4_id_29"/>
+      </body>
+      <body name="aruco_D_L2_C1" pos="-0.220 -0.155 0.852">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_D_L2_C1_marker" material="retail_aruco_4x4_id_30"/>
+      </body>
+      <body name="aruco_D_L2_C2" pos="0.000 -0.155 0.852">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_D_L2_C2_marker" material="retail_aruco_4x4_id_31"/>
+      </body>
+      <body name="aruco_D_L2_C3" pos="0.220 -0.155 0.852">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_D_L2_C3_marker" material="retail_aruco_4x4_id_32"/>
+      </body>
+      <body name="aruco_D_L3_C1" pos="-0.220 -0.155 1.190">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_D_L3_C1_marker" material="retail_aruco_4x4_id_33"/>
+      </body>
+      <body name="aruco_D_L3_C2" pos="0.000 -0.155 1.190">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_D_L3_C2_marker" material="retail_aruco_4x4_id_34"/>
+      </body>
+      <body name="aruco_D_L3_C3" pos="0.220 -0.155 1.190">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_D_L3_C3_marker" material="retail_aruco_4x4_id_35"/>
+      </body>
+    </body>
+    <body name="shelf_E" pos="1.805 3.323 0">
+      <geom class="static_box" name="shelf_E_left_front_post" size="0.02 0.02 0.65" pos="-0.430 -0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_E_right_front_post" size="0.02 0.02 0.65" pos="0.430 -0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_E_left_back_post" size="0.02 0.02 0.65" pos="-0.430 0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_E_right_back_post" size="0.02 0.02 0.65" pos="0.430 0.150 0.650" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_E_board_L1" size="0.430 0.150 0.01" pos="0 0 0.489" material="shelf_board"/>
+      <geom class="static_box" name="shelf_E_board_L2" size="0.430 0.150 0.01" pos="0 0 0.841" material="shelf_board"/>
+      <geom class="static_box" name="shelf_E_board_L3" size="0.430 0.150 0.01" pos="0 0 1.179" material="shelf_board"/>
+      <body name="aruco_E_L1_C1" pos="-0.220 -0.155 0.500">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_E_L1_C1_marker" material="retail_aruco_4x4_id_36"/>
+      </body>
+      <body name="aruco_E_L1_C2" pos="0.000 -0.155 0.500">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_E_L1_C2_marker" material="retail_aruco_4x4_id_37"/>
+      </body>
+      <body name="aruco_E_L1_C3" pos="0.220 -0.155 0.500">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_E_L1_C3_marker" material="retail_aruco_4x4_id_38"/>
+      </body>
+      <body name="aruco_E_L2_C1" pos="-0.220 -0.155 0.852">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_E_L2_C1_marker" material="retail_aruco_4x4_id_39"/>
+      </body>
+      <body name="aruco_E_L2_C2" pos="0.000 -0.155 0.852">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_E_L2_C2_marker" material="retail_aruco_4x4_id_40"/>
+      </body>
+      <body name="aruco_E_L2_C3" pos="0.220 -0.155 0.852">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_E_L2_C3_marker" material="retail_aruco_4x4_id_41"/>
+      </body>
+      <body name="aruco_E_L3_C1" pos="-0.220 -0.155 1.190">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_E_L3_C1_marker" material="retail_aruco_4x4_id_42"/>
+      </body>
+      <body name="aruco_E_L3_C2" pos="0.000 -0.155 1.190">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_E_L3_C2_marker" material="retail_aruco_4x4_id_43"/>
+      </body>
+      <body name="aruco_E_L3_C3" pos="0.220 -0.155 1.190">
+        <geom class="aruco_tile" type="mesh" mesh="aruco_marker_3cm_mesh" name="aruco_E_L3_C3_marker" material="retail_aruco_4x4_id_44"/>
+      </body>
+    </body>
+    <body name="product_001" pos="-1.95500 3.24300 0.54840" euler="0 0 0">
+      <joint name="product_001_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_001_collision" type="mesh" mesh="sanmingzhi_mesh" mass="0.1220" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_002" pos="-1.73500 3.24300 0.55150" euler="0 0 0">
+      <joint name="product_002_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_002_collision" type="mesh" mesh="heweidao_mesh" mass="0.0990" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_003" pos="-1.51500 3.24300 0.60400" euler="0 0 0">
+      <joint name="product_003_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_003_collision" type="cylinder" size="0.0325 0.1050" mass="0.1370" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_004" pos="-1.95500 3.24300 0.89500" euler="0 0 0">
+      <joint name="product_004_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_004_collision" type="box" size="0.0860 0.0425 0.0440" mass="0.1300" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_005" pos="-1.73500 3.24300 0.95600" euler="0 0 0">
+      <joint name="product_005_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_005_collision" type="cylinder" size="0.0325 0.1050" mass="0.6430" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_006" pos="-1.51500 3.24300 0.95600" euler="0 0 0">
+      <joint name="product_006_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_006_collision" type="cylinder" size="0.0325 0.1050" mass="0.6430" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_007" pos="-1.95500 3.24300 1.22900" euler="0 0 0">
+      <joint name="product_007_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_007_collision" type="cylinder" size="0.0245 0.0400" mass="0.0733" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_008" pos="-1.73500 3.24300 1.22400" euler="0 0 0">
+      <joint name="product_008_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_008_collision" type="sphere" size="0.0350" mass="0.2510" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_009" pos="-1.51500 3.24300 1.22600" euler="0 0 0">
+      <joint name="product_009_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_009_collision" type="sphere" size="0.0370" mass="0.2530" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_010" pos="-1.07000 3.24300 0.54840" euler="0 0 0">
+      <joint name="product_010_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_010_collision" type="mesh" mesh="sanmingzhi_mesh" mass="0.1220" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_011" pos="-0.85000 3.24300 0.55150" euler="0 0 0">
+      <joint name="product_011_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_011_collision" type="mesh" mesh="heweidao_mesh" mass="0.0990" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_012" pos="-0.63000 3.24300 0.60400" euler="0 0 0">
+      <joint name="product_012_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_012_collision" type="cylinder" size="0.0325 0.1050" mass="0.1370" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_013" pos="-1.07000 3.24300 0.89500" euler="0 0 0">
+      <joint name="product_013_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_013_collision" type="box" size="0.0860 0.0425 0.0440" mass="0.1300" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_014" pos="-0.85000 3.24300 0.95600" euler="0 0 0">
+      <joint name="product_014_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_014_collision" type="cylinder" size="0.0325 0.1050" mass="0.6430" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_015" pos="-0.63000 3.24300 0.92350" euler="0 0 0">
+      <joint name="product_015_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_015_collision" type="cylinder" size="0.0265 0.0725" mass="0.3570" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_016" pos="-1.07000 3.24300 1.22900" euler="0 0 0">
+      <joint name="product_016_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_016_collision" type="cylinder" size="0.0245 0.0400" mass="0.0733" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_017" pos="-0.85000 3.24300 1.22400" euler="0 0 0">
+      <joint name="product_017_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_017_collision" type="sphere" size="0.0350" mass="0.2510" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_018" pos="-0.63000 3.24300 1.22600" euler="0 0 0">
+      <joint name="product_018_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_018_collision" type="sphere" size="0.0370" mass="0.2530" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_019" pos="-0.18500 3.24300 0.54840" euler="0 0 0">
+      <joint name="product_019_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_019_collision" type="mesh" mesh="sanmingzhi_mesh" mass="0.1220" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_020" pos="0.03500 3.24300 0.55150" euler="0 0 0">
+      <joint name="product_020_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_020_collision" type="mesh" mesh="heweidao_mesh" mass="0.0990" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_021" pos="0.25500 3.24300 0.60400" euler="0 0 0">
+      <joint name="product_021_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_021_collision" type="cylinder" size="0.0325 0.1050" mass="0.1370" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_022" pos="-0.18500 3.24300 0.89500" euler="0 0 0">
+      <joint name="product_022_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_022_collision" type="box" size="0.0860 0.0425 0.0440" mass="0.1300" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_023" pos="0.03500 3.24300 0.95600" euler="0 0 0">
+      <joint name="product_023_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_023_collision" type="cylinder" size="0.0325 0.1050" mass="0.6430" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_024" pos="0.25500 3.24300 0.92350" euler="0 0 0">
+      <joint name="product_024_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_024_collision" type="cylinder" size="0.0265 0.0725" mass="0.3570" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_025" pos="-0.18500 3.24300 1.22900" euler="0 0 0">
+      <joint name="product_025_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_025_collision" type="cylinder" size="0.0245 0.0400" mass="0.0733" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_026" pos="0.03500 3.24300 1.22400" euler="0 0 0">
+      <joint name="product_026_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_026_collision" type="sphere" size="0.0350" mass="0.2510" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_027" pos="0.25500 3.24300 1.22600" euler="0 0 0">
+      <joint name="product_027_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_027_collision" type="sphere" size="0.0370" mass="0.2530" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_028" pos="0.70000 3.24300 0.54840" euler="0 0 0">
+      <joint name="product_028_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_028_collision" type="mesh" mesh="sanmingzhi_mesh" mass="0.1220" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_029" pos="0.92000 3.24300 0.55150" euler="0 0 0">
+      <joint name="product_029_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_029_collision" type="mesh" mesh="heweidao_mesh" mass="0.0990" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_030" pos="1.14000 3.24300 0.60400" euler="0 0 0">
+      <joint name="product_030_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_030_collision" type="cylinder" size="0.0325 0.1050" mass="0.1370" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_031" pos="0.70000 3.24300 0.89500" euler="0 0 0">
+      <joint name="product_031_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_031_collision" type="box" size="0.0860 0.0425 0.0440" mass="0.1300" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_032" pos="0.92000 3.24300 0.92350" euler="0 0 0">
+      <joint name="product_032_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_032_collision" type="cylinder" size="0.0265 0.0725" mass="0.3570" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_033" pos="1.14000 3.24300 0.92350" euler="0 0 0">
+      <joint name="product_033_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_033_collision" type="cylinder" size="0.0265 0.0725" mass="0.3570" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_034" pos="0.70000 3.24300 1.22900" euler="0 0 0">
+      <joint name="product_034_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_034_collision" type="cylinder" size="0.0245 0.0400" mass="0.0733" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_035" pos="0.92000 3.24300 1.22400" euler="0 0 0">
+      <joint name="product_035_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_035_collision" type="sphere" size="0.0350" mass="0.2510" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_036" pos="1.14000 3.24300 1.22600" euler="0 0 0">
+      <joint name="product_036_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_036_collision" type="sphere" size="0.0370" mass="0.2530" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_037" pos="1.58500 3.24300 0.54840" euler="0 0 0">
+      <joint name="product_037_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_037_collision" type="mesh" mesh="sanmingzhi_mesh" mass="0.1220" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_038" pos="1.80500 3.24300 0.55150" euler="0 0 0">
+      <joint name="product_038_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_038_collision" type="mesh" mesh="heweidao_mesh" mass="0.0990" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_039" pos="2.02500 3.24300 0.60400" euler="0 0 0">
+      <joint name="product_039_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_039_collision" type="cylinder" size="0.0325 0.1050" mass="0.1370" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_040" pos="1.58500 3.24300 0.89500" euler="0 0 0">
+      <joint name="product_040_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_040_collision" type="box" size="0.0860 0.0425 0.0440" mass="0.1300" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_041" pos="1.80500 3.24300 0.95600" euler="0 0 0">
+      <joint name="product_041_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_041_collision" type="cylinder" size="0.0325 0.1050" mass="0.6430" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_042" pos="2.02500 3.24300 0.92350" euler="0 0 0">
+      <joint name="product_042_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_042_collision" type="cylinder" size="0.0265 0.0725" mass="0.3570" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_043" pos="1.58500 3.24300 1.22900" euler="0 0 0">
+      <joint name="product_043_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_043_collision" type="cylinder" size="0.0245 0.0400" mass="0.0733" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_044" pos="1.80500 3.24300 1.22400" euler="0 0 0">
+      <joint name="product_044_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_044_collision" type="sphere" size="0.0350" mass="0.2510" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+    <body name="product_045" pos="2.02500 3.24300 1.22600" euler="0 0 0">
+      <joint name="product_045_freejoint" type="free" frictionloss="0.00005"/>
+      <geom name="product_045_collision" type="sphere" size="0.0370" mass="0.2530" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <include file="__REPO_ROOT__/models/mjcf/mobile_chassis/mmk2/mmk2_control.xml"/>
+  </actuator>
+  <sensor>
+    <include file="__REPO_ROOT__/models/mjcf/mobile_chassis/mmk2/mmk2_sensor.xml"/>
+  </sensor>
+</mujoco>
