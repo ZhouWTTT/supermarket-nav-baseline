@@ -158,6 +158,21 @@
     <body name="mmk2" pos="1.92 -3.17 0" euler="0 0 1.5708">
       <joint type="free" frictionloss="0.0001"/>
       <include file="__REPO_ROOT__/models/mjcf/mobile_chassis/mmk2/mmk2.xml"/>
+      <!-- Later sibling subtree preserves head/left/right camera IDs 0/1/2. -->
+      <body name="diagnostic_camera_rig">
+        <!-- Shoulder-level, steep first-person view matching grasp-debug videos:
+             both arms enter from the sides and the gripper target stays central. -->
+        <camera name="diagnostic_operator" pos="0.32 0 1.65"
+                xyaxes="0 -1 0 0.707 0 0.707" fovy="70"/>
+        <camera name="diagnostic_follow" pos="-1.20 0 2.10"
+                xyaxes="0 -1 0 0.419 0 0.908" fovy="60"/>
+      </body>
+    </body>
+    <!-- World-fixed overhead view for inspecting the complete navigation path.
+         +Y (north/shelves) is at the top of the rendered image. -->
+    <body name="diagnostic_world_camera_rig">
+      <camera name="diagnostic_top" pos="0 0 9.0"
+              xyaxes="1 0 0 0 1 0" fovy="50"/>
     </body>
     <body name="picking_zone" pos="0 2.475 0">
       <geom class="visual_zone" name="picking_zone_north_mark" size="2.5 0.05 0.00025" pos="0 0.775 0.00025" material="zone_yellow"/>
@@ -541,7 +556,7 @@
       <joint name="product_041_freejoint" type="free" frictionloss="0.00005"/>
       <geom name="product_041_collision" type="cylinder" size="0.0325 0.1050" mass="0.6430" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
     </body>
-    <body name="product_042" pos="2.02500 3.24300 0.92350" euler="0 0 0">
+    <body name="product_042" pos="2.02500 3.24300 1.26150" euler="0 0 0">
       <joint name="product_042_freejoint" type="free" frictionloss="0.00005"/>
       <geom name="product_042_collision" type="cylinder" size="0.0265 0.0725" mass="0.3570" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
     </body>
@@ -553,7 +568,7 @@
       <joint name="product_044_freejoint" type="free" frictionloss="0.00005"/>
       <geom name="product_044_collision" type="sphere" size="0.0350" mass="0.2510" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
     </body>
-    <body name="product_045" pos="2.02500 3.24300 1.22600" euler="0 0 0">
+    <body name="product_045" pos="2.02500 3.24300 0.88800" euler="0 0 0">
       <joint name="product_045_freejoint" type="free" frictionloss="0.00005"/>
       <geom name="product_045_collision" type="sphere" size="0.0370" mass="0.2530" rgba="1 0 0 0.45" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01" pos="0 0 0" euler="0 0 0"/>
     </body>

@@ -96,7 +96,16 @@ class SimulatorBase:
             self.free_camera.type = mujoco._enums.mjtCamera.mjCAMERA_FREE
             mujoco.mjv_defaultFreeCamera(self.mj_model, self.free_camera)
 
-            self.config.use_gaussian_renderer = self.config.use_gaussian_renderer and DISCOVERSE_GAUSSIAN_RENDERER
+            requested_gaussian_renderer = self.config.use_gaussian_renderer
+            if (requested_gaussian_renderer
+                    and not DISCOVERSE_GAUSSIAN_RENDERER
+                    and getattr(self.config, "require_gaussian_renderer", False)):
+                raise RuntimeError(
+                    "Gaussian renderer is required by this scene but is not installed. "
+                    "Install the project GS dependencies with: pip install -e '.[gs]'"
+                )
+            self.config.use_gaussian_renderer = (
+                requested_gaussian_renderer and DISCOVERSE_GAUSSIAN_RENDERER)
             if self.config.use_gaussian_renderer:
                 from discoverse.utils.download_from_huggingface import download_from_huggingface
                 hf_repo_id = getattr(self.config, 'hf_repo_id', 'tatp/DISCOVERSE-models')
@@ -364,8 +373,10 @@ class SimulatorBase:
 
             obs_cam_ids = list(set(self.config.obs_rgb_cam_id + self.config.obs_depth_cam_id))
             display_cam_id = self.cam_id if not self.config.headless and self.window is not None else None
+            use_gs_display = not getattr(self, "force_mujoco_display", False)
             render_cam_ids = obs_cam_ids.copy()
-            if display_cam_id is not None and (window_width, window_height) == (render_width, render_height):
+            if (use_gs_display and display_cam_id is not None and
+                    (window_width, window_height) == (render_width, render_height)):
                 if display_cam_id not in render_cam_ids:
                     render_cam_ids.append(display_cam_id)
             
@@ -401,7 +412,7 @@ class SimulatorBase:
                         )
                         self.batch_render_results = self._convert_gs_render_results(results_tensor)
 
-                if display_cam_id is not None:
+                if display_cam_id is not None and use_gs_display:
                     if (window_width, window_height) == (render_width, render_height) and display_cam_id in self.batch_render_results:
                         display_result = self.batch_render_results[display_cam_id]
                     else:
@@ -435,14 +446,40 @@ class SimulatorBase:
         if not self.config.headless and self.window is not None:
             self.update_renderer_window_size(window_width, window_height)
             if not self.renderer._depth_rendering:
-                if self.config.use_gaussian_renderer and self.show_gaussian_img and display_result is not None:
+                if (self.config.use_gaussian_renderer and self.show_gaussian_img
+                        and display_result is not None
+                        and not getattr(self, "force_mujoco_display", False)):
                     img_vis = display_result[0]
                 elif self.cam_id in self.config.obs_rgb_cam_id and (window_width, window_height) == (render_width, render_height):
                     img_vis = self.img_rgb_obs_s[self.cam_id]
                 else:
                     img_vis = self.getRgbImg(self.cam_id)
+
+                # Diagnostic split view: show the photorealistic GS image and
+                # complete MuJoCo collision scene from the same camera/time.
+                # This avoids hiding GS products behind their primitive
+                # collision geoms while keeping random boxes visible.
+                if (getattr(self, "dual_renderer_display", False)
+                        and display_result is not None):
+                    gs_img = display_result[0]
+                    mj_img = self.getRgbImg(self.cam_id)
+                    half_width = max(1, window_width // 2)
+                    gs_img = cv2.resize(gs_img, (half_width, window_height),
+                                        interpolation=cv2.INTER_AREA)
+                    mj_img = cv2.resize(
+                        mj_img, (window_width - half_width, window_height),
+                        interpolation=cv2.INTER_AREA)
+                    cv2.putText(gs_img, "3DGS / PRODUCTS", (12, 28),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                                (255, 255, 0), 2, cv2.LINE_AA)
+                    cv2.putText(mj_img, "MUJOCO / OBSTACLES", (12, 28),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                                (255, 255, 0), 2, cv2.LINE_AA)
+                    img_vis = np.concatenate((gs_img, mj_img), axis=1)
             else:
-                if self.config.use_gaussian_renderer and self.show_gaussian_img and display_result is not None:
+                if (self.config.use_gaussian_renderer and self.show_gaussian_img
+                        and display_result is not None
+                        and not getattr(self, "force_mujoco_display", False)):
                     img_depth = display_result[1]
                 elif self.cam_id in self.config.obs_depth_cam_id and (window_width, window_height) == (render_width, render_height):
                     img_depth = self.img_depth_obs_s[self.cam_id]

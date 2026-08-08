@@ -1,0 +1,10 @@
+.git
+.claude
+.pytest_cache
+**/__pycache__
+**/*.pyc
+**/*.log
+**/dataset
+**/runs
+*.tar
+*.tar.gz
