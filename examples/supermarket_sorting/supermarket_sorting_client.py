@@ -37,8 +37,10 @@ YAW_SOUTH = -math.pi / 2.0
 
 YELLOW_MID_Y = 2.475          # 抓取区两条黄线(y=1.70/3.25)正中
 APPROACH_BASE_X = 0.852       # shelf approach lane that leaves the target in right-arm reach
-GRASP_YAW_EAST_BIAS_DEG = 11.0
-GRASP_YAW = math.pi / 2.0 - math.radians(GRASP_YAW_EAST_BIAS_DEG)  # slightly east of north to square the gripper visually
+GRASP_YAW_EAST_BIAS_DEG = 0.0
+# Face the shelf squarely.  The former 11-degree east bias made the robot look
+# permanently tilted right and also reduced straight creep alignment.
+GRASP_YAW = math.pi / 2.0
 # 直行到黄线中点 -> 左转西行到货架列,停在黄线处部署胳膊,再 creep 进去
 ROUTE_TO_SHELF = [[1.92, YELLOW_MID_Y], [APPROACH_BASE_X, YELLOW_MID_Y]]
 # 倒车退回黄线中点后,沿旧 baseline 的直角避障路线走,避免斜切时胳膊扫墙.
@@ -51,8 +53,7 @@ GRASP_ARM = "r"
 HEAD_PITCH = -0.6
 SLIDE_PRE, SLIDE_GRASP, SLIDE_LIFT = 0.11, 0.11, -0.04
 GRIP_OPEN, GRIP_CLOSE = 1.0, 0.08   # 可乐瓶较细,夹爪需要闭得更紧
-# Gripper orientation in the FOOTPRINT frame. This is the previous visually
-# closest pose; the base yaw now supplies the small eastward correction.
+# Gripper orientation in the footprint frame while the base faces north.
 GRASP_ROT = np.array([
     [ 1.0, 0.0, 0.0],
     [ 0.0, 1.0, 0.0],
@@ -131,6 +132,9 @@ class PickPlaceClient(Node):
 
         # nav/phase state
         self.phase = NAV_SHELF
+        self.route_to_shelf = [list(point) for point in ROUTE_TO_SHELF]
+        self.slide_grasp = SLIDE_GRASP
+        self.grasp_rot = GRASP_ROT.copy()
         self.nav_idx = 0
         self.nav_mode = "turn"
         self.sub_idx = 0
@@ -150,12 +154,14 @@ class PickPlaceClient(Node):
         self.last_deploy_wait_log = 0.0
 
         # gains
-        self.pos_tol, self.turn_tol = 0.06, 0.03
-        self.max_lin, self.max_ang = 0.45, 1.2
+        self.pos_tol, self.turn_tol = 0.06, 0.015
+        # Faster in open aisles; the carried-object obstacle route is capped
+        # separately in follow_route. Fine grasp/retreat speeds stay unchanged.
+        self.max_lin, self.max_ang = 0.50, 1.50
         # velocity ramping (acceleration limits) so /cmd_vel never jumps -> smooth motion
         self.rate_hz = 50.0
         self.dt = 1.0 / self.rate_hz
-        self.max_lin_acc, self.max_ang_acc = 0.8, 5.0   # m/s^2, rad/s^2
+        self.max_lin_acc, self.max_ang_acc = 1.0, 6.0   # m/s^2, rad/s^2
         self.des_lin = self.des_ang = 0.0               # desired (from controller)
         self.cur_lin = self.cur_ang = 0.0               # ramped (actually published)
 
@@ -292,7 +298,11 @@ class PickPlaceClient(Node):
             self.arm_target_set = True
             return True
         else:
-            self.get_logger().warn(f"IK unreachable: world={np.round(world_pos, 3)} fp={np.round(fp, 3)} (arm holds)")
+            if self.now() - self.last_wait_log > 1.0:
+                self.get_logger().warn(
+                    f"IK unreachable: world={np.round(world_pos, 3)} "
+                    f"fp={np.round(fp, 3)} slide={self.tc[2]:.3f} (arm holds)")
+                self.last_wait_log = self.now()
             return False
 
     def ee_footprint_pose(self):
@@ -360,15 +370,21 @@ class PickPlaceClient(Node):
                     self.nav_mode = "turn"
                     self.set_twist(0.0, 0.0)
                 else:
-                    # Steering: deadband when nearly aligned, and FREEZE near the
-                    # waypoint (bearing blows up there) -> long straights stay dead
-                    # straight with no angular twitch.
-                    if abs(yaw_err) < 0.05 or dist < 0.25:
+                    # Continuously correct small errors on the long wall-adjacent
+                    # aisle. If alignment is badly lost, stop before turning.
+                    if abs(yaw_err) > 0.25:
+                        self.nav_mode = "turn"
+                        self.set_twist(0.0, 2.2 * yaw_err)
+                        return False
+                    if abs(yaw_err) < 0.005 or dist < 0.10:
                         ang = 0.0
                     else:
-                        ang = 2.2 * yaw_err
+                        ang = 2.8 * yaw_err
                     align = max(0.0, math.cos(yaw_err))
-                    self.set_twist(1.0 * dist * align, ang)
+                    # Carrying a grasped object through the fixed western
+                    # obstacle corridor needs more margin than open-aisle travel.
+                    speed_cap = 0.40 if self.phase == NAV_TABLE else self.max_lin
+                    self.set_twist(min(speed_cap, dist * align), ang)
             return False
         yaw_err = wrap_to_pi(final_yaw - self.base_yaw)
         self.set_twist(0.0, 1.8 * yaw_err)
@@ -434,7 +450,7 @@ class PickPlaceClient(Node):
             return
 
         if self.phase == NAV_SHELF:
-            if self.follow_route(ROUTE_TO_SHELF, GRASP_YAW):
+            if self.follow_route(self.route_to_shelf, GRASP_YAW):
                 self.phase, self.deploy_set = DEPLOY, False
                 self.det_buf.clear()
                 self.target_locked = False
@@ -449,12 +465,12 @@ class PickPlaceClient(Node):
                 # Aim head/slide so the shelf is in view, accumulate
                 # /kele/detections, then pose the arm from the vision target.
                 self.tc[4] = HEAD_PITCH
-                self.tc[2] = SLIDE_GRASP
+                self.tc[2] = self.slide_grasp
                 self.tc[18] = GRIP_OPEN
                 if not self.target_locked and self.now() - self.state_t0 < DETECT_DWELL:
                     pass
                 elif self._lock_target():
-                    if self.arm_to(self.DEPLOY_WORLD):
+                    if self.arm_to(self.DEPLOY_WORLD, self.grasp_rot):
                         self.deploy_set = True
                         self.state_t0 = self.now()
                     else:
@@ -479,7 +495,7 @@ class PickPlaceClient(Node):
         elif self.phase == LIFT:
             # 竖直抬起(减小 slide,胸部上移),让物体离开隔板,胳膊关节保持不动
             self.set_twist(0.0, 0.0)
-            self.tc[2] = SLIDE_GRASP - LIFT_AMOUNT
+            self.tc[2] = max(-0.04, self.slide_grasp - LIFT_AMOUNT)
             if abs(self.slide_meas - self.tc[2]) < 0.02:
                 self.phase = RETREAT
         elif self.phase == RETREAT:

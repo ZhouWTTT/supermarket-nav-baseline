@@ -189,19 +189,19 @@ class BlobBackend:
 # YoloBackend  (drop-in final backend once kele.pt is trained)
 # ---------------------------------------------------------------------------
 class YoloBackend:
-    """YOLOv8 detector (ultralytics).  Mirrors the reference yolo_detect.py
-    but stripped to single-class 'kele'.
+    """Ultralytics YOLO detector with class names read from the checkpoint.
 
     If the checkpoint file does not exist yet the backend logs a warning and
     returns an empty list (graceful degradation; swap to BlobBackend instead).
     """
 
-    CLASS_NAMES = ['kele']
-
-    def __init__(self, ckpt_path: str, conf_thresh: float = 0.65, device: str = "auto"):
+    def __init__(self, ckpt_path: str, conf_thresh: float = 0.45,
+                 device: str = "auto", target_class: str | None = None):
         self.conf_thresh = conf_thresh
         self.model = None
         self.device = device
+        self.target_class = target_class
+        self.class_names = {}
         if not os.path.isfile(ckpt_path):
             print(f"[YoloBackend] checkpoint not found: {ckpt_path} — returning empty detections")
             return
@@ -219,10 +219,22 @@ class YoloBackend:
             try:
                 self.model = YOLO(ckpt_path).to(device)
                 self.model.model.eval()
+                names = self.model.names
+                self.class_names = (
+                    {int(k): str(v) for k, v in names.items()}
+                    if isinstance(names, dict) else
+                    {i: str(v) for i, v in enumerate(names)})
+                if (self.target_class is not None and
+                        self.target_class not in self.class_names.values()):
+                    raise ValueError(
+                        f"target class {self.target_class!r} is not in checkpoint; "
+                        f"available={list(self.class_names.values())}")
             finally:
                 torch.load = _orig
-            print(f"[YoloBackend] loaded {ckpt_path} on {device}")
+            print(f"[YoloBackend] loaded {ckpt_path} on {device}; "
+                  f"classes={self.class_names}")
         except Exception as e:
+            self.model = None
             print(f"[YoloBackend] failed to load model: {e}")
 
     @staticmethod
@@ -261,18 +273,25 @@ class YoloBackend:
     ) -> list[dict]:
         if self.model is None:
             return []
-        results = self.model(rgb, verbose=False)[0]
+        # Pass the requested threshold into Ultralytics as well.  Filtering
+        # only after prediction made values below Ultralytics' default 0.25
+        # impossible to recover when searching for small top-shelf goods.
+        results = self.model(
+            rgb, verbose=False, conf=self.conf_thresh)[0]
         detections = []
         for box in results.boxes:
             conf = float(box.conf.item())
             if conf < self.conf_thresh:
                 continue
             cls_id = int(box.cls.item())
-            if cls_id >= len(self.CLASS_NAMES):
+            class_name = self.class_names.get(cls_id)
+            if class_name is None:
+                continue
+            if self.target_class is not None and class_name != self.target_class:
                 continue
             x0, y0, x1, y1 = map(int, box.xyxy[0].cpu().numpy())
             detections.append({
-                'class': self.CLASS_NAMES[cls_id],
+                'class': class_name,
                 'x': (x0 + x1) // 2,
                 'y': (y0 + y1) // 2,
                 'w': x1 - x0,

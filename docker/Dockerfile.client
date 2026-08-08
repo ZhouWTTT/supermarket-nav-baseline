@@ -1,0 +1,11 @@
+FROM crpi-1pzq998p9m7w0auy.cn-hangzhou.personal.cr.aliyuncs.com/challengecup/supermarket_sorting_final:client
+
+WORKDIR /workspace/baseline
+COPY . /workspace/baseline
+
+ENV PYTHONPATH=/workspace/baseline \
+    ROS_DOMAIN_ID=99 \
+    RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+    YOLO_CONFIG_DIR=/tmp/Ultralytics
+
+CMD ["./scripts/run_baseline.sh"]

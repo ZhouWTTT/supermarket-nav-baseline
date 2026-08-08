@@ -10,6 +10,8 @@ checkpoints/
 *.pth
 *.onnx
 *.weights
+!examples/supermarket_sorting/perception/checkpoints/
+!examples/supermarket_sorting/perception/checkpoints/best.pt
 models/meshes/
 models/textures/
 models/3dgs/
