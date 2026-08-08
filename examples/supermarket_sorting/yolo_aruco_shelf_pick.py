@@ -83,13 +83,13 @@ def fixed_layout_by_marker():
     }
 
 PRODUCT_CENTER_ABOVE_MARKER_M = {
-    "sanmingzhi": 0.0484,
-    "heweidao": 0.0515,
-    "shupian": 0.104,
+    "sanmingzhi": 0.0434,
+    "heweidao": 0.0355,
+    "shupian": 0.054,
     "zhijin": 0.043,
     "maidong": 0.104,
     "kele": 0.0715,
-    "kouxiangtang": 0.039,
+    "kouxiangtang": 0.030,
     "pingguo": 0.034,
     "chengzi": 0.036,
 }
@@ -196,7 +196,7 @@ def kind_never_on_lower_shelf(kind: str) -> bool:
         s["world_position"][2] >= MIDDLE_SHELF_Z_MIN_M for s in slots)
 
 YAW_NORTH = math.pi / 2.0
-ARM_LATERAL_BIAS_M = 0.07
+ARM_LATERAL_BIAS_M = 0.10
 NAV_X_MIN = -2.05
 NAV_X_MAX = 2.05
 # drive_to cruise/rotation limits.  The old profile rotated in place whenever
@@ -503,7 +503,7 @@ GRIP_OPEN = 1.0
 # a deeper target and a longer force-building dwell before lift so the fingers
 # finish seating the object instead of continuing to close during retreat.
 GRIP_CLOSE = 0.08
-GENERIC_GRIP_CLOSE = 0.02
+GENERIC_GRIP_CLOSE = 0.0
 GRIP_CLOSE_BY_CLASS = {"sanmingzhi": 0.16}
 GRIP_OPEN_MAX_STEP = 0.025
 GRIP_CLOSE_MAX_STEP = 0.006

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Formal five-order entry point for the supermarket competition.
+"""Formal multi-order entry point for the supermarket competition.
 
 The proven single-item controller remains an isolated worker process.  This
 node owns the match lifecycle: it receives the transient task, validates it,
@@ -139,7 +139,8 @@ class CompetitionRunner(Node):
                   and now - self.worker_terminate_at >= 3.0):
                 self.get_logger().error("worker ignored SIGTERM; sending SIGKILL")
                 self.worker.kill()
-            elif (self.worker_started_at is not None
+            elif (self.args.order_timeout > 0.0
+                  and self.worker_started_at is not None
                   and now - self.worker_started_at >= self.args.order_timeout):
                 self._request_worker_stop("order_timeout")
             return
@@ -460,14 +461,16 @@ class CompetitionRunner(Node):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="formal supermarket five-order task runner")
+        description="formal supermarket multi-order task runner")
     parser.add_argument("--worker", default=str(DEFAULT_WORKER))
     parser.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
     parser.add_argument("--confidence", type=float, default=0.45)
     parser.add_argument("--max-scan-cycles", type=int, default=2)
     parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--inventory-confirmations", type=int, default=3)
-    parser.add_argument("--order-timeout", type=float, default=150.0)
+    parser.add_argument(
+        "--order-timeout", type=float, default=0.0,
+        help="per-order timeout in seconds; 0 disables it")
     parser.add_argument("--match-timeout", type=float, default=570.0)
     parser.add_argument("--runtime-dir", default="/tmp/supermarket_competition")
     parser.add_argument("--summary-file")
@@ -482,8 +485,10 @@ def parse_args() -> argparse.Namespace:
     if (args.max_scan_cycles < 1 or args.max_attempts < 1
             or args.inventory_confirmations < 1):
         parser.error("scan cycles, attempts, and confirmations must be >= 1")
-    if args.order_timeout <= 0.0 or args.match_timeout <= 0.0:
-        parser.error("timeouts must be positive")
+    if args.order_timeout < 0.0:
+        parser.error("--order-timeout must be >= 0")
+    if args.match_timeout <= 0.0:
+        parser.error("--match-timeout must be positive")
     return args
 
 

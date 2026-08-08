@@ -32,13 +32,13 @@ GRASP_COST = {
 }
 
 PRODUCT_CENTER_ABOVE_MARKER_M = {
-    "sanmingzhi": 0.0484,
-    "heweidao": 0.0515,
-    "shupian": 0.104,
+    "sanmingzhi": 0.0434,
+    "heweidao": 0.0355,
+    "shupian": 0.054,
     "zhijin": 0.043,
     "maidong": 0.104,
     "kele": 0.0715,
-    "kouxiangtang": 0.039,
+    "kouxiangtang": 0.030,
     "pingguo": 0.034,
     "chengzi": 0.036,
 }

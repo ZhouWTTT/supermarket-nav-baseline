@@ -21,7 +21,7 @@ runner=(
     --max-scan-cycles "${SUPERMARKET_MAX_SCAN_CYCLES:-2}"
     --max-attempts "${SUPERMARKET_MAX_ATTEMPTS:-2}"
     --inventory-confirmations "${SUPERMARKET_INVENTORY_CONFIRMATIONS:-3}"
-    --order-timeout "${SUPERMARKET_ORDER_TIMEOUT:-150}"
+    --order-timeout "${SUPERMARKET_ORDER_TIMEOUT:-0}"
     --match-timeout "${SUPERMARKET_MATCH_TIMEOUT:-570}"
 )
 

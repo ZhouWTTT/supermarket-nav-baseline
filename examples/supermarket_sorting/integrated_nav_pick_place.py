@@ -46,6 +46,7 @@ import yolo_aruco_shelf_pick as pick  # noqa: E402  (parent pipeline, unmodified
 from sensor_msgs.msg import LaserScan  # noqa: E402
 from supermarket_navigation import (  # noqa: E402  (baseline nav, unmodified)
     DELIVERY_APPROACH,
+    DELIVERY_TABLE_XML_BOUNDS,
     SupermarketNavigator,
 )
 
@@ -113,6 +114,22 @@ NAV_LASER_STALE_S = 0.50           # fail safe if the 12 Hz scan stops
 NAV_STATE_STALE_S = 0.50           # odom/joints must also remain live
 NAV_PROGRESS_LOG_S = 3.0
 
+# Keep the held product clear of the shelf before delivery navigation starts
+# turning the base.  The arms and product still protrude toward the shelf at
+# the end of the parent grasp state machine.
+BACKUP_SPEED_MPS = 0.10
+BACKUP_TIMEOUT_S = 8.0
+
+# A* stops outside the table's inflated costmap.  From that safe pose, make a
+# short, slow, yaw-controlled final approach before extending the arm.  The
+# physical chassis front remains clear of the table at the nominal endpoint.
+PLACE_CREEP_DISTANCE_M = 0.20
+PLACE_CREEP_SPEED_MPS = 0.04
+PLACE_CREEP_FRONT_STOP_M = 0.30
+PLACE_CREEP_YAW_GAIN = 2.0
+PLACE_CREEP_MAX_ANGULAR_RPS = 0.30
+PLACE_RELEASE_TABLE_MARGIN_M = 0.04
+
 # Compact post-place travel pose (mirrors INIT_ARM in supermarket_sorting_client)
 PLACE_RETREAT_ARM_L = [0.0, -0.166, 0.032, 0.0, 1.571, 2.223]
 PLACE_RETREAT_ARM_R = [0.0, -0.166, 0.032, 0.0, -1.571, -2.223]
@@ -126,6 +143,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                           its drive_to() is overridden to use the navigator for
                           long-range transit while keeping the precise final
                           alignment untouched.
+      "backup"          — reverse with yaw hold to clear the shelf.
       "nav_to_delivery" — navigator to DELIVERY_APPROACH with goods held.
       "place"           — extend arm over the table, release, retreat.
       "done"            — flow finished.
@@ -139,12 +157,16 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             place_z: float = DELIVERY_TABLE_PLACE_WORLD[2],
             place_release_dwell_s: float = 2.0,
             place_retreat_dwell_s: float = 1.0,
-            nav_during_scan: bool = True):
+            nav_during_scan: bool = True,
+            backup_after_grab_m: float = 0.20,
+            place_creep_m: float = PLACE_CREEP_DISTANCE_M):
         super().__init__(
             target_kind, max_scan_cycles,
             tcp_diagnostic_ground_truth, scan_skip_lower)
 
         self.nav_during_scan = nav_during_scan
+        self.backup_after_grab_m = float(backup_after_grab_m)
+        self.place_creep_m = float(place_creep_m)
         self.place_world = np.array(
             [place_x, place_y, place_z], dtype=float)
         self.place_release_dwell_s = place_release_dwell_s
@@ -174,6 +196,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._place_retreat_sent = False
         self.place_creep_start_y = None
         self.place_creep_done = False
+        self._backup_start_xy = None
+        self._backup_start_yaw = 0.0
+        self._backup_t0 = 0.0
+        self._backup_logged = False
         self._flow_done_logged = False
         self._laser_warn_log = 0.0
         self._state_warn_log = 0.0
@@ -182,6 +208,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             "integrated nav+pick+place ready; "
             f"nav_during_scan={nav_during_scan} "
             f"place_world={np.round(self.place_world, 3)} "
+            f"backup_after_grab={self.backup_after_grab_m:.2f}m "
+            f"place_creep={self.place_creep_m:.2f}m "
             f"release_dwell={place_release_dwell_s}s "
             f"retreat_dwell={place_retreat_dwell_s}s")
 
@@ -262,11 +290,64 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.get_logger().info(
             f"[flow] goods grabbed (marker={self.target_marker_id}, "
             f"kind={self.target_kind}, state={self.state}); "
-            "navigating to delivery table")
+            "preparing delivery transit")
+        if self.backup_after_grab_m > 1e-4:
+            self.flow_phase = "backup"
+            self._backup_start_xy = self.base_xy.copy()
+            self._backup_start_yaw = float(self.base_yaw)
+            self._backup_t0 = self.now()
+            self._backup_logged = False
+            self.get_logger().info(
+                f"[flow] backing up {self.backup_after_grab_m:.2f}m "
+                "before delivery rotation")
+            return
+        self._start_delivery_navigation()
+
+    def _start_delivery_navigation(self) -> None:
         self.flow_phase = "nav_to_delivery"
         self._nav_goal = None
         self._nav_last_log = 0.0
         self.nav.set_goal(*DELIVERY_APPROACH)
+
+    def _backup_tick(self) -> None:
+        """Reverse along the grasp heading while holding the current yaw."""
+        now = self.now()
+        if self._backup_start_xy is None:
+            self._backup_start_xy = self.base_xy.copy()
+            self._backup_start_yaw = float(self.base_yaw)
+            self._backup_t0 = now
+
+        heading = np.array([
+            math.cos(self._backup_start_yaw),
+            math.sin(self._backup_start_yaw),
+        ])
+        moved_back = float(np.dot(
+            self._backup_start_xy - self.base_xy, heading))
+        yaw_err = pick.wrap_to_pi(self._backup_start_yaw - self.base_yaw)
+        elapsed = now - self._backup_t0
+
+        reached = moved_back >= self.backup_after_grab_m
+        timed_out = elapsed > BACKUP_TIMEOUT_S
+        if reached or timed_out:
+            self.set_twist(0.0, 0.0)
+            self._start_delivery_navigation()
+            message = (
+                f"[flow] backup finished (moved={moved_back:.3f}m, "
+                f"elapsed={elapsed:.1f}s); starting delivery navigation")
+            if timed_out and not reached:
+                self.get_logger().warn(message + " after timeout")
+            else:
+                self.get_logger().info(message)
+            return
+
+        angular = float(np.clip(2.0 * yaw_err, -0.6, 0.6))
+        self.set_twist(-BACKUP_SPEED_MPS, angular)
+        if not self._backup_logged and elapsed >= 1.0:
+            self._backup_logged = True
+            self.get_logger().info(
+                f"[backup] dist={moved_back:.3f}/"
+                f"{self.backup_after_grab_m:.2f}m "
+                f"yaw_err={math.degrees(yaw_err):.1f}°")
 
     def _nav_to_delivery_tick(self) -> None:
         now = self.now()
@@ -343,11 +424,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         tcp = self.selected_tcp_world()
         held_z = float(tcp[2]) if tcp is not None else 0.95
         bx, by = float(self.base_xy[0]), float(self.base_xy[1])
-        # Table top is ~0.767 m and the centre is at y=-3.41.  Release targets
-        # keep the wrist a little above the bottle height so the product drops
-        # only a few centimetres, and prefer deeper d to centre over the table.
+        # Table top is ~0.767 m and the centre is at y=-3.41.  After the final
+        # base creep, 0.55--0.65 m reaches the interior without forcing the arm
+        # to its old 0.70--0.80 m reach limit.
         z_candidates = (0.90, 0.92, 0.95)
-        d_candidates = (0.80, 0.75, 0.70)
+        d_candidates = (0.65, 0.60, 0.55)
         # Top-shelf grasps pin the slide at SLIDE_MIN, which leaves the arm too
         # high to reach the table; raising the slide lowers the whole arm into
         # reach.  Middle/lower grasps keep their grasp slide.
@@ -389,9 +470,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     f"world={np.round(world, 3)} slide={self.slide_grasp:.2f}")
                 return joints
 
-        self.get_logger().warn(
-            "[place] no IK solution over the table; will creep forward and "
-            "release in the current pose")
+        self.get_logger().error(
+            "[place] no IK solution over the table; keeping gripper closed")
         return None
 
     def _solve_place_world(
@@ -433,6 +513,61 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                  and r > 0.05 and r < 8.0]
         return min(valid) if valid else None
 
+    def _advance_place_creep(self) -> bool:
+        """Move slowly from the navigation endpoint to the arm-place pose."""
+        if self.place_creep_done:
+            return True
+        if self.place_creep_start_y is None:
+            self.place_creep_start_y = float(self.base_xy[1])
+
+        front = self._laser_front_range()
+        crept = float(self.place_creep_start_y - self.base_xy[1])
+        distance_reached = crept >= self.place_creep_m
+        front_reached = (
+            front is not None and front <= PLACE_CREEP_FRONT_STOP_M)
+        if self.place_creep_m <= 1e-4 or distance_reached or front_reached:
+            self.set_twist(0.0, 0.0)
+            self.place_creep_done = True
+            reason = (
+                "distance" if distance_reached else
+                "lidar" if front_reached else "disabled")
+            self.get_logger().info(
+                f"[place] final approach finished (reason={reason} "
+                f"crept={crept:.3f}m front={front} "
+                f"base=({self.base_xy[0]:.3f},{self.base_xy[1]:.3f}))")
+            return True
+
+        yaw_err = pick.wrap_to_pi(-math.pi / 2.0 - self.base_yaw)
+        angular = float(np.clip(
+            PLACE_CREEP_YAW_GAIN * yaw_err,
+            -PLACE_CREEP_MAX_ANGULAR_RPS,
+            PLACE_CREEP_MAX_ANGULAR_RPS))
+        # Pause translation if odometry shows an unexpectedly large yaw error;
+        # correct it first so a nominally southward creep cannot cut sideways.
+        linear = PLACE_CREEP_SPEED_MPS if abs(yaw_err) <= 0.10 else 0.0
+        self.set_twist(linear, angular)
+        return False
+
+    @staticmethod
+    def _tcp_over_delivery_table(tcp: np.ndarray | None) -> bool:
+        """Require the measured release point to lie inside the tabletop."""
+        if tcp is None or np.asarray(tcp).shape != (3,):
+            return False
+        x_min, y_min, x_max, y_max = DELIVERY_TABLE_XML_BOUNDS
+        margin = PLACE_RELEASE_TABLE_MARGIN_M
+        return (
+            np.all(np.isfinite(tcp))
+            and x_min + margin <= float(tcp[0]) <= x_max - margin
+            and y_min + margin <= float(tcp[1]) <= y_max - margin)
+
+    def _dual_release_world(self) -> np.ndarray | None:
+        """Approximate the held tissue centre by the two measured TCPs."""
+        left = self.arm_tcp_world("left")
+        right = self.arm_tcp_world("right")
+        if left is None or right is None:
+            return None
+        return 0.5 * (np.asarray(left) + np.asarray(right))
+
     def _place_tick(self) -> None:
         now = self.now()
         if self.use_dual_tissue_grasp:
@@ -440,24 +575,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             return
 
         if self.place_stage == 0:
-            # 1) creep the base a few cm toward the table so the release lands
-            # near the table centre (the nav arrival pose sits close to the
-            # table's north edge); 2) solve the arm over the table (once);
-            # 3) as a last resort release in the held pose.
-            if not self.place_creep_done:
-                if self.place_creep_start_y is None:
-                    self.place_creep_start_y = float(self.base_xy[1])
-                front = self._laser_front_range()
-                crept = float(self.place_creep_start_y - self.base_xy[1])
-                if crept >= 0.07 or (front is not None and front < 0.38):
-                    self.set_twist(0.0, 0.0)
-                    self.place_creep_done = True
-                    self.get_logger().info(
-                        f"[place] creep finished (crept={crept:.3f}m "
-                        f"front={front}); solving arm over the table")
-                else:
-                    self.set_twist(0.06, 0.0)
-                    return
+            # 1) perform a guarded final base approach; 2) solve the arm over
+            # the table; 3) release only after measured TCP verification.
+            if not self._advance_place_creep():
+                return
             if self.place_arm_joints is None:
                 self.place_arm_joints = self._compute_place_arm_joints()
                 if self.place_arm_joints is not None:
@@ -468,13 +589,15 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     if self.place_slide_cmd is not None:
                         self.des_slide = self.place_slide_cmd
                     self._place_arm_target_sent = True
-                elif not getattr(self, "_place_fallback_logged", False):
-                    self._place_fallback_logged = True
-                    self.get_logger().warn(
-                        "[place] no IK solution even after creep; releasing "
-                        "in the current held pose")
+                else:
+                    raise RuntimeError(
+                        "place IK failed; refusing to release goods off-table")
             if self.commands_ready(arm_tolerance=0.05, slide_tolerance=0.05):
                 tcp = self.selected_tcp_world()
+                if not self._tcp_over_delivery_table(tcp):
+                    raise RuntimeError(
+                        "measured place TCP is outside delivery tabletop: "
+                        f"{None if tcp is None else np.round(tcp, 3)}")
                 self.get_logger().info(
                     f"[place] arm extended over table; tcp="
                     f"{None if tcp is None else np.round(tcp, 3)}")
@@ -507,14 +630,22 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     f"{self.base_xy[1]:.2f})")
 
     def _place_tick_dual(self, now: float) -> None:
-        """Best-effort dual-arm (zhijin) place: keep the clamp, release, retreat."""
+        """Dual-arm tissue place with the same guarded final approach."""
         if self.place_stage == 0:
             self.des_left_grip = pick.DUAL_TISSUE_GRIP_COMMAND
             self.des_right_grip = pick.DUAL_TISSUE_GRIP_COMMAND
+            if not self._advance_place_creep():
+                return
+            release_world = self._dual_release_world()
+            if not self._tcp_over_delivery_table(release_world):
+                raise RuntimeError(
+                    "dual-arm release point is outside delivery tabletop: "
+                    f"{None if release_world is None else np.round(release_world, 3)}")
             self.place_stage = 1
             self.place_t0 = now
             self.get_logger().info(
-                "[place-dual] holding clamp pose; starting release sequence")
+                "[place-dual] release point verified over table; "
+                "starting release sequence")
         elif self.place_stage == 1:
             self.des_left_grip = pick.GRIP_OPEN
             self.des_right_grip = pick.GRIP_OPEN
@@ -573,7 +704,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
         # Post-grab phases: same command pipeline tail as the parent tick.
         self.set_twist(0.0, 0.0)
-        if self.flow_phase == "nav_to_delivery":
+        if self.flow_phase == "backup":
+            self._backup_tick()
+        elif self.flow_phase == "nav_to_delivery":
             self._nav_to_delivery_tick()
         elif self.flow_phase == "place":
             self._place_tick()
@@ -651,6 +784,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--place-retreat-dwell", type=float, default=1.0)
     parser.add_argument(
+        "--backup-after-grab", type=float, default=0.20,
+        help="base backup distance in metres after grasp and before delivery "
+             "navigation (0 disables)")
+    parser.add_argument(
+        "--place-creep-distance", type=float,
+        default=PLACE_CREEP_DISTANCE_M,
+        help="guarded final approach distance toward the delivery table in "
+             "metres (0 disables)")
+    parser.add_argument(
         "--no-nav-during-scan", action="store_true",
         help="use the parent straight-line drive_to between scan stations")
     args = parser.parse_args()
@@ -658,6 +800,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--confidence must be in [0, 1]")
     if args.max_scan_cycles < 1:
         parser.error("--max-scan-cycles must be >= 1")
+    if args.backup_after_grab < 0.0:
+        parser.error("--backup-after-grab must be >= 0")
+    if args.place_creep_distance < 0.0:
+        parser.error("--place-creep-distance must be >= 0")
     if args.formal_mode and (
             args.tcp_diagnostic_ground_truth or args.scan_skip_lower):
         parser.error(
@@ -729,7 +875,9 @@ def main() -> int:
             place_x=args.place_x, place_y=args.place_y, place_z=args.place_z,
             place_release_dwell_s=args.place_release_dwell,
             place_retreat_dwell_s=args.place_retreat_dwell,
-            nav_during_scan=not args.no_nav_during_scan)
+            nav_during_scan=not args.no_nav_during_scan,
+            backup_after_grab_m=args.backup_after_grab,
+            place_creep_m=args.place_creep_distance)
         controller.excluded_marker_ids = set(args.exclude_marker_id)
         controller.preferred_marker_id = args.preferred_marker_id
         if controller.excluded_marker_ids:

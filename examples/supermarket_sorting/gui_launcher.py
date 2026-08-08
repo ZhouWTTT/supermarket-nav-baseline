@@ -51,12 +51,13 @@ IMAGE_SETS = {
     },
 }
 
-# Five distinct source bodies are selected before the Server anonymises them.
+# Three distinct source bodies are selected before the Server anonymises them.
 # The organizer controls this value during formal evaluation; this default is
-# only a reproducible local five-order task instead of the 45-item stress mode.
+# only a reproducible local three-order smoke task instead of the 45-item
+# stress mode.  SUPERMARKET_GUI_TASKS can still request any valid task count.
 DEV_TASKS = os.environ.get(
     "SUPERMARKET_GUI_TASKS",
-    "product_001,product_005,product_015,product_026,product_040")
+    "product_001,product_015,product_026")
 
 
 def run_cmd(args, **kwargs):

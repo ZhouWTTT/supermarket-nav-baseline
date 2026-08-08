@@ -30,7 +30,8 @@ The entry script supports these optional environment variables:
 - `SUPERMARKET_MAX_ATTEMPTS`: attempts per anonymous order, default `2`.
 - `SUPERMARKET_INVENTORY_CONFIRMATIONS`: synchronized observations required
   before reusing a kind-to-ArUco mapping, default `3`.
-- `SUPERMARKET_ORDER_TIMEOUT`: per-order timeout in seconds, default `150`.
+- `SUPERMARKET_ORDER_TIMEOUT`: per-order timeout in seconds; `0` disables it
+  and is the default.
 - `SUPERMARKET_MATCH_TIMEOUT`: safe match deadline, default `570`.
 - `SUPERMARKET_SHOW=1`: request the optional OpenCV result window.
 
