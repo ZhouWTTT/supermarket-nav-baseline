@@ -578,13 +578,13 @@
     "level": "L2",
     "column": "C3",
     "aruco_id": 41,
-    "body": "product_042",
-    "object_kind": "kele",
-    "gs_ply": "shentoon/kele_fit.ply",
+    "body": "product_045",
+    "object_kind": "chengzi",
+    "gs_ply": "shentoon/chengzi_fit.ply",
     "world_position": [
       2.025,
       3.243,
-      0.9235
+      0.888
     ]
   },
   {
@@ -620,13 +620,13 @@
     "level": "L3",
     "column": "C3",
     "aruco_id": 44,
-    "body": "product_045",
-    "object_kind": "chengzi",
-    "gs_ply": "shentoon/chengzi_fit.ply",
+    "body": "product_042",
+    "object_kind": "kele",
+    "gs_ply": "shentoon/kele_fit.ply",
     "world_position": [
       2.025,
       3.243,
-      1.226
+      1.2615
     ]
   }
 ]

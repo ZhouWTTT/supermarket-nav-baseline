@@ -222,6 +222,15 @@ ASSOCIATION_CONFIRMATIONS_REQUIRED = 3
 MARKER_SAMPLES_REQUIRED = 5
 MARKER_SAMPLE_SPREAD_MAX_M = 0.04
 
+# Close-range verification before committing the arm.  Far-view YOLO and
+# ArUco association remains the localisation source; this second view only
+# verifies that the requested class is still present at the selected slot.
+CLOSE_RECHECK_CONFIRMATIONS = 2
+CLOSE_RECHECK_WINDOW_S = 2.0
+CLOSE_RECHECK_POSE_TIMEOUT_S = 3.0
+CLOSE_RECHECK_XY_MAX_M = 0.12
+CLOSE_RECHECK_Z_MAX_M = 0.16
+
 SLIDE_REFERENCE_Z_M = 0.9235
 SLIDE_REFERENCE_COMMAND = 0.11
 SLIDE_MIN = -0.04
@@ -367,6 +376,9 @@ GENERIC_DIRECT_FORWARD_SETTLE_S = 1.0
 # The fixed deploy dwell is a safety ceiling; with the convergence gate the
 # arm normally starts forward as soon as the pregrasp is reached.
 GENERIC_DIRECT_DEPLOY_DWELL_S = 2.0
+GENERIC_DEPLOY_SOFT_ARM_TOLERANCE_RAD = 0.06
+GENERIC_DEPLOY_SOFT_SLIDE_TOLERANCE_M = 0.035
+GENERIC_DEPLOY_HARD_TIMEOUT_S = 8.0
 GENERIC_TOP_LIFT_M = 0.025
 GENERIC_TOP_LIFT_TIMEOUT_S = 5.0
 
@@ -545,6 +557,7 @@ GRIP_PRESHAPE_REACHED_TOLERANCE = 0.04
 STATE_GO_SCAN = "go_scan"
 STATE_SCAN = "scan"
 STATE_ALIGN = "align"
+STATE_RECHECK = "recheck"
 STATE_DEPLOY = "deploy"
 STATE_ARM_FORWARD = "arm_forward"
 STATE_POST_EXTEND = "post_extend"
@@ -672,7 +685,8 @@ class ShelfPickController(Node):
 
     def __init__(self, target_kind: str, max_scan_cycles: int,
                  tcp_diagnostic_ground_truth: bool,
-                 scan_skip_lower: bool):
+                 scan_skip_lower: bool,
+                 close_recheck: bool = True):
         super().__init__("yolo_aruco_shelf_pick_controller")
         self.target_kind = target_kind
         self.product_height = PRODUCT_CENTER_ABOVE_MARKER_M[target_kind]
@@ -701,6 +715,7 @@ class ShelfPickController(Node):
         self.scan_pose_index = 0
         self.scan_camera_ready_since = None
         self.scan_cycles = 0
+        self.scan_station_order = None
         self.scan_poses = (
             SCAN_OVERVIEW_POSES
             if scan_skip_lower and kind_never_on_lower_shelf(target_kind)
@@ -722,6 +737,15 @@ class ShelfPickController(Node):
         # kind instead of repeatedly selecting the same slot.
         self.excluded_marker_ids = set()
         self.preferred_marker_id = None
+        self.close_recheck = bool(close_recheck)
+        self.recheck_marker_skips = set()
+        self.recheck_confirmation_times = deque(maxlen=12)
+        self.recheck_last_yolo_stamp = None
+        self.recheck_started_at = 0.0
+        self.recheck_pose_started_at = 0.0
+        self.recheck_pose_index = 0
+        self.recheck_poses = ()
+        self._recheck_passed = False
         self.last_generic_close_log = 0.0
         self.target_marker_id = None
         self.target_physical_marker_id = None
@@ -780,6 +804,7 @@ class ShelfPickController(Node):
         self.dual_insert_forward_m = DUAL_TISSUE_INSERT_FORWARD_M
         self.dual_pregrasp_half_span = DUAL_TISSUE_PREGRASP_HALF_SPAN_M
         self.dual_squeeze_m = DUAL_TISSUE_SQUEEZE_M
+        self.dual_contact_tcp_z = None
         self.dual_clamp_left_joints = None
         self.dual_clamp_right_joints = None
         self.dual_retreat_left_joints = None
@@ -905,6 +930,7 @@ class ShelfPickController(Node):
         with self.lock:
             self.yolo_frames.append((stamp_ns, records))
             self.try_association_locked()
+            self.try_recheck_locked()
 
     def aruco_cb(self, message: String) -> None:
         records = [record for record in decode_list(message)
@@ -917,6 +943,7 @@ class ShelfPickController(Node):
         with self.lock:
             self.aruco_frames.append((stamp_ns, records))
             self.try_association_locked()
+            self.try_recheck_locked()
 
     def try_association_locked(self) -> None:
         if self.state != STATE_SCAN or self.now() - self.state_t0 < SCAN_SETTLE_S:
@@ -948,6 +975,8 @@ class ShelfPickController(Node):
         detection, marker = best_pair
         marker_id = int(marker["id"])
         if marker_id in self.excluded_marker_ids:
+            return
+        if marker_id in self.recheck_marker_skips:
             return
         if (self.preferred_marker_id is not None
                 and marker_id != self.preferred_marker_id):
@@ -1004,6 +1033,7 @@ class ShelfPickController(Node):
                 return
             self.target_marker_id = marker_id
             self.target_physical_marker_id = physical_marker_id
+            self._recheck_passed = False
             self.marker_positions.clear()
             self.depth_target_samples.clear()
             physical_text = (
@@ -1180,6 +1210,190 @@ class ShelfPickController(Node):
             f"grasp_profile={self.grasp_profile_name()} "
             f"align_y={self.align_base_y:.3f}")
 
+    @staticmethod
+    def _verification_poses_for_z(z: float) -> tuple:
+        """Return close camera poses suitable for one shelf level."""
+        z = float(z)
+        if z >= TOP_SHELF_SURFACE_Z_M - 0.10:
+            return (
+                ("overview_high", 0.11, 0.00, -0.20),
+                ("overview_mid", 0.11, 0.00, -0.45),
+            )
+        if z >= MIDDLE_SHELF_SURFACE_Z_M - 0.10:
+            return (
+                ("overview_mid", 0.11, 0.00, -0.45),
+                ("overview_down", 0.11, 0.00, -0.65),
+            )
+        return (
+            ("lower_center", 0.45, 0.00, -0.45),
+            ("lower_yaw_minus", 0.45, -0.15, -0.45),
+            ("lower_yaw_plus", 0.45, 0.15, -0.45),
+        )
+
+    def _start_close_recheck(self) -> None:
+        """Start fresh multi-pose verification at the selected slot."""
+        self.recheck_poses = self._verification_poses_for_z(
+            float(self.target_world[2]))
+        self.recheck_pose_index = 0
+        now = self.now()
+        self.recheck_started_at = now
+        self.recheck_pose_started_at = now
+        self.recheck_confirmation_times.clear()
+        self.recheck_last_yolo_stamp = None
+        self.scan_camera_ready_since = None
+        with self.lock:
+            self.yolo_frames.clear()
+            self.aruco_frames.clear()
+        self.get_logger().info(
+            f"[close-recheck] starting marker={self.target_marker_id} "
+            f"kind={self.target_kind} poses="
+            f"{[pose[0] for pose in self.recheck_poses]}")
+
+    def current_recheck_pose(self):
+        if not self.recheck_poses:
+            return None
+        return self.recheck_poses[self.recheck_pose_index]
+
+    def try_recheck_locked(self) -> None:
+        """Count fresh close-view class confirmations once per YOLO frame."""
+        if self.state != STATE_RECHECK or self.current_recheck_pose() is None:
+            return
+        if self.target_marker_id is None or not self.yolo_frames:
+            return
+        if not self.scan_camera_ready(self.current_recheck_pose()):
+            return
+        if (self.scan_camera_ready_since is None
+                or self.now() - self.scan_camera_ready_since
+                < SCAN_CAMERA_STABLE_S):
+            return
+
+        yolo_stamp, detections = self.yolo_frames[-1]
+        if yolo_stamp == self.recheck_last_yolo_stamp:
+            return
+        self.recheck_last_yolo_stamp = yolo_stamp
+
+        # ArUco is preferred when a synchronized close-view frame exists.  It
+        # is deliberately optional: the product or shelf edge can occlude the
+        # marker at close range, in which case depth-based slot verification
+        # must still be able to run.
+        markers = []
+        if self.aruco_frames:
+            aruco_stamp, candidate_markers = min(
+                self.aruco_frames,
+                key=lambda frame: abs(frame[0] - yolo_stamp))
+            if abs(aruco_stamp - yolo_stamp) <= ARUCO_SYNC_TOLERANCE_NS:
+                markers = candidate_markers
+
+        for detection in sorted(
+                detections,
+                key=lambda item: float(item.get("conf", 0.0)),
+                reverse=True):
+            matched, source = self._recheck_detection_matches(
+                detection, markers)
+            if not matched:
+                continue
+            now = self.now()
+            cutoff = now - CLOSE_RECHECK_WINDOW_S
+            while (self.recheck_confirmation_times
+                   and self.recheck_confirmation_times[0] < cutoff):
+                self.recheck_confirmation_times.popleft()
+            self.recheck_confirmation_times.append(now)
+            self.get_logger().info(
+                f"[close-recheck] marker={self.target_marker_id} "
+                f"kind={self.target_kind} source={source} "
+                f"conf={float(detection.get('conf', 0.0)):.3f} "
+                f"count={len(self.recheck_confirmation_times)}/"
+                f"{CLOSE_RECHECK_CONFIRMATIONS}")
+            return
+
+    def _recheck_detection_matches(
+            self, detection: dict,
+            markers: list[dict]) -> tuple[bool, str]:
+        """Verify the same marker, or the same 3-D slot if it is occluded."""
+        marker = marker_below_yolo(detection, markers)
+        if marker is not None:
+            try:
+                matched = int(marker["id"]) == self.target_marker_id
+            except (KeyError, TypeError, ValueError):
+                matched = False
+            return matched, "aruco"
+
+        try:
+            world = np.asarray(detection.get("world"), dtype=float)
+            target = np.asarray(self.target_world, dtype=float)
+        except (TypeError, ValueError):
+            return False, "depth"
+        if (world.shape != (3,) or target.shape != (3,)
+                or not np.all(np.isfinite(world))
+                or not np.all(np.isfinite(target))):
+            return False, "depth"
+        matched = (
+            abs(float(world[0] - target[0])) <= CLOSE_RECHECK_XY_MAX_M
+            and abs(float(world[1] - target[1])) <= CLOSE_RECHECK_XY_MAX_M
+            and abs(float(world[2] - target[2])) <= CLOSE_RECHECK_Z_MAX_M)
+        return matched, "depth"
+
+    def _recheck_confirmed(self) -> bool:
+        cutoff = self.now() - CLOSE_RECHECK_WINDOW_S
+        while (self.recheck_confirmation_times
+               and self.recheck_confirmation_times[0] < cutoff):
+            self.recheck_confirmation_times.popleft()
+        return (len(self.recheck_confirmation_times)
+                >= CLOSE_RECHECK_CONFIRMATIONS)
+
+    def _advance_recheck_pose(self) -> bool:
+        """Move to the next view; return False when all views are exhausted."""
+        if self.recheck_pose_index + 1 >= len(self.recheck_poses):
+            return False
+        self.recheck_pose_index += 1
+        self.recheck_pose_started_at = self.now()
+        self.recheck_confirmation_times.clear()
+        self.recheck_last_yolo_stamp = None
+        self.scan_camera_ready_since = None
+        with self.lock:
+            self.yolo_frames.clear()
+            self.aruco_frames.clear()
+        self.get_logger().info(
+            f"[close-recheck] trying alternate pose="
+            f"{self.current_recheck_pose()[0]}")
+        return True
+
+    def _recheck_fail(self) -> None:
+        """Skip this slot and resume scanning without trapping preferred ID."""
+        marker_id = self.target_marker_id
+        if marker_id is not None:
+            self.recheck_marker_skips.add(marker_id)
+        if self.preferred_marker_id == marker_id:
+            self.get_logger().warn(
+                f"[close-recheck] preferred marker={marker_id} failed; "
+                "clearing the preference so another same-kind item can be "
+                "considered")
+            self.preferred_marker_id = None
+        self.get_logger().warn(
+            f"[close-recheck] FAILED marker={marker_id} "
+            f"kind={self.target_kind}; all close-view poses exhausted; "
+            "skipping this slot and resuming the shelf scan")
+        self._recheck_passed = False
+        self.recheck_poses = ()
+        self.recheck_confirmation_times.clear()
+        self.recheck_last_yolo_stamp = None
+        self.scan_camera_ready_since = None
+        self.target_marker_id = None
+        self.target_physical_marker_id = None
+        self.target_world = None
+        self.association_candidate_id = None
+        self.association_confirmation_count = 0
+        self.marker_positions.clear()
+        self.depth_target_samples.clear()
+        self.last_association_pair = None
+        self.scan_index = 0
+        self.scan_pose_index = 0
+        self.scan_station_order = self._nearest_scan_stations()
+        with self.lock:
+            self.yolo_frames.clear()
+            self.aruco_frames.clear()
+        self.set_state(STATE_GO_SCAN)
+
     def initialize_commands(self) -> None:
         self.cmd_slide = self.joints.get("slide_joint", 0.0)
         self.cmd_head = np.array([
@@ -1329,9 +1543,41 @@ class ShelfPickController(Node):
     def current_scan_camera_pose(self):
         return self.scan_poses[self.scan_pose_index]
 
-    def scan_camera_ready(self) -> bool:
-        _, slide_target, yaw_target, pitch_target = (
-            self.current_scan_camera_pose())
+    def _preferred_scan_station_index(self) -> int | None:
+        """Map a preferred slot marker to its east-to-west scan station."""
+        marker_id = self.preferred_marker_id
+        if marker_id is None or not 0 <= marker_id < 45:
+            return None
+        shelf_west_to_east = marker_id // 9
+        return len(SCAN_X) - 1 - shelf_west_to_east
+
+    def _nearest_scan_stations(self) -> list[int]:
+        """Order stations by preferred marker first, then travel distance."""
+        if self.base_xy is None:
+            base = np.zeros(2, dtype=float)
+        else:
+            base = np.asarray(self.base_xy, dtype=float)
+        ordered = sorted(
+            range(len(SCAN_X)),
+            key=lambda index: (
+                float(np.linalg.norm(
+                    np.array([SCAN_X[index], SCAN_Y]) - base)),
+                index))
+        preferred = self._preferred_scan_station_index()
+        if preferred is not None:
+            ordered.remove(preferred)
+            ordered.insert(0, preferred)
+        return ordered
+
+    def current_scan_station_x(self) -> float:
+        if self.scan_station_order is None:
+            return SCAN_X[self.scan_index]
+        return SCAN_X[self.scan_station_order[self.scan_index]]
+
+    def scan_camera_ready(self, pose=None) -> bool:
+        if pose is None:
+            pose = self.current_scan_camera_pose()
+        _, slide_target, yaw_target, pitch_target = pose
         slide = self.joints.get("slide_joint")
         yaw = self.joints.get("head_yaw_joint")
         pitch = self.joints.get("head_pitch_joint")
@@ -1539,6 +1785,7 @@ class ShelfPickController(Node):
             tcp_z = max(
                 surface_z + 0.04,
                 tcp_z - DUAL_TISSUE_CONTACT_WRAP_M)
+        self.dual_contact_tcp_z = float(tcp_z)
         insert_y = (
             self.target_world[1] + self.dual_insert_forward_m)
 
@@ -3258,8 +3505,10 @@ class ShelfPickController(Node):
                 self.current_scan_camera_pose())
             self.des_slide = slide_target
             self.des_head[:] = [yaw_target, pitch_target]
+            if self.scan_station_order is None:
+                self.scan_station_order = self._nearest_scan_stations()
             navigation_ready = self.drive_to(
-                [SCAN_X[self.scan_index], SCAN_Y], YAW_NORTH, 0.08)
+                [self.current_scan_station_x(), SCAN_Y], YAW_NORTH, 0.08)
             camera_ready = self.scan_camera_ready()
             if navigation_ready and camera_ready:
                 if self.scan_camera_ready_since is None:
@@ -3283,7 +3532,7 @@ class ShelfPickController(Node):
                     f"[scan-camera] settled pose={pose_name} "
                     f"slide={slide_target:.2f} yaw={yaw_target:+.2f} "
                     f"pitch={pitch_target:+.2f} station_x="
-                    f"{SCAN_X[self.scan_index]:.3f}")
+                    f"{self.current_scan_station_x():.3f}")
                 self.set_state(STATE_SCAN)
 
         elif self.state == STATE_SCAN:
@@ -3299,6 +3548,7 @@ class ShelfPickController(Node):
                     self.scan_index += 1
                     if self.scan_index >= len(SCAN_X):
                         self.scan_index = 0
+                        self.scan_station_order = self._nearest_scan_stations()
                         self.scan_cycles += 1
                         if self.scan_cycles >= self.max_scan_cycles:
                             self.get_logger().error(
@@ -3319,13 +3569,56 @@ class ShelfPickController(Node):
             if self.drive_to(
                     [self.align_base_x, self.align_base_y],
                     YAW_NORTH, align_x_tolerance):
-                grasp_status = self.configure_grasp()
-                if grasp_status is True:
-                    if self.shelf_level in ("top", "lower"):
-                        self.begin_manip_base_hold()
-                    self.set_state(STATE_DEPLOY)
-                elif grasp_status != "retry":
-                    self.set_state(STATE_ABORT)
+                if self.close_recheck and not self._recheck_passed:
+                    self.set_state(STATE_RECHECK)
+                    self._start_close_recheck()
+                else:
+                    grasp_status = self.configure_grasp()
+                    if grasp_status is True:
+                        if self.shelf_level in ("top", "lower"):
+                            self.begin_manip_base_hold()
+                        self.set_state(STATE_DEPLOY)
+                    elif grasp_status != "retry":
+                        self.set_state(STATE_ABORT)
+
+        elif self.state == STATE_RECHECK:
+            pose = self.current_recheck_pose()
+            if pose is None:
+                self._recheck_fail()
+                return
+            _, slide_target, yaw_target, pitch_target = pose
+            self.des_slide = slide_target
+            self.des_head[:] = [yaw_target, pitch_target]
+            if self.scan_camera_ready(pose):
+                if self.scan_camera_ready_since is None:
+                    self.scan_camera_ready_since = self.now()
+                if (self.now() - self.scan_camera_ready_since
+                        >= SCAN_CAMERA_STABLE_S
+                        and self._recheck_confirmed()):
+                    self._recheck_passed = True
+                    self.recheck_confirmation_times.clear()
+                    self.recheck_poses = ()
+                    self.get_logger().info(
+                        f"[close-recheck] PASS marker="
+                        f"{self.target_marker_id} kind={self.target_kind}; "
+                        "proceeding to grasp")
+                    grasp_status = self.configure_grasp()
+                    if grasp_status is True:
+                        if self.shelf_level in ("top", "lower"):
+                            self.begin_manip_base_hold()
+                        self.set_state(STATE_DEPLOY)
+                    elif grasp_status == "retry":
+                        self.set_state(STATE_ALIGN)
+                    else:
+                        self.set_state(STATE_ABORT)
+            else:
+                self.scan_camera_ready_since = None
+
+            if (self.state == STATE_RECHECK
+                    and self.now() - self.recheck_pose_started_at
+                    >= CLOSE_RECHECK_POSE_TIMEOUT_S):
+                if not self._advance_recheck_pose():
+                    self._recheck_fail()
 
         elif self.state == STATE_DEPLOY:
             middle_sphere = (
@@ -3390,20 +3683,49 @@ class ShelfPickController(Node):
                     "the symmetric pregrasp; starting fixed surround motion")
                 self.start_dual_tissue_surround()
             elif (not self.use_dual_tissue_grasp
-                    and not self.use_sphere_grasp
-                    and (deploy_ready
-                         or deploy_elapsed
-                         >= GENERIC_DIRECT_DEPLOY_DWELL_S)):
-                if not self.approach_arm_joints:
+                    and not self.use_sphere_grasp):
+                arm_error = self.selected_arm_error()
+                measured_slide = self.joints.get("slide_joint")
+                slide_error = (
+                    float("inf") if measured_slide is None
+                    else abs(float(measured_slide) - self.des_slide))
+                # Some simulator/controller builds report a small persistent
+                # gripper tracking error even though the fingers have visibly
+                # opened.  Do not let that auxiliary feedback deadlock the
+                # whole order: arm and slide convergence are the safety gates,
+                # while preshape readiness remains a diagnostic below.
+                converged = deploy_ready
+                soft_ready = (
+                    deploy_elapsed >= GENERIC_DIRECT_DEPLOY_DWELL_S
+                    and arm_error <= GENERIC_DEPLOY_SOFT_ARM_TOLERANCE_RAD
+                    and slide_error
+                    <= GENERIC_DEPLOY_SOFT_SLIDE_TOLERANCE_M)
+                if converged or soft_ready:
+                    if not self.approach_arm_joints:
+                        self.get_logger().error(
+                            "front approach has no contact target")
+                        self.set_state(STATE_ABORT)
+                        return
+                    gate = "converged" if converged else "soft"
+                    self.get_logger().info(
+                        f"[generic-direct] pregrasp ready after "
+                        f"{deploy_elapsed:.2f}s gate={gate} "
+                        f"arm_error={arm_error:.4f}rad "
+                        f"slide_error={slide_error:.4f}m "
+                        f"grip={deploy_gripper} "
+                        f"preshape_ready={int(preshape_ready)}; "
+                        "starting forward motion")
+                    self.start_arm_forward()
+                elif deploy_elapsed >= GENERIC_DEPLOY_HARD_TIMEOUT_S:
                     self.get_logger().error(
-                        "front approach has no contact target")
+                        f"[generic-direct] pregrasp did not converge within "
+                        f"{GENERIC_DEPLOY_HARD_TIMEOUT_S:.0f}s "
+                        f"arm_error={arm_error:.4f}rad "
+                        f"slide_error={slide_error:.4f}m "
+                        f"grip={deploy_gripper} "
+                        f"preshape={self.grip_preshape_command:.3f}; "
+                        "aborting instead of starting a blind forward sweep")
                     self.set_state(STATE_ABORT)
-                    return
-                self.get_logger().info(
-                    f"[generic-direct] pregrasp ready after "
-                    f"{deploy_elapsed:.2f}s (gate={deploy_ready}); starting "
-                    "forward motion without arm/TCP/preshape convergence gates")
-                self.start_arm_forward()
             elif (self.use_sphere_grasp
                   and deploy_elapsed > 0.8 and (
                     measured_ready or continue_experiment)
@@ -4095,6 +4417,9 @@ def parse_args():
               "when the requested kind never sits on the lower shelf in "
               "retail_competition_layout.json; keep off when the server runs "
               "with SUPERMARKET_RANDOMIZE=1"))
+    parser.add_argument(
+        "--no-close-recheck", action="store_true",
+        help="disable close-range class verification before grasping")
     args = parser.parse_args()
     if not 0.0 <= args.confidence <= 1.0:
         parser.error("--confidence must be in [0, 1]")
@@ -4127,7 +4452,8 @@ def main() -> None:
             publish_result_image=True)
         controller = ShelfPickController(
             args.target_kind, args.max_scan_cycles,
-            args.tcp_diagnostic_ground_truth, args.scan_skip_lower)
+            args.tcp_diagnostic_ground_truth, args.scan_skip_lower,
+            close_recheck=not args.no_close_recheck)
         nodes = [yolo_node, aruco_node, controller]
         viewer = None
         if args.show:

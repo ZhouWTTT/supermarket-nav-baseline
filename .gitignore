@@ -20,3 +20,4 @@ models/3dgs/
 *.zip
 .cache/
 *.log
+.claude/
