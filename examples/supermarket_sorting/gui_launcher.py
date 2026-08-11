@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""超市分拣启动 GUI（整合导航 + 抓取版）。
+"""超市分拣启动 GUI（1111 正式入口版）。
 
-基于官方镜像（server/client）一键启动仿真 Server 与整合客户端
-``integrated_nav_pick_place.py``（导航到货架 → YOLO+ArUco 定位 → 抓取 →
-导航穿越障碍区 → 配送台放置），界面实时显示两个容器的日志。
+基于官方镜像（server/client）一键启动仿真 Server 与正式比赛客户端
+``scripts/run_baseline.sh``（competition_runner 从 /supermarket_sorting/task
+接收任务，逐单执行抓取→配送，失败自动重试），界面实时显示两个容器的日志。
 
 相对旧版 GUI 的差异：
   * 默认使用官方 final 镜像（server 镜像自带代码，无需挂载仓库）；

@@ -662,7 +662,7 @@ class NavigationController:
         # Velocity limits
         self.max_lin = 0.70
         self.max_ang = 2.5
-        self.max_lin_acc = 1.2
+        self.max_lin_acc = 1.5
         self.max_ang_acc = 5.0
         self.dt = 0.02
         self._last_update_time = None
@@ -677,7 +677,7 @@ class NavigationController:
 
         # Gains
         self.k_ang = 2.5
-        self.k_lin = 1.0
+        self.k_lin = 1.3
 
         # Tolerances
         self.pos_tol = 0.10
@@ -688,7 +688,7 @@ class NavigationController:
         self._blocked_timer = 0.0
         self._blocked_thresh = 0.35
         self._stop_dist = 0.32
-        self._slow_dist = 0.70
+        self._slow_dist = 0.55
         self._stop_arc = math.radians(38)
 
         # Replanning/progress state
@@ -1195,11 +1195,20 @@ class NavigationController:
 
     def _motion_is_free(self, bx, by, byaw, linear, angular,
                         horizon=0.45, sample_dt=0.05):
-        """Check the near-future arc against map and table keep-out."""
+        """Check the near-future arc against map and table keep-out.
+
+        At low speed the prediction shrinks proportionally so slow
+        creeps near walls are not blocked by a far-away arc prediction.
+        """
         if linear <= 0.0:
             return True
+        # Adaptive horizon: full 0.45 m at ≥0.35 m/s, scaled below
+        adaptive_horizon = horizon * min(1.0, linear / 0.35)
+        if adaptive_horizon < 0.08:
+            adaptive_horizon = 0.08  # at least one step
         x, y, yaw = bx, by, byaw
-        steps = max(1, int(math.ceil(horizon / sample_dt)))
+        steps = max(1, int(math.ceil(adaptive_horizon / sample_dt)))
+        dt = adaptive_horizon / steps
         dt = horizon / steps
         for _ in range(steps):
             yaw = wrap_to_pi(yaw + angular * dt)
