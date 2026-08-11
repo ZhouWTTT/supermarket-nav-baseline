@@ -35,9 +35,22 @@ OFFICIAL_PREFIX = (
     "crpi-1pzq998p9m7w0auy.cn-hangzhou.personal.cr.aliyuncs.com/"
     "challengecup/supermarket_sorting_final")
 
-# 固定使用官方 final 镜像（server 镜像自带完整代码，无需挂载仓库）
-SERVER_IMAGE = f"{OFFICIAL_PREFIX}:server"
-CLIENT_IMAGE = f"{OFFICIAL_PREFIX}:client"
+# 镜像候选：完整官方名优先；队友机器上可能是同一个镜像但本地 tag 不同。
+# 也可用环境变量 SUPERMARKET_SERVER_IMAGE / SUPERMARKET_CLIENT_IMAGE 强制指定。
+SERVER_IMAGE_CANDIDATES = [
+    os.environ.get("SUPERMARKET_SERVER_IMAGE", "").strip(),
+    f"{OFFICIAL_PREFIX}:server",
+    "supermarket_sorting_final:server",
+    "challengecup/supermarket_sorting_final:server",
+    "supermarket_sorting_task:sm120",
+]
+CLIENT_IMAGE_CANDIDATES = [
+    os.environ.get("SUPERMARKET_CLIENT_IMAGE", "").strip(),
+    f"{OFFICIAL_PREFIX}:client",
+    "supermarket_sorting_final:client",
+    "challengecup/supermarket_sorting_final:client",
+    "supermarket_sorting_task:sm120-yolo11",
+]
 
 KINDS = [
     "kele", "maidong", "heweidao", "shupian", "zhijin",
@@ -75,6 +88,8 @@ class LauncherApp:
         self._poll_job = None
         self._recorder_started = False
         self._recorder_output = None
+        self.server_image = None
+        self.client_image = None
 
         self._build_controls()
         self._build_logs()
@@ -235,6 +250,15 @@ class LauncherApp:
         code, _, _ = run_cmd(["docker", "image", "inspect", image])
         return code == 0
 
+    @staticmethod
+    def _resolve_image(candidates: list[str]) -> str | None:
+        """返回本机已存在的第一个候选镜像名（兼容不同的本地 tag）。"""
+        for name in candidates:
+            name = name.strip()
+            if name and LauncherApp._check_image(name):
+                return name
+        return None
+
     def _seed_value(self):
         seed_text = self.seed_var.get().strip()
         if not seed_text:
@@ -327,13 +351,12 @@ class LauncherApp:
         ]
         args += [
             "-v", "supermarket_sorting_cache:/root/.cache",
-            SERVER_IMAGE,
+            self.server_image,
             "bash", "-lc",
             "cd /workspace/supermarket_sorting_task && "
             "source /opt/ros/humble/setup.bash && "
             "python3 examples/supermarket_sorting/"
-            "supermarket_sorting_server.py 2>&1 | "
-            "tee logs/gui_server_$(date +%H%M%S).log",
+            "supermarket_sorting_server.py",
         ]
         return args
 
@@ -361,17 +384,17 @@ class LauncherApp:
             "-e", f"TORCH_EXTENSIONS_DIR={TORCH_CACHE}",
             "-v", f"{REPO_ROOT}:/workspace/supermarket_sorting_task",
             "-v", "supermarket_sorting_cache:/root/.cache",
-            CLIENT_IMAGE,
+            self.client_image,
             "bash", "-lc",
             "cd /workspace/supermarket_sorting_task && "
             "source /opt/ros/humble/setup.bash && "
             "python3 examples/supermarket_sorting/"
             "continuous_goods_client.py "
             f"--orders {orders} "
-            f"--max-scan-cycles {int(self.cycles_var.get())}"
-            + (" --show" if self.show_yolo_var.get() else "")
-            + " 2>&1 | tee logs/gui_client_continuous_"
-            + f"$(date +%H%M%S).log",
+            f"--max-scan-cycles {int(self.cycles_var.get())} "
+            "--weights /workspace/supermarket_sorting_task/examples/"
+            "supermarket_sorting/perception/checkpoints/best.pt"
+            + (" --show" if self.show_yolo_var.get() else ""),
         ]
         return args
 
@@ -388,7 +411,7 @@ class LauncherApp:
             "-e", f"RMW_IMPLEMENTATION={RMW}",
             "-e", "PYTHONPATH=/workspace/supermarket_sorting_task",
             "-v", f"{REPO_ROOT}:/workspace/supermarket_sorting_task",
-            CLIENT_IMAGE,
+            self.client_image,
             "python3", "/workspace/supermarket_sorting_task/record_run.py",
             "--output", output,
             "--fps", str(self.fps_var.get()),
@@ -430,12 +453,23 @@ class LauncherApp:
 
     # ---------------- actions ----------------
     def start_all(self):
-        if not self._check_image(SERVER_IMAGE) or \
-                not self._check_image(CLIENT_IMAGE):
+        self.server_image = self._resolve_image(SERVER_IMAGE_CANDIDATES)
+        self.client_image = self._resolve_image(CLIENT_IMAGE_CANDIDATES)
+        if not self.server_image or not self.client_image:
             messagebox.showerror(
                 "镜像缺失",
-                f"请先拉取官方镜像:\n  {SERVER_IMAGE}\n  {CLIENT_IMAGE}")
+                "未找到可用的 Server/Client 镜像。\n"
+                "请先拉取官方镜像：\n"
+                f"  {SERVER_IMAGE_CANDIDATES[1]}\n"
+                f"  {CLIENT_IMAGE_CANDIDATES[1]}\n"
+                "或用环境变量指定本机镜像名：\n"
+                "  SUPERMARKET_SERVER_IMAGE=<名> "
+                "SUPERMARKET_CLIENT_IMAGE=<名>")
             return
+        self._append_log(
+            self.server_text,
+            f"使用镜像: server={self.server_image} "
+            f"client={self.client_image}\n")
         if not self.orders:
             messagebox.showerror(
                 "订单为空", "请先用“随机生成”或“添加”生成订单列表。")
