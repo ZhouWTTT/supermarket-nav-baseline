@@ -8,3 +8,8 @@
 **/runs
 *.tar
 *.tar.gz
+
+# The organizer runs the Server in an isolated image. Keep the local Server
+# implementation available for development, but never copy it into the Client
+# submission image.
+examples/supermarket_sorting/supermarket_sorting_server.py
