@@ -85,10 +85,10 @@ def fixed_layout_by_marker():
 PRODUCT_CENTER_ABOVE_MARKER_M = {
     "sanmingzhi": 0.0434,
     "heweidao": 0.0355,
-    "shupian": 0.054,
+    "shupian": 0.034,
     "zhijin": 0.043,
-    "maidong": 0.104,
-    "kele": 0.0715,
+    "maidong": 0.054,
+    "kele": 0.0315,
     "kouxiangtang": 0.030,
     "pingguo": 0.034,
     "chengzi": 0.036,
@@ -211,14 +211,22 @@ NAV_ROTATE_GATE_RAD = 0.45
 NAV_ANGULAR_MAX_RADPS = 1.50
 NAV_TRANSLATE_ANGULAR_MAX_RADPS = 1.00
 NAV_YAW_DEADBAND_RAD = 0.035
+# 原地旋转卡死恢复：旋转指令发出后若 yaw 长时间无变化（被西墙/货架顶住），
+# 先短距离倒车解除卡死再继续旋转，避免在西侧货架贴墙处永久卡住。
+NAV_ROT_STALL_S = 2.5            # 旋转无进展判定时间（秒）
+NAV_ROT_STALL_MIN_CHANGE_RAD = 0.03
+NAV_ROT_UNSTICK_DIST_M = 0.15    # 解除卡死时的倒车距离
+NAV_ROT_UNSTICK_SPEED_MPS = 0.08
+NAV_ROT_UNSTICK_TIMEOUT_S = 4.0
+NAV_ROT_UNSTICK_MAX = 3          # 最多解除次数，超过后重置继续尝试
 
 ARUCO_SYNC_TOLERANCE_NS = 200_000_000
 ARUCO_MAX_VERTICAL_GAP_BOX_HEIGHTS = 1.50
 ARUCO_MAX_VERTICAL_GAP_MIN_PX = 65.0
-ARUCO_MAX_HORIZONTAL_MARGIN_BOX_WIDTHS = 0.35
+ARUCO_MAX_HORIZONTAL_MARGIN_BOX_WIDTHS = 0.60
 ARUCO_PRODUCT_LEVEL_TOLERANCE_M = 0.16
 FIXED_MARKER_POSITION_TOLERANCE_M = 0.12
-ASSOCIATION_CONFIRMATIONS_REQUIRED = 3
+ASSOCIATION_CONFIRMATIONS_REQUIRED = 2
 MARKER_SAMPLES_REQUIRED = 5
 MARKER_SAMPLE_SPREAD_MAX_M = 0.04
 
@@ -376,8 +384,7 @@ GENERIC_DIRECT_FORWARD_SETTLE_S = 1.0
 # The fixed deploy dwell is a safety ceiling; with the convergence gate the
 # arm normally starts forward as soon as the pregrasp is reached.
 GENERIC_DIRECT_DEPLOY_DWELL_S = 2.0
-GENERIC_DEPLOY_SOFT_ARM_TOLERANCE_RAD = 0.06
-GENERIC_DEPLOY_SOFT_SLIDE_TOLERANCE_M = 0.035
+GENERIC_DEPLOY_SOFT_ARM_TOLERANCE_RAD = 0.12
 GENERIC_DEPLOY_HARD_TIMEOUT_S = 8.0
 GENERIC_TOP_LIFT_M = 0.025
 GENERIC_TOP_LIFT_TIMEOUT_S = 5.0
@@ -722,6 +729,13 @@ class ShelfPickController(Node):
             else SCAN_CAMERA_POSES)
         self.nav_target = None
         self.ik_retry_forward_m = 0.0
+        # 原地旋转卡死恢复状态
+        self._rot_stall_target = None
+        self._rot_stall_anchor_yaw = None
+        self._rot_stall_anchor_t = 0.0
+        self._rot_stall_anchor_xy = None
+        self._rot_stall_unsticks = 0
+        self._rot_unstick_phase = False
 
         self.yolo_frames = deque(maxlen=24)
         self.aruco_frames = deque(maxlen=24)
@@ -1150,9 +1164,13 @@ class ShelfPickController(Node):
             self.grasp_arm = "r"
             desired_base_x = self.target_world[0]
         else:
+            # 最西侧一列（shelf A，贴西墙）固定用左臂：右臂停车点会压到
+            # 西墙（x≈-2.03）导致原地旋转/抓取卡死；左臂停车点偏东侧，安全。
+            west_slot = fixed_layout_by_marker().get(self.target_marker_id)
+            west_column = bool(west_slot and west_slot.get("shelf") == "A")
             desired_right_base_x = (
                 self.target_world[0] - ARM_LATERAL_BIAS_M)
-            if desired_right_base_x < NAV_X_MIN:
+            if west_column or desired_right_base_x < NAV_X_MIN:
                 self.grasp_arm = "l"
                 desired_base_x = (
                     self.target_world[0] + ARM_LATERAL_BIAS_M)
@@ -1573,6 +1591,8 @@ class ShelfPickController(Node):
             desired_yaw = math.atan2(delta[1], delta[0])
             yaw_error = wrap_to_pi(desired_yaw - self.base_yaw)
             if abs(yaw_error) > NAV_ROTATE_GATE_RAD:
+                if self._rotate_with_unstick(desired_yaw):
+                    return False
                 self.set_twist(0.0, float(np.clip(
                     2.2 * yaw_error, -NAV_ANGULAR_MAX_RADPS,
                     NAV_ANGULAR_MAX_RADPS)))
@@ -1586,12 +1606,90 @@ class ShelfPickController(Node):
             return False
         yaw_error = wrap_to_pi(final_yaw - self.base_yaw)
         if abs(yaw_error) > NAV_YAW_DEADBAND_RAD:
+            if self._rotate_with_unstick(final_yaw):
+                return False
             self.set_twist(0.0, float(np.clip(
                 2.0 * yaw_error, -NAV_ANGULAR_MAX_RADPS,
                 NAV_ANGULAR_MAX_RADPS)))
             return False
         self.set_twist(0.0, 0.0)
         return True
+
+    def _rotate_with_unstick(self, target_yaw: float) -> bool:
+        """原地旋转到 target_yaw；卡死（yaw 长时间无变化）时先短距倒车解除。
+
+        返回 True 表示本 tick 正在执行“解除卡死”的倒车动作，调用方不应再
+        下发旋转速度。
+        """
+        now = self.now()
+        target_yaw = wrap_to_pi(target_yaw)
+        if (self._rot_stall_target is None
+                or abs(wrap_to_pi(target_yaw - self._rot_stall_target)) > 0.05):
+            self._rot_stall_target = target_yaw
+            self._rot_stall_anchor_yaw = float(self.base_yaw)
+            self._rot_stall_anchor_t = now
+            self._rot_stall_anchor_xy = self.base_xy.copy()
+            self._rot_stall_unsticks = 0
+            self._rot_unstick_phase = False
+
+        if self._rot_unstick_phase:
+            # 沿当前朝向倒车一小段（保持 yaw），腾出旋转空间
+            heading = np.array([
+                math.cos(self.base_yaw), math.sin(self.base_yaw)])
+            moved_back = float(np.dot(
+                self._rot_stall_anchor_xy - self.base_xy, heading))
+            yaw_err = wrap_to_pi(
+                self._rot_stall_anchor_yaw - self.base_yaw)
+            if (moved_back >= NAV_ROT_UNSTICK_DIST_M
+                    or now - self._rot_stall_anchor_t
+                    >= NAV_ROT_UNSTICK_TIMEOUT_S):
+                self._rot_unstick_phase = False
+                self._rot_stall_anchor_yaw = float(self.base_yaw)
+                self._rot_stall_anchor_t = now
+                self._rot_stall_anchor_xy = self.base_xy.copy()
+                self.set_twist(0.0, 0.0)
+                self.get_logger().info(
+                    f"[rotate-unstick] backing finished moved="
+                    f"{moved_back:.3f}m; resuming rotation")
+                return False
+            angular = float(np.clip(2.0 * yaw_err, -0.5, 0.5))
+            self.set_twist(-NAV_ROT_UNSTICK_SPEED_MPS, angular)
+            return True
+
+        yaw_changed = abs(wrap_to_pi(
+            self.base_yaw - self._rot_stall_anchor_yaw))
+        moved = (
+            0.0 if self._rot_stall_anchor_xy is None
+            else float(np.linalg.norm(
+                self.base_xy - self._rot_stall_anchor_xy)))
+        if now - self._rot_stall_anchor_t >= NAV_ROT_STALL_S:
+            if yaw_changed < NAV_ROT_STALL_MIN_CHANGE_RAD and moved < 0.03:
+                self._rot_stall_unsticks += 1
+                if self._rot_stall_unsticks > NAV_ROT_UNSTICK_MAX:
+                    # 多次解除仍卡死：重置继续尝试旋转，由上层超时/重试兜底
+                    self._rot_stall_unsticks = 0
+                    self._rot_stall_anchor_yaw = float(self.base_yaw)
+                    self._rot_stall_anchor_t = now
+                    self._rot_stall_anchor_xy = self.base_xy.copy()
+                    self.get_logger().warn(
+                        "[rotate-unstick] still stuck after multiple "
+                        "attempts; continuing rotation")
+                    return False
+                self.get_logger().warn(
+                    f"[rotate-unstick] rotation stalled for "
+                    f"{now - self._rot_stall_anchor_t:.1f}s "
+                    f"(yaw_change={yaw_changed:.3f}rad); backing up "
+                    f"{NAV_ROT_UNSTICK_DIST_M:.2f}m to free the base")
+                self._rot_unstick_phase = True
+                self._rot_stall_anchor_xy = self.base_xy.copy()
+                self._rot_stall_anchor_yaw = float(self.base_yaw)
+                self._rot_stall_anchor_t = now
+                return True
+            # 有进展：重置计时基准
+            self._rot_stall_anchor_yaw = float(self.base_yaw)
+            self._rot_stall_anchor_t = now
+            self._rot_stall_anchor_xy = self.base_xy.copy()
+        return False
 
     def world_to_footprint(self, world: np.ndarray) -> np.ndarray:
         delta = np.asarray(world, dtype=float) - np.array([
@@ -3674,9 +3772,7 @@ class ShelfPickController(Node):
                 converged = deploy_ready
                 soft_ready = (
                     deploy_elapsed >= GENERIC_DIRECT_DEPLOY_DWELL_S
-                    and arm_error <= GENERIC_DEPLOY_SOFT_ARM_TOLERANCE_RAD
-                    and slide_error
-                    <= GENERIC_DEPLOY_SOFT_SLIDE_TOLERANCE_M)
+                    and arm_error <= GENERIC_DEPLOY_SOFT_ARM_TOLERANCE_RAD)
                 if converged or soft_ready:
                     if not self.approach_arm_joints:
                         self.get_logger().error(
@@ -3694,13 +3790,23 @@ class ShelfPickController(Node):
                         "starting forward motion")
                     self.start_arm_forward()
                 elif deploy_elapsed >= GENERIC_DEPLOY_HARD_TIMEOUT_S:
+                    diag_measured = np.round(self.selected_arm_positions(), 4)
+                    diag_desired = np.round(
+                        self.des_left_arm if self.grasp_arm == "l"
+                        else self.des_right_arm, 4)
+                    diag_delta = np.round(diag_measured - diag_desired, 4)
                     self.get_logger().error(
                         f"[generic-direct] pregrasp did not converge within "
                         f"{GENERIC_DEPLOY_HARD_TIMEOUT_S:.0f}s "
                         f"arm_error={arm_error:.4f}rad "
                         f"slide_error={slide_error:.4f}m "
                         f"grip={deploy_gripper} "
-                        f"preshape={self.grip_preshape_command:.3f}; "
+                        f"preshape={self.grip_preshape_command:.3f} "
+                        f"measured={diag_measured.tolist()} "
+                        f"desired={diag_desired.tolist()} "
+                        f"delta={diag_delta.tolist()} "
+                        f"align_y={self.align_base_y:.4f} "
+                        f"target={np.round(self.target_world, 4).tolist()}; "
                         "aborting instead of starting a blind forward sweep")
                     self.set_state(STATE_ABORT)
             elif (self.use_sphere_grasp

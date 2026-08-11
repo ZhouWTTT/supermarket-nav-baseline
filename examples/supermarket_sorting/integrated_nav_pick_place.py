@@ -158,6 +158,11 @@ PLACE_CREEP_FRONT_STOP_M = 0.30
 PLACE_CREEP_YAW_GAIN = 2.0
 PLACE_CREEP_MAX_ANGULAR_RPS = 0.30
 PLACE_RELEASE_TABLE_MARGIN_M = 0.04
+# 放桌手臂到位超时与备选姿态重试：第 0 步发出放桌手臂目标后，若长时间不
+# 收敛（肩关节被货物/机体卡住），自动换下一组 d/z/slide 候选重新解 IK，
+# 多次仍不行才抛错让上层重试/跳过，避免在放桌点永久冻结。
+PLACE_ARM_SETTLE_TIMEOUT_S = 8.0
+PLACE_ARM_RETRY_MAX = 3
 
 # Compact post-place travel pose (mirrors INIT_ARM in supermarket_sorting_client)
 PLACE_RETREAT_ARM_L = [0.0, -0.166, 0.032, 0.0, 1.571, 2.223]
@@ -225,8 +230,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_slide_cmd = None
         self.place_release_world = None
         self.place_release_slide_cmd = None
-        self._place_ik_attempted = False
+        self._place_ik_attempted = None
         self._place_arm_target_sent = False
+        self._place_arm_sent_t0 = None
+        self._place_candidate_skip = 0
         self._place_descent_sent = False
         self._place_retreat_sent = False
         self._dual_descent_sent = False
@@ -501,7 +508,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             + PLACE_PRODUCT_BOTTOM_CLEARANCE_M
             + tcp_above_product_center)
 
-    def _compute_place_arm_joints(self) -> np.ndarray | None:
+    def _compute_place_arm_joints(
+            self, candidate_skip: int = 0) -> np.ndarray | None:
         """Solve an approach pose with enough slide travel for a low release.
 
         The numeric IK depends heavily on the reference joints.  At the
@@ -509,11 +517,15 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         we also try the compact INIT pose and the measured joints.  Once an
         approach pose is found, the final vertical descent keeps the arm joints
         fixed and increases the downward-facing slide joint.  The result
-        (including failure) is cached to avoid per-tick recomputation.
+        (including failure) is cached per ``candidate_skip`` level to avoid
+        per-tick recomputation.  When the arm does not converge (jammed by
+        the held goods or the robot body), ``candidate_skip`` skips already
+        tried approach candidates and returns the next distinct solution.
         """
-        if self._place_ik_attempted:
+        if (self._place_ik_attempted is not None
+                and self._place_ik_attempted == candidate_skip):
             return self.place_arm_joints
-        self._place_ik_attempted = True
+        self._place_ik_attempted = candidate_skip
 
         measured = self.selected_arm_positions()
         compact = np.asarray(
@@ -544,6 +556,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                        for item in slide_candidates):
                 slide_candidates.append(slide)
 
+        solved_count = 0
         for d in d_candidates:
             for z in z_candidates:
                 descent = z - release_z
@@ -555,6 +568,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     for ref in refs:
                         joints = self._solve_place_world(world, ref, slide)
                         if joints is None:
+                            continue
+                        if solved_count < candidate_skip:
+                            solved_count += 1
                             continue
                         self.place_world = world
                         self.place_arm_joints = joints
@@ -696,7 +712,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             if not self._advance_place_creep():
                 return
             if self.place_arm_joints is None:
-                self.place_arm_joints = self._compute_place_arm_joints()
+                self.place_arm_joints = self._compute_place_arm_joints(
+                    candidate_skip=self._place_candidate_skip)
                 if self.place_arm_joints is not None:
                     # Send once — set_selected_arm_target resets
                     # commands_ready_since, so calling it every tick would
@@ -705,6 +722,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     if self.place_slide_cmd is not None:
                         self.des_slide = self.place_slide_cmd
                     self._place_arm_target_sent = True
+                    self._place_arm_sent_t0 = now
                 else:
                     raise RuntimeError(
                         "place IK failed; refusing to release goods off-table")
@@ -726,6 +744,27 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 self.des_slide = self.place_release_slide_cmd
                 self.commands_ready_since = None
                 self._place_descent_sent = True
+            elif (self._place_arm_sent_t0 is not None
+                    and now - self._place_arm_sent_t0
+                    >= PLACE_ARM_SETTLE_TIMEOUT_S):
+                # 手臂长时间不到位（可能被货物/机体卡住）：换下一组备选姿态
+                # 重新解 IK；多次仍不行才抛错交给上层重试/跳过。
+                self._place_candidate_skip += 1
+                if self._place_candidate_skip > PLACE_ARM_RETRY_MAX:
+                    raise RuntimeError(
+                        f"place arm did not converge after "
+                        f"{PLACE_ARM_RETRY_MAX} retries "
+                        f"(arm_err={self.selected_arm_error():.3f}rad)")
+                self.get_logger().warn(
+                    f"[place] arm not converged within "
+                    f"{PLACE_ARM_SETTLE_TIMEOUT_S:.0f}s "
+                    f"(arm_err={self.selected_arm_error():.3f}rad); "
+                    f"retrying candidate "
+                    f"{self._place_candidate_skip}/{PLACE_ARM_RETRY_MAX}")
+                self.place_arm_joints = None
+                self._place_arm_sent_t0 = None
+                self._place_arm_target_sent = False
+                self.commands_ready_since = None
         elif self.place_stage == 1:
             # Keep the product clamped while the slide lowers the complete arm
             # vertically.  Opening is forbidden until measured XY and Z both

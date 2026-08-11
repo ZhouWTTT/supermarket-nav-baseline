@@ -39,6 +39,24 @@ Runtime summaries are written below `/tmp/supermarket_competition/<run_prefix>`
 inside the Client container.  The formal path never enables fixed-layout or
 ground-truth diagnostic options.
 
+## GUI launcher
+
+宿主机运行项目根目录的 `gui_launcher_continuous.py` 可一键启动 Server 与
+连续多单客户端（界面与主仓库 `gui_launcher_continuous.py` 完全一致，固定
+使用官方 final 镜像）：
+
+```bash
+python3 gui_launcher_continuous.py
+```
+
+它会挂载本目录到客户端容器的 `/workspace/supermarket_sorting_task` 并执行
+`examples/supermarket_sorting/continuous_goods_client.py`：每单执行
+「抓货区抓取 → 导航到终点 → 直接扔货 → 返回抓货区」。GUI 在宿主机生成
+订单列表并通过 `--orders` 传给客户端。
+
+正式比赛入口（任务话题驱动、带完整放桌流程）仍可通过 `scripts/run_baseline.sh`
+运行，两者互不影响。
+
 ## Submission image
 
 The same entry can be packaged on top of the organizer's Client image:
