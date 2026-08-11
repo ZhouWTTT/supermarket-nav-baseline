@@ -690,6 +690,10 @@ class NavigationController:
         self._stop_dist = 0.32
         self._slow_dist = 0.55
         self._stop_arc = math.radians(38)
+        # Optional chassis-width forward corridor.  ``None`` preserves the
+        # original cone check; navigation-only callers can enable the
+        # corridor so close side walls are not mistaken for frontal hazards.
+        self.front_corridor_half_width = None
 
         # Replanning/progress state
         self._last_replan_time = float('-inf')
@@ -1173,7 +1177,14 @@ class NavigationController:
         return self.cur_ang
 
     def _front_clearance(self, laser_msg):
-        """Minimum valid range in the forward cone, independent of scan layout."""
+        """Return obstacle clearance in front of the moving chassis.
+
+        By default this preserves the original cone-based behaviour.  When
+        ``front_corridor_half_width`` is configured, each laser return is
+        projected into forward/lateral coordinates and only points inside
+        that corridor participate.  This prevents parallel walls beside the
+        robot from causing a false emergency stop in a narrow aisle.
+        """
         if laser_msg is None or not laser_msg.ranges:
             return float('inf')
         angle = float(laser_msg.angle_min)
@@ -1182,10 +1193,18 @@ class NavigationController:
         range_max = float(getattr(laser_msg, 'range_max', float('inf')))
         clearance = float('inf')
         for r in laser_msg.ranges:
-            if abs(wrap_to_pi(angle)) <= self._stop_arc:
-                r = float(r)
-                if math.isfinite(r) and range_min < r <= range_max:
-                    clearance = min(clearance, r)
+            beam_angle = wrap_to_pi(angle)
+            r = float(r)
+            if math.isfinite(r) and range_min < r <= range_max:
+                if self.front_corridor_half_width is None:
+                    if abs(beam_angle) <= self._stop_arc:
+                        clearance = min(clearance, r)
+                elif abs(beam_angle) < math.pi / 2.0:
+                    forward = r * math.cos(beam_angle)
+                    lateral = r * math.sin(beam_angle)
+                    if (forward > 0.0 and abs(lateral) <=
+                            self.front_corridor_half_width):
+                        clearance = min(clearance, forward)
             angle += angle_inc
         return clearance
 

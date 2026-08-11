@@ -46,6 +46,20 @@ PARK_ARM_L = [0.0, -0.166, 0.032, 0.0, 1.571, 2.223, 0.0]
 PARK_ARM_R = [0.0, -0.166, 0.032, 0.0, -1.571, -2.223, 0.0]
 NAV_HEAD = [0.0, -0.50]
 
+# Navigation-only speed profile.  The default is faster than the formal
+# loaded-robot profile, while remaining below the navigator's old 0.70 m/s
+# ceiling.  Environment variables make container-side tuning possible.
+DEMO_MAX_LINEAR_MPS = float(os.environ.get(
+    "SUPERMARKET_NAV_MAX_LINEAR", "0.55"))
+DEMO_MAX_ANGULAR_RADPS = float(os.environ.get(
+    "SUPERMARKET_NAV_MAX_ANGULAR", "1.80"))
+DEMO_LINEAR_STEP_MPS = float(os.environ.get(
+    "SUPERMARKET_NAV_LINEAR_STEP", "0.025"))
+DEMO_ANGULAR_STEP_RADPS = float(os.environ.get(
+    "SUPERMARKET_NAV_ANGULAR_STEP", "0.12"))
+DEMO_FRONT_CORRIDOR_HALF_WIDTH_M = float(os.environ.get(
+    "SUPERMARKET_NAV_FRONT_HALF_WIDTH", "0.24"))
+
 # ---------------------------------------------------------------------------
 # Navigation-only task sequence
 # ---------------------------------------------------------------------------
@@ -90,6 +104,18 @@ class NavigationDemoNode(Node):
         super().__init__("navigation_demo")
 
         self.navigator = SupermarketNavigator()
+        if min(DEMO_MAX_LINEAR_MPS, DEMO_MAX_ANGULAR_RADPS,
+               DEMO_LINEAR_STEP_MPS, DEMO_ANGULAR_STEP_RADPS,
+               DEMO_FRONT_CORRIDOR_HALF_WIDTH_M) <= 0.0:
+            raise ValueError(
+                "navigation speed and corridor parameters must be positive")
+        controller = self.navigator.controller
+        controller.max_lin = DEMO_MAX_LINEAR_MPS
+        controller.max_ang = DEMO_MAX_ANGULAR_RADPS
+        controller.max_lin_acc = DEMO_LINEAR_STEP_MPS / 0.02
+        controller.max_ang_acc = DEMO_ANGULAR_STEP_RADPS / 0.02
+        controller.front_corridor_half_width = (
+            DEMO_FRONT_CORRIDOR_HALF_WIDTH_M)
 
         # Robot state
         self.base_x = self.base_y = self.base_yaw = None
@@ -103,6 +129,8 @@ class NavigationDemoNode(Node):
         self._arms_tucked = False
         self._last_sensor_warn = float('-inf')
         self._last_safety_warn = float('-inf')
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
 
         # Demo state machine
         self.seq_index = 0
@@ -266,7 +294,9 @@ class NavigationDemoNode(Node):
         odom_stale = (
             self.last_odom_time is None or now - self.last_odom_time > 0.50)
         if scan_stale or odom_stale:
-            self._publish_cmd(0.0, 0.0)
+            # The formal controller bypasses its slew limiter when feedback
+            # is stale, publishing an immediate zero-velocity safety command.
+            self._publish_cmd(0.0, 0.0, immediate=True)
             if now - self._last_sensor_warn > 1.0:
                 self.get_logger().warn(
                     "waiting for fresh scan/odom data "
@@ -287,7 +317,7 @@ class NavigationDemoNode(Node):
                 time_now=now)
         except Exception as e:
             self.get_logger().error(f"navigator.update crashed: {e}")
-            self._publish_cmd(0.0, 0.0)
+            self._publish_cmd(0.0, 0.0, immediate=True)
             return
 
         self._publish_cmd(v, w)
@@ -334,10 +364,31 @@ class NavigationDemoNode(Node):
             self.state = "DWELLING"
             self.arrive_timer = 0.0
 
-    def _publish_cmd(self, v, w):
+    @staticmethod
+    def _clip(value, lower, upper):
+        return max(lower, min(upper, float(value)))
+
+    def _publish_cmd(self, v, w, immediate=False):
+        if immediate:
+            publish_linear = 0.0
+            publish_angular = 0.0
+        else:
+            desired_linear = self._clip(
+                v, -DEMO_MAX_LINEAR_MPS, DEMO_MAX_LINEAR_MPS)
+            desired_angular = self._clip(
+                w, -DEMO_MAX_ANGULAR_RADPS, DEMO_MAX_ANGULAR_RADPS)
+            self.cmd_linear += self._clip(
+                desired_linear - self.cmd_linear,
+                -DEMO_LINEAR_STEP_MPS, DEMO_LINEAR_STEP_MPS)
+            self.cmd_angular += self._clip(
+                desired_angular - self.cmd_angular,
+                -DEMO_ANGULAR_STEP_RADPS, DEMO_ANGULAR_STEP_RADPS)
+            publish_linear = self.cmd_linear
+            publish_angular = self.cmd_angular
+
         tw = Twist()
-        tw.linear.x = float(v)
-        tw.angular.z = float(w)
+        tw.linear.x = publish_linear
+        tw.angular.z = publish_angular
         self.cmd_pub.publish(tw)
 
 
