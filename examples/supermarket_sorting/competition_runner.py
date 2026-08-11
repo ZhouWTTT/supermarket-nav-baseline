@@ -64,7 +64,6 @@ class CompetitionRunner(Node):
         self.current_order = None
         self.worker_stop_reason: str | None = None
         self.worker_terminate_at: float | None = None
-        self.preferred_marker_id: int | None = None
         self.finished = False
         self.latest_yolo: tuple[int, list[dict]] | None = None
         self.latest_aruco: tuple[int, list[dict]] | None = None
@@ -153,13 +152,13 @@ class CompetitionRunner(Node):
             self._finish_match("match_timeout")
             return
 
-        order, preferred_marker = self._select_order()
+        order = self._select_order()
         if order is None:
             self._finish_match("orders_terminal")
             return
-        self._start_worker(order, preferred_marker)
+        self._start_worker(order)
 
-    def _start_worker(self, order, preferred_marker: int | None) -> None:
+    def _start_worker(self, order) -> None:
         assert self.task is not None
         run_dir = (
             Path(self.args.runtime_dir)
@@ -183,13 +182,10 @@ class CompetitionRunner(Node):
             "--formal-mode",
         ]
         command.extend(marker_arguments(self.task.excluded_markers(order.kind)))
-        if preferred_marker is not None:
-            command.extend(["--preferred-marker-id", str(preferred_marker)])
         if self.args.show:
             command.append("--show")
 
         self.current_order = order
-        self.preferred_marker_id = preferred_marker
         self.worker_result_path = result_path
         self.worker_started_at = time.monotonic()
         self.worker_stop_reason = None
@@ -197,7 +193,6 @@ class CompetitionRunner(Node):
         self.get_logger().info(
             f"starting order id={order.id} kind={order.kind} "
             f"attempt={order.attempts + 1}/{self.args.max_attempts} "
-            f"preferred_marker={preferred_marker} "
             f"excluded_markers={self.task.excluded_markers(order.kind)}")
         try:
             self.worker = subprocess.Popen(
@@ -215,7 +210,6 @@ class CompetitionRunner(Node):
                 max_attempts=self.args.max_attempts,
             )
             self.current_order = None
-            self.preferred_marker_id = None
             self.worker_started_at = None
             self.worker_result_path = None
             self._write_summary("worker_start_failed")
@@ -275,7 +269,6 @@ class CompetitionRunner(Node):
         self.worker_started_at = None
         self.worker_result_path = None
         self.current_order = None
-        self.preferred_marker_id = None
         self.worker_stop_reason = None
         self.worker_terminate_at = None
         self._publish_stop()
@@ -406,7 +399,7 @@ class CompetitionRunner(Node):
             and order.attempts < self.args.max_attempts
         ]
         if not candidates:
-            return None, None
+            return None
 
         def inventory_for(order):
             excluded = set(self.task.excluded_markers(order.kind))
@@ -445,8 +438,7 @@ class CompetitionRunner(Node):
                  GRASP_COST.get(order.kind, 10.0), order.source_index),
                 order, entry))
         _, order, entry = min(ranked, key=lambda item: item[0])
-        marker_id = None if entry is None else int(entry["marker_id"])
-        return order, marker_id
+        return order
 
     def stop(self) -> None:
         self._publish_stop()

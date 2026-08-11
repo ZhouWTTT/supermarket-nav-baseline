@@ -1031,9 +1031,6 @@ def parse_args() -> argparse.Namespace:
         "--exclude-marker-id", action="append", type=int, default=[],
         help="ignore a marker already delivered or failed in this match")
     parser.add_argument(
-        "--preferred-marker-id", type=int,
-        help="prefer a confirmed inventory marker for this order")
-    parser.add_argument(
         "--formal-mode", action="store_true",
         help="disable all fixed-layout diagnostic shortcuts")
     parser.add_argument(
@@ -1093,9 +1090,6 @@ def parse_args() -> argparse.Namespace:
             "formal mode forbids fixed-layout ground truth and scan shortcuts")
     invalid_markers = [value for value in args.exclude_marker_id
                        if value < 0 or value > 44]
-    if (args.preferred_marker_id is not None
-            and not 0 <= args.preferred_marker_id <= 44):
-        invalid_markers.append(args.preferred_marker_id)
     if invalid_markers:
         parser.error(f"invalid ArUco marker ids: {invalid_markers}")
     return args
@@ -1163,15 +1157,10 @@ def main() -> int:
             place_creep_m=args.place_creep_distance,
             close_recheck=not args.no_close_recheck)
         controller.excluded_marker_ids = set(args.exclude_marker_id)
-        controller.preferred_marker_id = args.preferred_marker_id
         if controller.excluded_marker_ids:
             controller.get_logger().info(
                 "excluding markers from earlier attempts: "
                 f"{sorted(controller.excluded_marker_ids)}")
-        if controller.preferred_marker_id is not None:
-            controller.get_logger().info(
-                f"using confirmed inventory marker: "
-                f"{controller.preferred_marker_id}")
         nodes = [yolo_node, aruco_node, controller]
         viewer = None
         if args.show:

@@ -750,7 +750,6 @@ class ShelfPickController(Node):
         # attempt, so a retry searches for another physical item of the same
         # kind instead of repeatedly selecting the same slot.
         self.excluded_marker_ids = set()
-        self.preferred_marker_id = None
         self.close_recheck = bool(close_recheck)
         self.recheck_marker_skips = set()
         self.recheck_confirmation_times = deque(maxlen=12)
@@ -991,9 +990,6 @@ class ShelfPickController(Node):
         if marker_id in self.excluded_marker_ids:
             return
         if marker_id in self.recheck_marker_skips:
-            return
-        if (self.preferred_marker_id is not None
-                and marker_id != self.preferred_marker_id):
             return
         marker_world = np.asarray(marker["position_world"], dtype=float)
         if marker_id in self.skipped_tissue_markers:
@@ -1381,12 +1377,6 @@ class ShelfPickController(Node):
         marker_id = self.target_marker_id
         if marker_id is not None:
             self.recheck_marker_skips.add(marker_id)
-        if self.preferred_marker_id == marker_id:
-            self.get_logger().warn(
-                f"[close-recheck] preferred marker={marker_id} failed; "
-                "clearing the preference so another same-kind item can be "
-                "considered")
-            self.preferred_marker_id = None
         self.get_logger().warn(
             f"[close-recheck] FAILED marker={marker_id} "
             f"kind={self.target_kind}; all close-view poses exhausted; "
@@ -1561,16 +1551,8 @@ class ShelfPickController(Node):
     def current_scan_camera_pose(self):
         return self.scan_poses[self.scan_pose_index]
 
-    def _preferred_scan_station_index(self) -> int | None:
-        """Map a preferred slot marker to its east-to-west scan station."""
-        marker_id = self.preferred_marker_id
-        if marker_id is None or not 0 <= marker_id < 45:
-            return None
-        shelf_west_to_east = marker_id // 9
-        return len(SCAN_X) - 1 - shelf_west_to_east
-
     def _nearest_scan_stations(self) -> list[int]:
-        """Order stations by preferred marker first, then travel distance."""
+        """Order stations by travel distance."""
         if self.base_xy is None:
             base = np.zeros(2, dtype=float)
         else:
@@ -1581,10 +1563,6 @@ class ShelfPickController(Node):
                 float(np.linalg.norm(
                     np.array([SCAN_X[index], SCAN_Y]) - base)),
                 index))
-        preferred = self._preferred_scan_station_index()
-        if preferred is not None:
-            ordered.remove(preferred)
-            ordered.insert(0, preferred)
         return ordered
 
     def current_scan_station_x(self) -> float:
