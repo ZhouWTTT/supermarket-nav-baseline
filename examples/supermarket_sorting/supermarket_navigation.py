@@ -45,6 +45,17 @@ DELIVERY_APPROACH = (-1.80, -2.60, -math.pi / 2.0)
 DELIVERY_TABLE_XML_BOUNDS = (-2.42, -3.63, -1.46, -3.19)
 DELIVERY_TABLE_COSTMAP_BOUNDS = (-2.45, -3.66, -1.43, -3.16)
 WHOLE_BODY_KEEP_OUT_RADIUS = 0.55
+TABLE_ROTATION_KEEP_OUT_RADIUS = 0.50
+ROBOT_HALF_WIDTH_M = 0.20
+ROBOT_NAVIGATION_MARGIN_M = 0.04
+FRONT_CORRIDOR_HALF_WIDTH_M = (
+    ROBOT_HALF_WIDTH_M + ROBOT_NAVIGATION_MARGIN_M)
+# Only the physical chassis plus a small measurement allowance should cause
+# an unconditional laser stop.  Returns in the remaining navigation-margin
+# band are still represented in the dynamic costmap and checked by the motion
+# trajectory predictor, so a shelf beside the chassis does not masquerade as
+# an obstacle directly in front of it.
+HARD_STOP_CORRIDOR_HALF_WIDTH_M = ROBOT_HALF_WIDTH_M + 0.01
 
 # Shelf approach poses.  y=2.40 stays inside the picking zone while leaving a
 # clear cross-aisle above the middle wall endpoint at y=1.70.
@@ -175,6 +186,7 @@ class Costmap2D:
         self.vision_hits = np.zeros((self.height, self.width), dtype=np.uint8)
         self.dynamic = np.zeros((self.height, self.width), dtype=np.int8)
         self.master = np.zeros((self.height, self.width), dtype=np.int8)
+        self._raw_dynamic_points_world = np.empty((0, 2), dtype=float)
 
         # Pre-compute disk kernel for inflation
         r = int(math.ceil(inflation_radius_m / resolution))
@@ -411,6 +423,14 @@ class Costmap2D:
         """Inflate the union of lidar and RGB-D raw obstacle observations."""
         raw_occupied = ((self.dynamic_raw == LETHAL) |
                         (self.vision_raw == LETHAL))
+        rows, cols = np.nonzero(raw_occupied)
+        if rows.size:
+            self._raw_dynamic_points_world = np.column_stack((
+                (cols.astype(float) + 0.5) * self.resolution + self.origin_x,
+                (rows.astype(float) + 0.5) * self.resolution + self.origin_y,
+            ))
+        else:
+            self._raw_dynamic_points_world = np.empty((0, 2), dtype=float)
         # Always inflate from raw hits, never from the previous inflated layer.
         occ = raw_occupied.astype(np.int8)
         inflated = maximum_filter(occ, footprint=self._disk)
@@ -457,6 +477,22 @@ class Costmap2D:
     def is_free_world(self, wx, wy):
         gx, gy = self.world_to_grid(wx, wy)
         return self.is_free_grid(gx, gy)
+
+    def is_static_free_world(self, wx, wy):
+        """Whether a world point is outside the inflated static layer."""
+        gx, gy = self.world_to_grid(wx, wy)
+        return (
+            self.in_bounds(gx, gy)
+            and self.static[gy, gx] < LETHAL
+        )
+
+    def raw_dynamic_clearance_world(self, wx, wy):
+        """Distance to the nearest uninflated lidar/RGB-D obstacle hit."""
+        if self._raw_dynamic_points_world.size == 0:
+            return float('inf')
+        delta = self._raw_dynamic_points_world - np.array(
+            [float(wx), float(wy)], dtype=float)
+        return float(np.sqrt(np.min(np.sum(delta * delta, axis=1))))
 
     def line_is_free(self, wx0, wy0, wx1, wy1):
         """Return whether the complete world-space segment is collision-free."""
@@ -687,12 +723,44 @@ class NavigationController:
         self.yaw_tol = 0.15
 
         # Obstacle safety.  The laser is 9 cm ahead of base_link and the base
-        # front is about 21 cm ahead, so 0.34 m still leaves braking margin.
+        # front is about 21 cm ahead, so 0.32 m still leaves braking margin.
         self._blocked_timer = 0.0
         self._blocked_thresh = 0.35
         self._stop_dist = 0.32
-        self._slow_dist = 0.70
+        self._slow_dist = 0.55
         self._stop_arc = math.radians(38)
+        self.front_corridor_half_width = FRONT_CORRIDOR_HALF_WIDTH_M
+        self.hard_stop_corridor_half_width = (
+            HARD_STOP_CORRIDOR_HALF_WIDTH_M)
+        self._arc_blocked_timer = 0.0
+        self._arc_replan_threshold = 0.35
+
+        # Safe straight-reverse recovery.  Replanning from an unchanged pose
+        # cannot resolve a path whose first segment needs more turning room,
+        # so a persistent local block may move the base a short measured
+        # distance backwards before forcing a new plan.
+        self._reverse_recovery_phase = None
+        self._reverse_recovery_blocked_time = 0.0
+        self._reverse_recovery_block_anchor_x = None
+        self._reverse_recovery_block_anchor_y = None
+        self._reverse_recovery_start_x = None
+        self._reverse_recovery_start_y = None
+        self._reverse_recovery_start_yaw = None
+        self._reverse_recovery_started_at = 0.0
+        self._reverse_recovery_trigger_s = 1.0
+        self._reverse_recovery_no_progress_m = 0.03
+        self._reverse_recovery_distance_m = 0.12
+        self._reverse_recovery_speed = 0.10
+        self._reverse_recovery_timeout_s = 10.0
+        # The lidar is about 0.09 m ahead of base_link while the chassis rear
+        # is roughly 0.22 m behind it.  A 0.45 m laser clearance therefore
+        # preserves about 0.14 m behind the physical rear face.
+        self._reverse_recovery_rear_stop_m = 0.45
+        self._reverse_recovery_yaw_gain = 2.0
+        self._reverse_recovery_max_ang = 0.30
+        self._reverse_recovery_attempts = 0
+        self._reverse_recovery_max_attempts = 2
+        self._reverse_recovery_cooldown_until = float('-inf')
 
         # Replanning/progress state
         self._last_replan_time = float('-inf')
@@ -710,11 +778,15 @@ class NavigationController:
         self._rotation_anchor_x = None
         self._rotation_anchor_y = None
         self._last_base_yaw = None
-        self._rotation_loop_limit = 0.80 * math.pi
+        # A normal route may legitimately require a full 180-degree turn
+        # after leaving the delivery table.  Only substantially more rotation
+        # without translation is considered a loop.
+        self._rotation_loop_limit = 1.25 * math.pi
         self._rotation_recoveries = 0
 
         # Per-sensor clearance and stop-reason diagnostics
         self.lidar_clearance = float('inf')
+        self.rear_clearance = float('inf')
         self.depth_clearance_val = float('inf')
         self.stop_reason = None          # current stop reason (str or None)
         self._last_logged_reason = None  # avoid log spam
@@ -736,6 +808,17 @@ class NavigationController:
         self.nav_goal_y = self.goal_y
         self.path = []
         self._blocked_timer = 0.0
+        self._arc_blocked_timer = 0.0
+        self._reverse_recovery_phase = None
+        self._reverse_recovery_blocked_time = 0.0
+        self._reverse_recovery_block_anchor_x = None
+        self._reverse_recovery_block_anchor_y = None
+        self._reverse_recovery_start_x = None
+        self._reverse_recovery_start_y = None
+        self._reverse_recovery_start_yaw = None
+        self._reverse_recovery_started_at = 0.0
+        self._reverse_recovery_attempts = 0
+        self._reverse_recovery_cooldown_until = float('-inf')
         self._last_replan_time = float('-inf')
         self._replan_hold_until = float('-inf')
         self._best_goal_dist = float('inf')
@@ -748,6 +831,7 @@ class NavigationController:
         self.stop_reason = None
         self._last_logged_reason = None
         self.lidar_clearance = float('inf')
+        self.rear_clearance = float('inf')
         self.depth_clearance_val = float('inf')
         self._last_plan_mode = None
         self._last_plan_full_failure = None
@@ -768,7 +852,9 @@ class NavigationController:
         # Capture current sensor values before any planner branch can return.
         # Previously no_path/stuck_no_path logs displayed values left over from
         # the last successful control cycle.
-        self.lidar_clearance = self._front_clearance(laser_msg)
+        self.lidar_clearance = self._front_clearance(
+            laser_msg, self.hard_stop_corridor_half_width)
+        self.rear_clearance = self._rear_clearance(laser_msg)
         if (depth_clearance is not None and
                 math.isfinite(float(depth_clearance))):
             self.depth_clearance_val = float(depth_clearance)
@@ -781,6 +867,10 @@ class NavigationController:
 
         if self.goal_x is None:
             return 0.0, 0.0, True
+
+        if self._reverse_recovery_phase == "backup":
+            return self._reverse_recovery_tick(
+                base_x, base_y, base_yaw, laser_msg, now)
 
         rotation_loop = self._update_rotation_watchdog(
             base_x, base_y, base_yaw)
@@ -800,6 +890,10 @@ class NavigationController:
             self._rotation_anchor_y = base_y
             self.cur_lin = self.cur_ang = 0.0
             self.stop_reason = "rotation_loop"
+            if self._maybe_start_reverse_recovery(
+                    "rotation_loop", base_x, base_y, base_yaw,
+                    laser_msg, now):
+                self.stop_reason = "reverse_recovery_start"
             return 0.0, 0.0, False
 
         # Plan periodically so newly observed boxes trigger a prompt detour.
@@ -911,6 +1005,12 @@ class NavigationController:
                 v_des = 0.0
             new_reason = "heading_alignment"
 
+        # Preserve the controller's intent before obstacle scaling.  When
+        # clearance is already inside stop_dist the scale below becomes zero;
+        # testing the scaled velocity would then hide a real lidar/depth stop
+        # and prevent persistent-block recovery from ever starting.
+        forward_intent = v_des > 1e-6
+
         if v_des > 0.0 and composite < self._slow_dist:
             scale = (composite - self._stop_dist) / (
                 self._slow_dist - self._stop_dist)
@@ -923,7 +1023,7 @@ class NavigationController:
             v = 0.18
 
         # ── emergency stop (per-sensor) ──
-        if v > 0.0 and self.lidar_clearance <= self._stop_dist:
+        if forward_intent and self.lidar_clearance <= self._stop_dist:
             self.cur_lin = 0.0
             v = 0.0
             new_reason = "lidar_stop"
@@ -936,7 +1036,7 @@ class NavigationController:
                     self._consider_new_path(
                         new_path, base_x, base_y, force=True)
                 self._blocked_timer = 0.0
-        elif v > 0.0 and self.depth_clearance_val <= self._stop_dist:
+        elif forward_intent and self.depth_clearance_val <= self._stop_dist:
             self.cur_lin = 0.0
             v = 0.0
             new_reason = "depth_stop"
@@ -945,15 +1045,28 @@ class NavigationController:
                                       self._blocked_timer - 2.0 * self.dt)
 
         # ── motion-arc prediction ──
-        if v > 0.0 and not self._motion_is_free(
-                base_x, base_y, base_yaw, v, w):
+        arc_blocked = v > 0.0 and not self._motion_is_free(
+            base_x, base_y, base_yaw, v, w)
+        if arc_blocked:
             self.cur_lin = 0.0
             v = 0.0
             new_reason = "arc_blocked"
+            self._arc_blocked_timer += self.dt
+            if self._arc_blocked_timer >= self._arc_replan_threshold:
+                new_path = self._try_plan_with_fallback(
+                    base_x, base_y, self.goal_x, self.goal_y)
+                self._last_replan_time = now
+                if new_path is not None:
+                    self._consider_new_path(
+                        new_path, base_x, base_y, force=True)
+                self._arc_blocked_timer = 0.0
             if (point_to_rect_clearance(
                     base_x, base_y, DELIVERY_TABLE_COSTMAP_BOUNDS)
                     <= WHOLE_BODY_KEEP_OUT_RADIUS + 0.12):
                 new_reason = "table_keepout"
+        else:
+            self._arc_blocked_timer = max(
+                0.0, self._arc_blocked_timer - 2.0 * self.dt)
 
         # ── table-rotation guard ──
         if (abs(w) > 1e-6 and
@@ -968,6 +1081,10 @@ class NavigationController:
                 "no_path")
 
         self.stop_reason = new_reason
+        if self._maybe_start_reverse_recovery(
+                new_reason, base_x, base_y, base_yaw, laser_msg, now):
+            self.stop_reason = "reverse_recovery_start"
+            return 0.0, 0.0, False
 
         return v, w, False
 
@@ -1092,11 +1209,170 @@ class NavigationController:
             self._rotation_anchor_y = by
             self._rotation_accum = 0.0
             self._rotation_recoveries = 0
+            self._reverse_recovery_attempts = 0
         elif self._last_base_yaw is not None:
             self._rotation_accum += abs(angdist(
                 self._last_base_yaw, byaw))
         self._last_base_yaw = byaw
         return self._rotation_accum > self._rotation_loop_limit
+
+    @staticmethod
+    def _rear_scan_available(laser_msg):
+        """Whether the current scan observes a substantial rear hemisphere."""
+        if laser_msg is None or not laser_msg.ranges:
+            return False
+        span = abs(float(laser_msg.angle_increment)) * len(laser_msg.ranges)
+        return span >= 1.5 * math.pi
+
+    def _maybe_start_reverse_recovery(
+            self, reason, bx, by, byaw, laser_msg, now):
+        """Enter measured straight backup after a persistent local block."""
+        recoverable = {"lidar_stop", "arc_blocked", "rotation_loop"}
+        if reason not in recoverable:
+            self._reverse_recovery_blocked_time = max(
+                0.0,
+                self._reverse_recovery_blocked_time - 2.0 * self.dt)
+            if self._reverse_recovery_blocked_time <= 0.0:
+                self._reverse_recovery_block_anchor_x = None
+                self._reverse_recovery_block_anchor_y = None
+            return False
+
+        if self._reverse_recovery_block_anchor_x is None:
+            self._reverse_recovery_block_anchor_x = float(bx)
+            self._reverse_recovery_block_anchor_y = float(by)
+            self._reverse_recovery_blocked_time = 0.0
+
+        blocked_translation = math.hypot(
+            bx - self._reverse_recovery_block_anchor_x,
+            by - self._reverse_recovery_block_anchor_y)
+        if blocked_translation > self._reverse_recovery_no_progress_m:
+            self._reverse_recovery_block_anchor_x = float(bx)
+            self._reverse_recovery_block_anchor_y = float(by)
+            self._reverse_recovery_blocked_time = 0.0
+            return False
+
+        self._reverse_recovery_blocked_time += self.dt
+        if reason == "rotation_loop":
+            # The rotation watchdog already proves prolonged lack of
+            # translation, so it need not wait for a second one-second timer.
+            self._reverse_recovery_blocked_time = max(
+                self._reverse_recovery_blocked_time,
+                self._reverse_recovery_trigger_s)
+
+        if (self._reverse_recovery_blocked_time
+                < self._reverse_recovery_trigger_s):
+            return False
+        if now < self._reverse_recovery_cooldown_until:
+            return False
+        if (self._reverse_recovery_attempts
+                >= self._reverse_recovery_max_attempts):
+            return False
+        if not self._rear_scan_available(laser_msg):
+            return False
+        if self.rear_clearance <= self._reverse_recovery_rear_stop_m:
+            return False
+
+        signed_distance = -self._reverse_recovery_distance_m
+        if not self._straight_translation_is_free(
+                bx, by, byaw, signed_distance):
+            return False
+
+        self._reverse_recovery_phase = "backup"
+        self._reverse_recovery_start_x = float(bx)
+        self._reverse_recovery_start_y = float(by)
+        self._reverse_recovery_start_yaw = float(byaw)
+        self._reverse_recovery_started_at = float(now)
+        self._reverse_recovery_attempts += 1
+        self._reverse_recovery_blocked_time = 0.0
+        self.cur_lin = 0.0
+        self.cur_ang = 0.0
+        return True
+
+    def _finish_reverse_recovery(self, bx, by, byaw, now):
+        """Stop recovery, reset watchdogs and plan from the changed pose."""
+        self._reverse_recovery_phase = None
+        self._reverse_recovery_start_x = None
+        self._reverse_recovery_start_y = None
+        self._reverse_recovery_start_yaw = None
+        self._reverse_recovery_blocked_time = 0.0
+        self._reverse_recovery_block_anchor_x = float(bx)
+        self._reverse_recovery_block_anchor_y = float(by)
+        self._reverse_recovery_cooldown_until = float(now) + 2.0
+        self.cur_lin = 0.0
+        self.cur_ang = 0.0
+        self._blocked_timer = 0.0
+        self._arc_blocked_timer = 0.0
+        self._rotation_accum = 0.0
+        self._rotation_anchor_x = float(bx)
+        self._rotation_anchor_y = float(by)
+        self._last_base_yaw = float(byaw)
+        self._best_goal_dist = float('inf')
+        self._last_progress_time = float(now)
+
+        new_path = self._try_plan_with_fallback(
+            bx, by, self.goal_x, self.goal_y)
+        self._last_replan_time = float(now)
+        if new_path is not None:
+            self._install_path(new_path)
+            self._replan_hold_until = float(now) + 2.0
+        else:
+            self.path = []
+
+    def _reverse_recovery_tick(self, bx, by, byaw, laser_msg, now):
+        """Execute a low-speed odometry-measured straight reverse."""
+        if (self._reverse_recovery_start_x is None
+                or self._reverse_recovery_start_y is None
+                or self._reverse_recovery_start_yaw is None):
+            self._finish_reverse_recovery(bx, by, byaw, now)
+            self.stop_reason = "reverse_recovery_invalid"
+            return 0.0, 0.0, False
+
+        heading_x = math.cos(self._reverse_recovery_start_yaw)
+        heading_y = math.sin(self._reverse_recovery_start_yaw)
+        moved_back = (
+            (self._reverse_recovery_start_x - bx) * heading_x
+            + (self._reverse_recovery_start_y - by) * heading_y)
+        moved_back = max(0.0, float(moved_back))
+        elapsed = float(now) - self._reverse_recovery_started_at
+        remaining = max(
+            0.0, self._reverse_recovery_distance_m - moved_back)
+
+        if moved_back >= self._reverse_recovery_distance_m:
+            self._finish_reverse_recovery(bx, by, byaw, now)
+            self.stop_reason = "reverse_recovery_complete"
+            return 0.0, 0.0, False
+        if elapsed >= self._reverse_recovery_timeout_s:
+            self._finish_reverse_recovery(bx, by, byaw, now)
+            self.stop_reason = "reverse_recovery_timeout"
+            return 0.0, 0.0, False
+        if not self._rear_scan_available(laser_msg):
+            self._finish_reverse_recovery(bx, by, byaw, now)
+            self.stop_reason = "reverse_recovery_no_rear_scan"
+            return 0.0, 0.0, False
+        if self.rear_clearance <= self._reverse_recovery_rear_stop_m:
+            self._finish_reverse_recovery(bx, by, byaw, now)
+            self.stop_reason = "reverse_recovery_rear_stop"
+            return 0.0, 0.0, False
+        if not self._straight_translation_is_free(
+                bx, by, byaw, -remaining):
+            self._finish_reverse_recovery(bx, by, byaw, now)
+            self.stop_reason = "reverse_recovery_path_blocked"
+            return 0.0, 0.0, False
+
+        yaw_error = angdist(byaw, self._reverse_recovery_start_yaw)
+        angular = max(
+            -self._reverse_recovery_max_ang,
+            min(self._reverse_recovery_max_ang,
+                self._reverse_recovery_yaw_gain * yaw_error))
+        if not self._motion_is_free(
+                bx, by, byaw, -self._reverse_recovery_speed, angular):
+            self._finish_reverse_recovery(bx, by, byaw, now)
+            self.stop_reason = "reverse_recovery_arc_blocked"
+            return 0.0, 0.0, False
+        self.cur_lin = -self._reverse_recovery_speed
+        self.cur_ang = angular
+        self.stop_reason = "reverse_recovery"
+        return -self._reverse_recovery_speed, angular, False
 
     def _closest_index(self, bx, by):
         best_i, best_d2 = 0, float('inf')
@@ -1175,41 +1451,153 @@ class NavigationController:
         self.cur_ang += delta
         return self.cur_ang
 
-    def _front_clearance(self, laser_msg):
-        """Minimum valid range in the forward cone, independent of scan layout."""
+    def _front_clearance(self, laser_msg, corridor_half_width=None):
+        """Longitudinal clearance inside the chassis-width front corridor."""
         if laser_msg is None or not laser_msg.ranges:
             return float('inf')
+        if corridor_half_width is None:
+            corridor_half_width = self.front_corridor_half_width
         angle = float(laser_msg.angle_min)
         angle_inc = float(laser_msg.angle_increment)
         range_min = max(0.02, float(getattr(laser_msg, 'range_min', 0.02)))
         range_max = float(getattr(laser_msg, 'range_max', float('inf')))
         clearance = float('inf')
         for r in laser_msg.ranges:
-            if abs(wrap_to_pi(angle)) <= self._stop_arc:
-                r = float(r)
-                if math.isfinite(r) and range_min < r <= range_max:
-                    clearance = min(clearance, r)
+            beam_angle = wrap_to_pi(angle)
+            r = float(r)
+            if (math.isfinite(r) and range_min < r <= range_max
+                    and abs(beam_angle) < math.pi / 2.0):
+                forward = r * math.cos(beam_angle)
+                lateral = r * math.sin(beam_angle)
+                if (forward > 0.0 and
+                        abs(lateral) <= corridor_half_width):
+                    clearance = min(clearance, forward)
+            angle += angle_inc
+        return clearance
+
+    def _rear_clearance(self, laser_msg):
+        """Longitudinal clearance inside the chassis-width rear corridor."""
+        if laser_msg is None or not laser_msg.ranges:
+            return float('inf')
+        angle = float(laser_msg.angle_min)
+        angle_inc = float(laser_msg.angle_increment)
+        range_min = max(0.02, float(getattr(
+            laser_msg, 'range_min', 0.02)))
+        range_max = float(getattr(
+            laser_msg, 'range_max', float('inf')))
+        clearance = float('inf')
+        for r in laser_msg.ranges:
+            beam_angle = wrap_to_pi(angle)
+            r = float(r)
+            if (math.isfinite(r) and range_min < r <= range_max
+                    and abs(beam_angle) > math.pi / 2.0):
+                longitudinal = -r * math.cos(beam_angle)
+                lateral = r * math.sin(beam_angle)
+                if (longitudinal > 0.0 and
+                        abs(lateral) <= self.front_corridor_half_width):
+                    clearance = min(clearance, longitudinal)
             angle += angle_inc
         return clearance
 
     def _check_front_blocked(self, laser_msg, base_yaw=None):
         """Compatibility helper for users of the original controller API."""
-        return self._front_clearance(laser_msg) <= self._stop_dist
+        return (self._front_clearance(
+            laser_msg, self.hard_stop_corridor_half_width)
+            <= self._stop_dist)
+
+    def _straight_translation_is_free(
+            self, bx, by, byaw, signed_distance):
+        """Check a complete straight candidate, including inflation escape."""
+        distance = abs(float(signed_distance))
+        if distance <= 1e-6:
+            return True
+        direction = 1.0 if signed_distance > 0.0 else -1.0
+        start_free = self.cm.is_free_world(bx, by)
+        start_static_free = self.cm.is_static_free_world(bx, by)
+        start_clearance = self.cm.raw_dynamic_clearance_world(bx, by)
+        escaping_dynamic_inflation = (
+            not start_free
+            and start_static_free
+            and math.isfinite(start_clearance)
+            and start_clearance > 0.5 * self.cm.resolution
+        )
+        previous_clearance = start_clearance
+        sample_step = 0.5 * self.cm.resolution
+        steps = max(1, int(math.ceil(distance / sample_step)))
+        for index in range(1, steps + 1):
+            travelled = distance * index / steps
+            x = bx + direction * travelled * math.cos(byaw)
+            y = by + direction * travelled * math.sin(byaw)
+            if not self.cm.is_static_free_world(x, y):
+                return False
+            clearance = self.cm.raw_dynamic_clearance_world(x, y)
+            if (escaping_dynamic_inflation
+                    and math.isfinite(previous_clearance)
+                    and math.isfinite(clearance)
+                    and clearance + 1e-4 < previous_clearance):
+                # While escaping an inflated obstacle halo, require every
+                # sample to move away from the raw hit.  If the complete
+                # candidate already lies in free cells, millimetre-level scan
+                # geometry changes must not veto an otherwise safe backup.
+                return False
+            if not self.cm.is_free_world(x, y):
+                if (not escaping_dynamic_inflation
+                        or not math.isfinite(clearance)
+                        or clearance <= 0.5 * self.cm.resolution
+                        or clearance + 1e-4 < previous_clearance):
+                    return False
+            previous_clearance = clearance
+            if (point_to_rect_clearance(
+                    x, y, DELIVERY_TABLE_COSTMAP_BOUNDS)
+                    <= WHOLE_BODY_KEEP_OUT_RADIUS):
+                return False
+        if (escaping_dynamic_inflation
+                and previous_clearance < start_clearance + 0.001):
+            return False
+        return True
 
     def _motion_is_free(self, bx, by, byaw, linear, angular,
                         horizon=0.45, sample_dt=0.05):
-        """Check the near-future arc against map and table keep-out."""
-        if linear <= 0.0:
+        """Check the near-future arc, allowing safe inflation-layer escape.
+
+        If the current pose lies only in a dynamic obstacle's inflated halo,
+        permit a trajectory that monotonically increases clearance from the
+        raw obstacle hits.  Static cells and raw dynamic hit cells remain
+        forbidden, so this recovery cannot drive through a real obstacle.
+        At low speed the prediction horizon is shortened so a safe creep is
+        not rejected because of an arc the robot will not reach soon.
+        """
+        if abs(linear) <= 1e-6:
             return True
+        adaptive_horizon = horizon * min(1.0, abs(linear) / 0.35)
+        adaptive_horizon = max(0.08, adaptive_horizon)
         x, y, yaw = bx, by, byaw
-        steps = max(1, int(math.ceil(horizon / sample_dt)))
-        dt = horizon / steps
+        start_free = self.cm.is_free_world(x, y)
+        start_static_free = self.cm.is_static_free_world(x, y)
+        start_clearance = self.cm.raw_dynamic_clearance_world(x, y)
+        escaping_dynamic_inflation = (
+            not start_free
+            and start_static_free
+            and math.isfinite(start_clearance)
+            and start_clearance > 0.5 * self.cm.resolution
+        )
+        previous_clearance = start_clearance
+        steps = max(1, int(math.ceil(adaptive_horizon / sample_dt)))
+        dt = adaptive_horizon / steps
         for _ in range(steps):
             yaw = wrap_to_pi(yaw + angular * dt)
             x += linear * math.cos(yaw) * dt
             y += linear * math.sin(yaw) * dt
-            if not self.cm.is_free_world(x, y):
+            if not self.cm.is_static_free_world(x, y):
                 return False
+            clearance = self.cm.raw_dynamic_clearance_world(x, y)
+            if not self.cm.is_free_world(x, y):
+                if (not escaping_dynamic_inflation
+                        or not math.isfinite(clearance)
+                        or clearance <= 0.5 * self.cm.resolution
+                        or clearance + 1e-4 < previous_clearance):
+                    return False
+            previous_clearance = clearance
             # The table is fixed and known exactly.  This analytical guard is
             # intentionally independent of the raster costmap so a rounding,
             # path-following or small localisation error cannot command the
@@ -1218,6 +1606,12 @@ class NavigationController:
                     x, y, DELIVERY_TABLE_COSTMAP_BOUNDS)
                     <= WHOLE_BODY_KEEP_OUT_RADIUS):
                 return False
+        if escaping_dynamic_inflation:
+            required_progress = min(
+                0.005,
+                max(0.001, 0.10 * abs(linear) * adaptive_horizon))
+            if previous_clearance < start_clearance + required_progress:
+                return False
         return True
 
     @staticmethod
@@ -1225,7 +1619,7 @@ class NavigationController:
         """Whether rotating the parked whole body is safe by the table."""
         return (point_to_rect_clearance(
                     bx, by, DELIVERY_TABLE_COSTMAP_BOUNDS)
-                > WHOLE_BODY_KEEP_OUT_RADIUS)
+                > TABLE_ROTATION_KEEP_OUT_RADIUS)
 
     def _path_valid(self, bx, by):
         """Check whether the remaining path is collision-free."""

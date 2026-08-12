@@ -505,7 +505,8 @@ class ContinuousOrderController(IntegratedNavPickPlace):
             self._last_nav_reason = ctrl.stop_reason
             self.get_logger().info(
                 f"[nav→shelf] stop_reason={ctrl.stop_reason} "
-                f"lidar={ctrl.lidar_clearance:.2f}m")
+                f"lidar={ctrl.lidar_clearance:.2f}m "
+                f"rear={ctrl.rear_clearance:.2f}m")
 
         if now - self._nav_last_log >= integrated.NAV_PROGRESS_LOG_S:
             self._nav_last_log = now
@@ -605,6 +606,8 @@ class ContinuousOrderController(IntegratedNavPickPlace):
             self._abort_settle_tick()
         elif self.flow_phase == "backup":
             self._backup_tick()
+        elif self.flow_phase == "restore_height":
+            self._restore_height_tick()
         elif self.flow_phase == "nav_to_delivery":
             self._nav_watchdog_check(DROP_GOAL)
             if not self.order_aborted:

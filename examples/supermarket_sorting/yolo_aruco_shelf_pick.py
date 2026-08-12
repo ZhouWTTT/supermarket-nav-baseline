@@ -1481,8 +1481,8 @@ class ShelfPickController(Node):
             f"grip={gripper} preshape={self.grip_preshape_command:.3f}")
 
     def set_twist(self, linear: float, angular: float) -> None:
-        self.des_linear = float(np.clip(linear, -0.40, 0.40))
-        self.des_angular = float(np.clip(angular, -1.40, 1.40))
+        self.des_linear = float(np.clip(linear, -0.70, 0.70))
+        self.des_angular = float(np.clip(angular, -2.50, 2.50))
 
     def begin_manip_base_hold(self) -> None:
         """Capture the actual top/lower base pose without adding a gate."""

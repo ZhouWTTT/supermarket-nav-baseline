@@ -148,12 +148,15 @@ NAV_PROGRESS_LOG_S = 3.0
 # the end of the parent grasp state machine.
 BACKUP_SPEED_MPS = 0.18
 BACKUP_TIMEOUT_S = 8.0
+TRANSIT_SLIDE_TARGET_M = 0.006
+TRANSIT_SLIDE_TOLERANCE_M = 0.010
+TRANSIT_SLIDE_TIMEOUT_S = 8.0
 
 # A* stops outside the table's inflated costmap.  From that safe pose, make a
 # short, slow, yaw-controlled final approach before extending the arm.  The
 # physical chassis front remains clear of the table at the nominal endpoint.
 PLACE_CREEP_DISTANCE_M = 0.20
-PLACE_CREEP_SPEED_MPS = 0.08
+PLACE_CREEP_SPEED_MPS = 0.12
 PLACE_CREEP_FRONT_STOP_M = 0.30
 PLACE_CREEP_YAW_GAIN = 2.0
 PLACE_CREEP_MAX_ANGULAR_RPS = 0.30
@@ -164,7 +167,9 @@ PLACE_APPROACH_SOFT_SLIDE_TOLERANCE_M = 0.05
 PLACE_APPROACH_HARD_TIMEOUT_S = 15.0
 PLACE_APPROACH_PROGRESS_LOG_S = 2.0
 
-# Compact post-place travel pose (mirrors INIT_ARM in supermarket_sorting_client)
+# Fixed initial arm posture from ``supermarket_sorting_client.INIT_ARM``.
+# Both arms return here after every release; restoring only the selected arm
+# can preserve a stale pose inherited from an earlier failed order.
 PLACE_RETREAT_ARM_L = [0.0, -0.166, 0.032, 0.0, 1.571, 2.223]
 PLACE_RETREAT_ARM_R = [0.0, -0.166, 0.032, 0.0, -1.571, -2.223]
 
@@ -178,6 +183,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                           long-range transit while keeping the precise final
                           alignment untouched.
       "backup"          — reverse with yaw hold to clear the shelf.
+      "restore_height"  — restore the lift to its startup height.
       "nav_to_delivery" — navigator to DELIVERY_APPROACH with goods held.
       "place"           — extend, descend near the table, release, retreat.
       "done"            — flow finished.
@@ -248,6 +254,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._backup_start_yaw = 0.0
         self._backup_t0 = 0.0
         self._backup_logged = False
+        self._height_restore_t0 = 0.0
+        self._height_restore_timeout_logged = False
         self._flow_done_logged = False
         self._table_escape_logged = False
         self._laser_warn_log = 0.0
@@ -274,6 +282,19 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         return (
             self.last_scan_time is None
             or now - self.last_scan_time > NAV_LASER_STALE_S)
+
+    def initialize_commands(self) -> None:
+        """Initialize commands while keeping a fixed post-grasp transit height."""
+        super().initialize_commands()
+        measured_slide = self.joints.get("slide_joint")
+        self.get_logger().info(
+            f"[flow] configured post-grasp transit slide="
+            f"{TRANSIT_SLIDE_TARGET_M:.3f} "
+            f"(initial measured={measured_slide})")
+
+    @staticmethod
+    def _transit_slide_target() -> float:
+        return float(TRANSIT_SLIDE_TARGET_M)
 
     # ------------------------------------------------------------------
     # drive_to override — navigator for transit, parent logic for the last
@@ -367,6 +388,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 self.get_logger().info(
                     f"[nav] stop_reason={ctrl.stop_reason} "
                     f"lidar={ctrl.lidar_clearance:.2f}m "
+                    f"rear={ctrl.rear_clearance:.2f}m "
                     f"v={v:.2f} w={w:.2f}")
 
             if now - self._nav_last_log >= NAV_PROGRESS_LOG_S:
@@ -389,6 +411,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
     # flow hooks
     # ------------------------------------------------------------------
     def _on_grab_complete(self) -> None:
+        # Restore during the straight backup; rotation waits for feedback.
+        self.des_slide = self._transit_slide_target()
         self.get_logger().info(
             f"[flow] goods grabbed (marker={self.target_marker_id}, "
             f"kind={self.target_kind}, state={self.state}); "
@@ -403,10 +427,47 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 f"[flow] backing up {self.backup_after_grab_m:.2f}m "
                 "before delivery rotation")
             return
-        self._start_delivery_navigation()
+        self._start_height_restore()
+
+    def _start_height_restore(self) -> None:
+        self.flow_phase = "restore_height"
+        self._height_restore_t0 = self.now()
+        self._height_restore_timeout_logged = False
+        self.des_slide = self._transit_slide_target()
+        self.set_twist(0.0, 0.0)
+        self.get_logger().info(
+            f"[flow] restoring post-grasp transit slide: measured="
+            f"{self.joints.get('slide_joint')} "
+            f"target={self.des_slide:.3f}")
+
+    def _restore_height_tick(self) -> None:
+        now = self.now()
+        target_slide = self._transit_slide_target()
+        self.set_twist(0.0, 0.0)
+        self.des_slide = target_slide
+        measured_slide = self.joints.get("slide_joint")
+        if measured_slide is not None and math.isfinite(float(measured_slide)):
+            error = abs(float(measured_slide) - target_slide)
+            if error <= TRANSIT_SLIDE_TOLERANCE_M:
+                self.get_logger().info(
+                    f"[flow] post-grasp transit slide restored: measured="
+                    f"{float(measured_slide):.3f} error={error:.3f}m; "
+                    "starting delivery navigation")
+                self._start_delivery_navigation()
+                return
+        if (not self._height_restore_timeout_logged
+                and now - self._height_restore_t0
+                >= TRANSIT_SLIDE_TIMEOUT_S):
+            self._height_restore_timeout_logged = True
+            self.get_logger().warn(
+                f"[flow] post-grasp transit slide restore timed out after "
+                f"{TRANSIT_SLIDE_TIMEOUT_S:.1f}s "
+                f"(measured={measured_slide}, target={target_slide:.3f}); "
+                "remaining stopped and holding the target")
 
     def _start_delivery_navigation(self) -> None:
         self.flow_phase = "nav_to_delivery"
+        self.des_slide = self._transit_slide_target()
         self._nav_goal = None
         self._nav_last_log = 0.0
         self._nav_memory_logged = False
@@ -415,6 +476,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
     def _backup_tick(self) -> None:
         """Reverse along the grasp heading while holding the current yaw."""
         now = self.now()
+        self.des_slide = self._transit_slide_target()
         if self._backup_start_xy is None:
             self._backup_start_xy = self.base_xy.copy()
             self._backup_start_yaw = float(self.base_yaw)
@@ -433,14 +495,14 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         timed_out = elapsed > BACKUP_TIMEOUT_S
         if reached or timed_out:
             self.set_twist(0.0, 0.0)
-            self._start_delivery_navigation()
             message = (
                 f"[flow] backup finished (moved={moved_back:.3f}m, "
-                f"elapsed={elapsed:.1f}s); starting delivery navigation")
+                f"elapsed={elapsed:.1f}s); verifying transit height")
             if timed_out and not reached:
                 self.get_logger().warn(message + " after timeout")
             else:
                 self.get_logger().info(message)
+            self._start_height_restore()
             return
 
         angular = float(np.clip(2.0 * yaw_err, -0.6, 0.6))
@@ -454,6 +516,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
     def _nav_to_delivery_tick(self) -> None:
         now = self.now()
+        self.des_slide = self._transit_slide_target()
         if self._laser_stale(now):
             self.set_twist(0.0, 0.0)
             if now - self._laser_warn_log > 1.0:
@@ -479,7 +542,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self._last_nav_reason = ctrl.stop_reason
             self.get_logger().info(
                 f"[nav→delivery] stop_reason={ctrl.stop_reason} "
-                f"lidar={ctrl.lidar_clearance:.2f}m")
+                f"lidar={ctrl.lidar_clearance:.2f}m "
+                f"rear={ctrl.rear_clearance:.2f}m")
 
         if now - self._nav_last_log >= NAV_PROGRESS_LOG_S:
             self._nav_last_log = now
@@ -509,6 +573,14 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self.des_right_grip = float(value)
         else:
             self.des_left_grip = float(value)
+
+    def _command_initial_arm_posture(self) -> None:
+        """Open both grippers and return both arms to the fixed initial pose."""
+        self.des_left_arm = np.asarray(PLACE_RETREAT_ARM_L, dtype=float)
+        self.des_right_arm = np.asarray(PLACE_RETREAT_ARM_R, dtype=float)
+        self.des_left_grip = pick.GRIP_OPEN
+        self.des_right_grip = pick.GRIP_OPEN
+        self.des_slide = pick.SLIDE_REFERENCE_COMMAND
 
     def _product_release_z(self) -> float:
         """Return TCP height that leaves the product just above the table.
@@ -827,26 +899,26 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self._set_selected_grip(pick.GRIP_OPEN)
             if now - self.place_t0 >= self.place_release_dwell_s:
                 self.get_logger().info(
-                    "[place] gripper released; retreating arm")
+                    "[place] gripper released; restoring both arms to "
+                    "initial posture")
                 self.place_stage = 3
                 self.place_t0 = now
                 self._place_retreat_sent = False
         elif self.place_stage == 3:
-            self._set_selected_grip(pick.GRIP_OPEN)
+            self.des_left_grip = pick.GRIP_OPEN
+            self.des_right_grip = pick.GRIP_OPEN
             if not self._place_retreat_sent:
                 self._place_retreat_sent = True
-                joints = (
-                    PLACE_RETREAT_ARM_R if self.grasp_arm == "r"
-                    else PLACE_RETREAT_ARM_L)
-                self.set_selected_arm_target(np.asarray(joints, dtype=float))
-                self.des_slide = pick.SLIDE_REFERENCE_COMMAND
+                self.commands_ready_since = None
+                self._command_initial_arm_posture()
             if (now - self.place_t0 >= self.place_retreat_dwell_s
-                    and self.commands_ready(
+                    and self.dual_commands_ready(
                         arm_tolerance=0.08, slide_tolerance=0.05)):
                 self.place_stage = 4
                 self.place_t0 = now
                 self.get_logger().info(
-                    "[place] arm safely retracted; backing out of the "
+                    "[place] both arms restored to initial posture; "
+                    "backing out of the "
                     "delivery-table keep-out")
 
     def _place_tick_dual(self, now: float) -> None:
@@ -911,27 +983,22 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 self.place_stage = 2
                 self.place_t0 = now
         elif self.place_stage == 2:
-            self.des_left_arm = np.asarray(PLACE_RETREAT_ARM_L, dtype=float)
-            self.des_right_arm = np.asarray(PLACE_RETREAT_ARM_R, dtype=float)
-            self.des_left_grip = pick.GRIP_OPEN
-            self.des_right_grip = pick.GRIP_OPEN
-            self.des_slide = pick.SLIDE_REFERENCE_COMMAND
+            self._command_initial_arm_posture()
             if (now - self.place_t0 >= self.place_retreat_dwell_s
                     and self.dual_commands_ready(
                         arm_tolerance=0.08, slide_tolerance=0.05)):
                 self.place_stage = 4
                 self.place_t0 = now
                 self.get_logger().info(
-                    "[place-dual] arms safely retracted; backing out of "
+                    "[place-dual] both arms restored to initial posture; "
+                    "backing out of "
                     "the delivery-table keep-out")
 
     def _clear_delivery_table_tick(self, now: float) -> None:
         """Back away after release so the next order can safely turn."""
-        if self.use_dual_tissue_grasp:
-            self.des_left_grip = pick.GRIP_OPEN
-            self.des_right_grip = pick.GRIP_OPEN
-        else:
-            self._set_selected_grip(pick.GRIP_OPEN)
+        # Keep both arms in the initial posture throughout the base retreat,
+        # independent of which arm performed the grasp.
+        self._command_initial_arm_posture()
 
         clearance = point_to_rect_clearance(
             float(self.base_xy[0]), float(self.base_xy[1]),
@@ -939,6 +1006,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         required = WHOLE_BODY_KEEP_OUT_RADIUS + PLACE_CLEAR_TABLE_MARGIN_M
         if clearance >= required:
             self.set_twist(0.0, 0.0)
+            if not self.dual_commands_ready(
+                    arm_tolerance=0.08, slide_tolerance=0.05):
+                return
             self.flow_phase = "done"
             self.place_t0 = now
             self.get_logger().info(
@@ -1019,6 +1089,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.set_twist(0.0, 0.0)
         if self.flow_phase == "backup":
             self._backup_tick()
+        elif self.flow_phase == "restore_height":
+            self._restore_height_tick()
         elif self.flow_phase == "nav_to_delivery":
             self._nav_to_delivery_tick()
         elif self.flow_phase == "place":
