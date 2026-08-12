@@ -16,9 +16,12 @@ Usage (in a ROS2 control loop)::
 
 import math
 import heapq
+import os
 import time
 import numpy as np
 from scipy.ndimage import maximum_filter
+
+from path_memory import PathMemory
 
 # ============================================================================
 # Constants
@@ -662,7 +665,7 @@ class NavigationController:
         # Velocity limits
         self.max_lin = 0.70
         self.max_ang = 2.5
-        self.max_lin_acc = 1.5
+        self.max_lin_acc = 1.2
         self.max_ang_acc = 5.0
         self.dt = 0.02
         self._last_update_time = None
@@ -677,7 +680,7 @@ class NavigationController:
 
         # Gains
         self.k_ang = 2.5
-        self.k_lin = 1.3
+        self.k_lin = 1.0
 
         # Tolerances
         self.pos_tol = 0.10
@@ -688,12 +691,8 @@ class NavigationController:
         self._blocked_timer = 0.0
         self._blocked_thresh = 0.35
         self._stop_dist = 0.32
-        self._slow_dist = 0.55
+        self._slow_dist = 0.70
         self._stop_arc = math.radians(38)
-        # Optional chassis-width forward corridor.  ``None`` preserves the
-        # original cone check; navigation-only callers can enable the
-        # corridor so close side walls are not mistaken for frontal hazards.
-        self.front_corridor_half_width = None
 
         # Replanning/progress state
         self._last_replan_time = float('-inf')
@@ -1177,14 +1176,7 @@ class NavigationController:
         return self.cur_ang
 
     def _front_clearance(self, laser_msg):
-        """Return obstacle clearance in front of the moving chassis.
-
-        By default this preserves the original cone-based behaviour.  When
-        ``front_corridor_half_width`` is configured, each laser return is
-        projected into forward/lateral coordinates and only points inside
-        that corridor participate.  This prevents parallel walls beside the
-        robot from causing a false emergency stop in a narrow aisle.
-        """
+        """Minimum valid range in the forward cone, independent of scan layout."""
         if laser_msg is None or not laser_msg.ranges:
             return float('inf')
         angle = float(laser_msg.angle_min)
@@ -1193,18 +1185,10 @@ class NavigationController:
         range_max = float(getattr(laser_msg, 'range_max', float('inf')))
         clearance = float('inf')
         for r in laser_msg.ranges:
-            beam_angle = wrap_to_pi(angle)
-            r = float(r)
-            if math.isfinite(r) and range_min < r <= range_max:
-                if self.front_corridor_half_width is None:
-                    if abs(beam_angle) <= self._stop_arc:
-                        clearance = min(clearance, r)
-                elif abs(beam_angle) < math.pi / 2.0:
-                    forward = r * math.cos(beam_angle)
-                    lateral = r * math.sin(beam_angle)
-                    if (forward > 0.0 and abs(lateral) <=
-                            self.front_corridor_half_width):
-                        clearance = min(clearance, forward)
+            if abs(wrap_to_pi(angle)) <= self._stop_arc:
+                r = float(r)
+                if math.isfinite(r) and range_min < r <= range_max:
+                    clearance = min(clearance, r)
             angle += angle_inc
         return clearance
 
@@ -1214,20 +1198,11 @@ class NavigationController:
 
     def _motion_is_free(self, bx, by, byaw, linear, angular,
                         horizon=0.45, sample_dt=0.05):
-        """Check the near-future arc against map and table keep-out.
-
-        At low speed the prediction shrinks proportionally so slow
-        creeps near walls are not blocked by a far-away arc prediction.
-        """
+        """Check the near-future arc against map and table keep-out."""
         if linear <= 0.0:
             return True
-        # Adaptive horizon: full 0.45 m at ≥0.35 m/s, scaled below
-        adaptive_horizon = horizon * min(1.0, linear / 0.35)
-        if adaptive_horizon < 0.08:
-            adaptive_horizon = 0.08  # at least one step
         x, y, yaw = bx, by, byaw
-        steps = max(1, int(math.ceil(adaptive_horizon / sample_dt)))
-        dt = adaptive_horizon / steps
+        steps = max(1, int(math.ceil(horizon / sample_dt)))
         dt = horizon / steps
         for _ in range(steps):
             yaw = wrap_to_pi(yaw + angular * dt)
@@ -1288,10 +1263,70 @@ class SupermarketNavigator:
         self._laser_count = 0
         self._last_scan_msg = None
         self._last_depth_token = None
+        self._goal = None
+        self._goal_start_pose = None
+        self._goal_path_snapshot = None
+        self._cached_path_active = False
+        self._cached_path_info = {"enabled": False, "cache_hit": False}
+        self.path_memory = PathMemory(
+            enabled=os.environ.get("SUPERMARKET_PATH_MEMORY", "0") == "1",
+            storage_path=os.environ.get(
+                "SUPERMARKET_PATH_MEMORY_FILE",
+                "/root/.cache/supermarket_path_memory.json",
+            ),
+        )
+        self._cached_path_info = {
+            "enabled": self.path_memory.enabled,
+            "cache_hit": False,
+        }
 
     def set_goal(self, x, y, yaw=None):
         self.controller.set_goal(x, y, yaw)
         self._reached = False
+        self._goal = (float(x), float(y), None if yaw is None else float(yaw))
+        self._goal_start_pose = None
+        self._goal_path_snapshot = None
+        self._cached_path_active = False
+        self._cached_path_info = {"enabled": self.path_memory.enabled, "cache_hit": False}
+
+    def _try_restore_cached_path(self, base_x, base_y, base_yaw, now):
+        if not self.path_memory.enabled or self._goal is None or self.controller.path:
+            return
+        path, info = self.path_memory.load_path(
+            start_x=base_x,
+            start_y=base_y,
+            start_yaw=base_yaw,
+            goal_x=self._goal[0],
+            goal_y=self._goal[1],
+            goal_yaw=self._goal[2],
+        )
+        self._cached_path_info = info
+        if path:
+            self.controller._install_path(path)
+            self.controller._last_replan_time = float(now)
+            self.controller._replan_hold_until = float(now) + 2.0
+            self._cached_path_active = True
+
+    def _save_successful_path(self, base_x, base_y, base_yaw):
+        if (not self.path_memory.enabled or self._goal is None
+                or not self.controller.path):
+            return
+        start_pose = self._goal_start_pose
+        if start_pose is None:
+            start_pose = (float(base_x), float(base_y), float(base_yaw))
+        path_to_save = self._goal_path_snapshot or list(self.controller.path)
+        if not path_to_save:
+            return
+        self.path_memory.save_path(
+            start_x=start_pose[0],
+            start_y=start_pose[1],
+            start_yaw=start_pose[2],
+            goal_x=self._goal[0],
+            goal_y=self._goal[1],
+            goal_yaw=self._goal[2],
+            path=path_to_save,
+            source="cached" if self._cached_path_active else "planner",
+        )
 
     def update(self, base_x, base_y, base_yaw, laser_msg=None,
                depth_clearance=None, depth_token=None, time_now=None):
@@ -1314,13 +1349,27 @@ class SupermarketNavigator:
             self.costmap.update_from_depth_obstacle(
                 depth_clearance, base_x, base_y, base_yaw)
 
+        current_now = time.monotonic() if time_now is None else time_now
+        if self._goal is not None and self._goal_start_pose is None:
+            self._goal_start_pose = (
+                float(base_x), float(base_y), float(base_yaw))
+        self._try_restore_cached_path(base_x, base_y, base_yaw, current_now)
+
         v, w, reached = self.controller.compute_velocity(
             base_x, base_y, base_yaw,
             laser_msg=laser_msg,
             depth_clearance=depth_clearance,
-            time_now=time.monotonic() if time_now is None else time_now)
+            time_now=current_now)
+
+        if self._goal is not None and self._goal_path_snapshot is None and self.controller.path:
+            # Keep the first full path produced for this goal.  Near-goal
+            # replans later in the run can replace controller.path with a
+            # short terminal segment, which is not useful as a remembered route.
+            self._goal_path_snapshot = list(self.controller.path)
 
         self._reached = reached
+        if reached:
+            self._save_successful_path(base_x, base_y, base_yaw)
         return v, w, reached
 
     @property
@@ -1334,3 +1383,9 @@ class SupermarketNavigator:
     def get_costmap_grid(self):
         """Return the master costmap (for debugging/visualisation)."""
         return self.costmap.master
+
+    def path_memory_status(self):
+        status = self.path_memory.summary()
+        status.update(self._cached_path_info)
+        status["cached_path_active"] = self._cached_path_active
+        return status
