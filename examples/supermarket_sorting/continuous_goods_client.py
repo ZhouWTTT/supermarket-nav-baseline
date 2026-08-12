@@ -605,6 +605,8 @@ class ContinuousOrderController(IntegratedNavPickPlace):
             self._abort_settle_tick()
         elif self.flow_phase == "backup":
             self._backup_tick()
+        elif self.flow_phase == "restore_height":
+            self._restore_height_tick()
         elif self.flow_phase == "nav_to_delivery":
             self._nav_watchdog_check(DROP_GOAL)
             if not self.order_aborted:

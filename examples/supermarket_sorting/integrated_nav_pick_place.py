@@ -148,12 +148,14 @@ NAV_PROGRESS_LOG_S = 3.0
 # the end of the parent grasp state machine.
 BACKUP_SPEED_MPS = 0.18
 BACKUP_TIMEOUT_S = 8.0
+TRANSIT_SLIDE_TOLERANCE_M = 0.020
+TRANSIT_SLIDE_TIMEOUT_S = 8.0
 
 # A* stops outside the table's inflated costmap.  From that safe pose, make a
 # short, slow, yaw-controlled final approach before extending the arm.  The
 # physical chassis front remains clear of the table at the nominal endpoint.
 PLACE_CREEP_DISTANCE_M = 0.20
-PLACE_CREEP_SPEED_MPS = 0.08
+PLACE_CREEP_SPEED_MPS = 0.12
 PLACE_CREEP_FRONT_STOP_M = 0.30
 PLACE_CREEP_YAW_GAIN = 2.0
 PLACE_CREEP_MAX_ANGULAR_RPS = 0.30
@@ -178,6 +180,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                           long-range transit while keeping the precise final
                           alignment untouched.
       "backup"          — reverse with yaw hold to clear the shelf.
+      "restore_height"  — restore the lift to its normal transit height.
       "nav_to_delivery" — navigator to DELIVERY_APPROACH with goods held.
       "place"           — extend, descend near the table, release, retreat.
       "done"            — flow finished.
@@ -244,6 +247,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._backup_start_yaw = 0.0
         self._backup_t0 = 0.0
         self._backup_logged = False
+        self._original_slide_command = None
+        self._height_restore_t0 = 0.0
+        self._height_restore_timeout_logged = False
         self._flow_done_logged = False
         self._table_escape_logged = False
         self._laser_warn_log = 0.0
@@ -270,6 +276,27 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         return (
             self.last_scan_time is None
             or now - self.last_scan_time > NAV_LASER_STALE_S)
+
+    def initialize_commands(self) -> None:
+        """Capture the actual pre-pick lift height before scanning moves it."""
+        super().initialize_commands()
+        measured_slide = self.joints.get("slide_joint")
+        if measured_slide is not None and math.isfinite(float(measured_slide)):
+            self._original_slide_command = float(np.clip(
+                float(measured_slide), pick.SLIDE_MIN, pick.SLIDE_MAX))
+        else:
+            # MMK2Cfg starts slide_joint at zero.  This is only a fallback;
+            # normal operation always captures fresh joint feedback above.
+            self._original_slide_command = 0.0
+        self.get_logger().info(
+            f"[flow] captured original lift command="
+            f"{self._original_slide_command:.3f}")
+
+    def _original_slide_target(self) -> float:
+        """Return the lift command captured before the pick flow began."""
+        if self._original_slide_command is None:
+            return 0.0
+        return float(self._original_slide_command)
 
     # ------------------------------------------------------------------
     # drive_to override — navigator for transit, parent logic for the last
@@ -368,6 +395,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
     # flow hooks
     # ------------------------------------------------------------------
     def _on_grab_complete(self) -> None:
+        # Start restoring the lift immediately.  It can move while the base
+        # reverses straight away from the shelf, but rotation/navigation will
+        # wait until measured feedback reaches the normal transit height.
+        self.des_slide = self._original_slide_target()
         self.get_logger().info(
             f"[flow] goods grabbed (marker={self.target_marker_id}, "
             f"kind={self.target_kind}, state={self.state}); "
@@ -382,10 +413,57 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 f"[flow] backing up {self.backup_after_grab_m:.2f}m "
                 "before delivery rotation")
             return
-        self._start_delivery_navigation()
+        self._start_height_restore()
+
+    def _start_height_restore(self) -> None:
+        """Stop the base until the lift returns to its transit height."""
+        self.flow_phase = "restore_height"
+        self._height_restore_t0 = self.now()
+        self._height_restore_timeout_logged = False
+        target_slide = self._original_slide_target()
+        self.des_slide = target_slide
+        self.set_twist(0.0, 0.0)
+        measured_slide = self.joints.get("slide_joint")
+        self.get_logger().info(
+            f"[flow] restoring transit height: measured_slide="
+            f"{measured_slide} target_slide="
+            f"{target_slide:.3f}")
+
+    def _restore_height_tick(self) -> None:
+        """Maintain the lift target and enter delivery navigation when ready."""
+        now = self.now()
+        self.set_twist(0.0, 0.0)
+        target_slide = self._original_slide_target()
+        self.des_slide = target_slide
+        measured_slide = self.joints.get("slide_joint")
+        if measured_slide is not None and math.isfinite(float(measured_slide)):
+            error = abs(
+                float(measured_slide) - target_slide)
+            if error <= TRANSIT_SLIDE_TOLERANCE_M:
+                self.get_logger().info(
+                    f"[flow] transit height restored: measured_slide="
+                    f"{float(measured_slide):.3f} error={error:.3f}m; "
+                    "starting delivery navigation")
+                self._start_delivery_navigation()
+                return
+
+        if (not self._height_restore_timeout_logged
+                and now - self._height_restore_t0
+                >= TRANSIT_SLIDE_TIMEOUT_S):
+            # Do not deadlock an order on a slightly biased joint reading.
+            # Navigation may continue, but every later tick keeps commanding
+            # the same transit-height target.
+            self._height_restore_timeout_logged = True
+            self.get_logger().warn(
+                f"[flow] lift did not reach transit height within "
+                f"{TRANSIT_SLIDE_TIMEOUT_S:.1f}s "
+                f"(measured_slide={measured_slide}); continuing while "
+                "holding the transit-height command")
+            self._start_delivery_navigation()
 
     def _start_delivery_navigation(self) -> None:
         self.flow_phase = "nav_to_delivery"
+        self.des_slide = self._original_slide_target()
         self._nav_goal = None
         self._nav_last_log = 0.0
         self.nav.set_goal(*DELIVERY_APPROACH)
@@ -393,6 +471,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
     def _backup_tick(self) -> None:
         """Reverse along the grasp heading while holding the current yaw."""
         now = self.now()
+        self.des_slide = self._original_slide_target()
         if self._backup_start_xy is None:
             self._backup_start_xy = self.base_xy.copy()
             self._backup_start_yaw = float(self.base_yaw)
@@ -411,14 +490,14 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         timed_out = elapsed > BACKUP_TIMEOUT_S
         if reached or timed_out:
             self.set_twist(0.0, 0.0)
-            self._start_delivery_navigation()
             message = (
                 f"[flow] backup finished (moved={moved_back:.3f}m, "
-                f"elapsed={elapsed:.1f}s); starting delivery navigation")
+                f"elapsed={elapsed:.1f}s); verifying transit height")
             if timed_out and not reached:
                 self.get_logger().warn(message + " after timeout")
             else:
                 self.get_logger().info(message)
+            self._start_height_restore()
             return
 
         angular = float(np.clip(2.0 * yaw_err, -0.6, 0.6))
@@ -432,6 +511,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
     def _nav_to_delivery_tick(self) -> None:
         now = self.now()
+        # Keep the lift at normal height for the complete loaded transit.
+        self.des_slide = self._original_slide_target()
         if self._laser_stale(now):
             self.set_twist(0.0, 0.0)
             if now - self._laser_warn_log > 1.0:
@@ -985,6 +1066,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.set_twist(0.0, 0.0)
         if self.flow_phase == "backup":
             self._backup_tick()
+        elif self.flow_phase == "restore_height":
+            self._restore_height_tick()
         elif self.flow_phase == "nav_to_delivery":
             self._nav_to_delivery_tick()
         elif self.flow_phase == "place":

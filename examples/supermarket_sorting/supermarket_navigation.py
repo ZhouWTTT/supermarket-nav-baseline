@@ -42,6 +42,11 @@ DELIVERY_APPROACH = (-1.80, -2.60, -math.pi / 2.0)
 DELIVERY_TABLE_XML_BOUNDS = (-2.42, -3.63, -1.46, -3.19)
 DELIVERY_TABLE_COSTMAP_BOUNDS = (-2.45, -3.66, -1.43, -3.16)
 WHOLE_BODY_KEEP_OUT_RADIUS = 0.55
+# Rotation can use a slightly tighter bound than translational motion.  The
+# measured parked-arm sweep is about 0.455 m, so 0.50 m still leaves roughly
+# 4.5 cm for link thickness and tracking error without imposing the previous
+# extra 5 cm translational margin on an in-place yaw correction.
+TABLE_ROTATION_KEEP_OUT_RADIUS = 0.50
 
 # Shelf approach poses.  y=2.40 stays inside the picking zone while leaving a
 # clear cross-aisle above the middle wall endpoint at y=1.70.
@@ -1250,7 +1255,7 @@ class NavigationController:
         """Whether rotating the parked whole body is safe by the table."""
         return (point_to_rect_clearance(
                     bx, by, DELIVERY_TABLE_COSTMAP_BOUNDS)
-                > WHOLE_BODY_KEEP_OUT_RADIUS)
+                > TABLE_ROTATION_KEEP_OUT_RADIUS)
 
     def _path_valid(self, bx, by):
         """Check whether the remaining path is collision-free."""
