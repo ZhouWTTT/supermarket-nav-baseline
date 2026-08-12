@@ -134,9 +134,9 @@ PLACE_PRODUCT_BOTTOM_CLEARANCE_M = 0.015
 PLACE_APPROACH_CLEARANCE_M = 0.060
 PLACE_RELEASE_HEIGHT_LOWER_TOLERANCE_M = 0.010
 PLACE_RELEASE_HEIGHT_UPPER_TOLERANCE_M = 0.035
-PLACE_DESCENT_SLIDE_STEP_M = 0.0015
+PLACE_DESCENT_SLIDE_STEP_M = 0.0030
 PLACE_CLEAR_TABLE_MARGIN_M = 0.060
-PLACE_CLEAR_TABLE_SPEED_MPS = 0.10
+PLACE_CLEAR_TABLE_SPEED_MPS = 0.18
 PLACE_CLEAR_TABLE_TIMEOUT_S = 15.0
 NAV_TRANSIT_GATE_M = 0.35          # beyond this distance, use the navigator
 NAV_LASER_STALE_S = 0.50           # fail safe if the 12 Hz scan stops
@@ -146,14 +146,14 @@ NAV_PROGRESS_LOG_S = 3.0
 # Keep the held product clear of the shelf before delivery navigation starts
 # turning the base.  The arms and product still protrude toward the shelf at
 # the end of the parent grasp state machine.
-BACKUP_SPEED_MPS = 0.10
+BACKUP_SPEED_MPS = 0.18
 BACKUP_TIMEOUT_S = 8.0
 
 # A* stops outside the table's inflated costmap.  From that safe pose, make a
 # short, slow, yaw-controlled final approach before extending the arm.  The
 # physical chassis front remains clear of the table at the nominal endpoint.
 PLACE_CREEP_DISTANCE_M = 0.20
-PLACE_CREEP_SPEED_MPS = 0.04
+PLACE_CREEP_SPEED_MPS = 0.08
 PLACE_CREEP_FRONT_STOP_M = 0.30
 PLACE_CREEP_YAW_GAIN = 2.0
 PLACE_CREEP_MAX_ANGULAR_RPS = 0.30
