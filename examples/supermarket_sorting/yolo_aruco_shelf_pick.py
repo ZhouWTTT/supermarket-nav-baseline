@@ -1373,7 +1373,7 @@ class ShelfPickController(Node):
         return True
 
     def _recheck_fail(self) -> None:
-        """Skip this slot and resume scanning without trapping preferred ID."""
+        """Skip this slot and resume scanning."""
         marker_id = self.target_marker_id
         if marker_id is not None:
             self.recheck_marker_skips.add(marker_id)
@@ -1481,8 +1481,8 @@ class ShelfPickController(Node):
             f"grip={gripper} preshape={self.grip_preshape_command:.3f}")
 
     def set_twist(self, linear: float, angular: float) -> None:
-        self.des_linear = float(np.clip(linear, -0.40, 0.40))
-        self.des_angular = float(np.clip(angular, -1.40, 1.40))
+        self.des_linear = float(np.clip(linear, -0.70, 0.70))
+        self.des_angular = float(np.clip(angular, -2.50, 2.50))
 
     def begin_manip_base_hold(self) -> None:
         """Capture the actual top/lower base pose without adding a gate."""
@@ -1552,18 +1552,17 @@ class ShelfPickController(Node):
         return self.scan_poses[self.scan_pose_index]
 
     def _nearest_scan_stations(self) -> list[int]:
-        """Order stations by travel distance."""
+        """Order scan stations by travel distance from current base position."""
         if self.base_xy is None:
             base = np.zeros(2, dtype=float)
         else:
             base = np.asarray(self.base_xy, dtype=float)
-        ordered = sorted(
+        return sorted(
             range(len(SCAN_X)),
             key=lambda index: (
                 float(np.linalg.norm(
                     np.array([SCAN_X[index], SCAN_Y]) - base)),
                 index))
-        return ordered
 
     def current_scan_station_x(self) -> float:
         if self.scan_station_order is None:

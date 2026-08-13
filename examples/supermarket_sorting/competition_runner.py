@@ -437,7 +437,7 @@ class CompetitionRunner(Node):
                 (order.attempts, entry is None, distance,
                  GRASP_COST.get(order.kind, 10.0), order.source_index),
                 order, entry))
-        _, order, entry = min(ranked, key=lambda item: item[0])
+        _, order, _entry = min(ranked, key=lambda item: item[0])
         return order
 
     def stop(self) -> None:

@@ -315,7 +315,7 @@ class LauncherApp:
         args = [
             "docker", "run", "--rm", "-d",
             "--name", SERVER_NAME,
-            "--gpus", "all", "--network", "host", "--ipc", "host",
+            "--runtime=nvidia", "--network", "host", "--ipc", "host",
             "-e", f"ROS_DOMAIN_ID={ROS_DOMAIN_ID}",
             "-e", f"RMW_IMPLEMENTATION={RMW}",
         ]
@@ -365,7 +365,7 @@ class LauncherApp:
         args = [
             "docker", "run", "--rm", "-d",
             "--name", CLIENT_NAME,
-            "--gpus", "all", "--network", "host", "--ipc", "host",
+            "--runtime=nvidia", "--network", "host", "--ipc", "host",
             "-e", f"ROS_DOMAIN_ID={ROS_DOMAIN_ID}",
             "-e", f"RMW_IMPLEMENTATION={RMW}",
             "-e", "YOLO_CONFIG_DIR=/tmp/Ultralytics",
