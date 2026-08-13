@@ -699,9 +699,9 @@ class NavigationController:
         self.nav_goal_x = self.nav_goal_y = None
 
         # Velocity limits
-        self.max_lin = 0.70
+        self.max_lin = 0.80
         self.max_ang = 2.5
-        self.max_lin_acc = 1.2
+        self.max_lin_acc = 2.0
         self.max_ang_acc = 5.0
         self.dt = 0.02
         self._last_update_time = None

@@ -1181,6 +1181,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-nav-during-scan", action="store_true",
         help="use the parent straight-line drive_to between scan stations")
+    parser.add_argument(
+        "--scan-start-west", action="store_true",
+        help="scan from the westmost shelf (A) first; used for orders after "
+             "the first in a match")
     args = parser.parse_args()
     if not 0.0 <= args.confidence <= 1.0:
         parser.error("--confidence must be in [0, 1]")
@@ -1224,6 +1228,8 @@ def _write_result(path: str | None, document: dict) -> None:
 
 
 def main() -> int:
+    from run_log import start_run_log
+    start_run_log("worker")
     args = parse_args()
     started_at = time.monotonic()
     weights = str(pathlib.Path(args.weights).expanduser().resolve())
@@ -1262,6 +1268,7 @@ def main() -> int:
             backup_after_grab_m=args.backup_after_grab,
             place_creep_m=args.place_creep_distance,
             close_recheck=not args.no_close_recheck)
+        controller.scan_prefer_west_start = args.scan_start_west
         controller.excluded_marker_ids = set(args.exclude_marker_id)
         if controller.excluded_marker_ids:
             controller.get_logger().info(
