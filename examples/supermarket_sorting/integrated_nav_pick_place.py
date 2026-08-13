@@ -114,6 +114,21 @@ if _mmk2_fk_mod is not None:
 DELIVERY_TABLE_PLACE_WORLD = (-1.80, -3.35, 0.85)  # x, y, minimum approach z
 DELIVERY_TABLE_TOP_Z_M = 0.767
 
+# Five deterministic delivery slots.  The robot approaches from +Y and faces
+# south, so more-negative Y is deeper on the table.  Three staggered inner
+# slots are filled first, followed by two outer slots.  A literal five-item
+# depth-only row would leave less than 90 mm between centres on this 440 mm
+# deep table and would overlap the larger products.
+DELIVERY_PLACE_SLOTS_XY = (
+    (-2.20, -3.45),  # 1: deepest, inner-left
+    (-1.94, -3.43),  # 2: inner-centre
+    (-1.68, -3.41),  # 3: inner-right
+    (-2.07, -3.29),  # 4: outer-left
+    (-1.81, -3.27),  # 5: outer-right / nearest
+)
+PLACE_SLOT_IK_NUDGE_M = 0.020
+PLACE_SLOT_XY_TOLERANCE_M = 0.060
+
 # Product centre heights above their supporting surface.  These are the
 # physical half-heights of the collision geometry in the competition scene.
 # The placement controller targets the product centre at table top + this
@@ -195,6 +210,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             place_x: float = DELIVERY_TABLE_PLACE_WORLD[0],
             place_y: float = DELIVERY_TABLE_PLACE_WORLD[1],
             place_z: float = DELIVERY_TABLE_PLACE_WORLD[2],
+            place_slot: int | None = None,
             place_release_dwell_s: float = 2.0,
             place_retreat_dwell_s: float = 1.0,
             nav_during_scan: bool = True,
@@ -209,6 +225,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.nav_during_scan = nav_during_scan
         self.backup_after_grab_m = float(backup_after_grab_m)
         self.place_creep_m = float(place_creep_m)
+        self.place_slot = place_slot
         self.place_world = np.array(
             [place_x, place_y, place_z], dtype=float)
         self.place_min_approach_z = float(place_z)
@@ -246,6 +263,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._place_descent_sent = False
         self._place_retreat_sent = False
         self._dual_descent_sent = False
+        self._dual_place_target_sent = False
         self.dual_release_slide_cmd = None
         self.place_creep_start_y = None
         self.place_creep_done = False
@@ -265,6 +283,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             "integrated nav+pick+place ready; "
             f"nav_during_scan={nav_during_scan} "
             f"close_recheck={int(close_recheck)} "
+            f"place_slot={None if place_slot is None else place_slot + 1} "
             f"place_world={np.round(self.place_world, 3)} "
             f"backup_after_grab={self.backup_after_grab_m:.2f}m "
             f"place_creep={self.place_creep_m:.2f}m "
@@ -471,7 +490,21 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._nav_goal = None
         self._nav_last_log = 0.0
         self._nav_memory_logged = False
-        self.nav.set_goal(*DELIVERY_APPROACH)
+        # Align the chassis with the assigned table slot before the guarded
+        # southward creep.  This keeps the arm motion predominantly forward
+        # even for the left/right slots and makes the fixed world target much
+        # more likely to have a nearby IK solution.
+        delivery_goal = (
+            float(self.place_world[0]),
+            DELIVERY_APPROACH[1],
+            DELIVERY_APPROACH[2],
+        )
+        self.nav.set_goal(*delivery_goal)
+        self.get_logger().info(
+            f"[nav→delivery] assigned slot="
+            f"{None if self.place_slot is None else self.place_slot + 1} "
+            f"target={np.round(self.place_world[:2], 3)} "
+            f"approach={np.round(delivery_goal[:2], 3)}")
 
     def _backup_tick(self) -> None:
         """Reverse along the grasp heading while holding the current yaw."""
@@ -630,17 +663,24 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         if self.pregrasp_arm_joints is not None:
             refs.append(np.asarray(self.pregrasp_arm_joints, dtype=float))
 
-        bx, by = float(self.base_xy[0]), float(self.base_xy[1])
-        # Table top is ~0.767 m and the centre is at y=-3.41.  After the final
-        # base creep, 0.55--0.65 m reaches the interior without forcing the arm
-        # to its old 0.70--0.80 m reach limit.
+        # The formal runner assigns an absolute table slot.  Manual runs use
+        # --place-x/--place-y in exactly the same way.  Small bounded nudges
+        # are IK fallbacks only; they cannot move a product into another slot.
+        target_x = float(self.place_world[0])
+        target_y = float(self.place_world[1])
+        xy_candidates = (
+            (target_x, target_y),
+            (target_x, target_y + PLACE_SLOT_IK_NUDGE_M),
+            (target_x, target_y - PLACE_SLOT_IK_NUDGE_M),
+            (target_x + PLACE_SLOT_IK_NUDGE_M, target_y),
+            (target_x - PLACE_SLOT_IK_NUDGE_M, target_y),
+        )
         release_z = self._product_release_z()
         minimum_approach_z = max(
             self.place_min_approach_z,
             release_z + PLACE_APPROACH_CLEARANCE_M)
         z_candidates = tuple(
             minimum_approach_z + offset for offset in (0.0, 0.02, 0.04))
-        d_candidates = (0.65, 0.60, 0.55)
         # Top-shelf grasps pin the slide at SLIDE_MIN, which leaves the arm too
         # high to reach the table; raising the slide lowers the whole arm into
         # reach.  Middle/lower grasps keep their grasp slide.
@@ -651,14 +691,14 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                        for item in slide_candidates):
                 slide_candidates.append(slide)
 
-        for d in d_candidates:
+        for x, y in xy_candidates:
             for z in z_candidates:
                 descent = z - release_z
                 for slide in slide_candidates:
                     release_slide = slide + descent
                     if release_slide > pick.SLIDE_MAX + 1e-6:
                         continue
-                    world = np.array([bx, by - d, z], dtype=float)
+                    world = np.array([x, y, z], dtype=float)
                     for ref in refs:
                         joints = self._solve_place_world(world, ref, slide)
                         if joints is None:
@@ -673,7 +713,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                             f"[place] approach IK={np.round(world, 3)} "
                             f"release={np.round(self.place_release_world, 3)} "
                             f"slide={slide:.3f}->{release_slide:.3f} "
-                            f"descent={descent:.3f}m d={d:.2f}m "
+                            f"descent={descent:.3f}m "
+                            f"slot={None if self.place_slot is None else self.place_slot + 1} "
                             f"refs_tried={len(refs)}")
                         return joints
 
@@ -780,6 +821,15 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             <= float(tcp[2])
             <= target_z + PLACE_RELEASE_HEIGHT_UPPER_TOLERANCE_M)
 
+    def _tcp_at_assigned_slot(self, tcp: np.ndarray | None) -> bool:
+        """Require the measured release XY to remain near its own slot."""
+        if tcp is None or np.asarray(tcp).shape != (3,):
+            return False
+        error = np.asarray(tcp[:2], dtype=float) - self.place_world[:2]
+        return bool(
+            np.all(np.isfinite(error))
+            and np.linalg.norm(error) <= PLACE_SLOT_XY_TOLERANCE_M)
+
     def _dual_release_world(self) -> np.ndarray | None:
         """Approximate the held tissue centre by the two measured TCPs."""
         left = self.arm_tcp_world("left")
@@ -839,6 +889,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     raise RuntimeError(
                         "measured place TCP is outside delivery tabletop: "
                         f"{None if tcp is None else np.round(tcp, 3)}")
+                if not self._tcp_at_assigned_slot(tcp):
+                    raise RuntimeError(
+                        "measured place TCP missed assigned slot: "
+                        f"tcp={None if tcp is None else np.round(tcp, 3)} "
+                        f"slot={np.round(self.place_world[:2], 3)}")
                 self.get_logger().info(
                     f"[place] arm at approach pose gate={gate} "
                     f"elapsed={approach_elapsed:.2f}s "
@@ -883,6 +938,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 raise RuntimeError(
                     "measured lowered TCP is outside delivery tabletop: "
                     f"{None if tcp is None else np.round(tcp, 3)}")
+            if not self._tcp_at_assigned_slot(tcp):
+                raise RuntimeError(
+                    "measured lowered TCP missed assigned slot: "
+                    f"tcp={None if tcp is None else np.round(tcp, 3)} "
+                    f"slot={np.round(self.place_world[:2], 3)}")
             target_z = float(self.place_release_world[2])
             if not self._tcp_at_release_height(tcp, target_z):
                 raise RuntimeError(
@@ -921,19 +981,98 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     "backing out of the "
                     "delivery-table keep-out")
 
+    def _configure_dual_place_target(self) -> bool:
+        """Translate the clamped tissue centre to the assigned slot."""
+        left_tcp = self.arm_tcp_world("left")
+        right_tcp = self.arm_tcp_world("right")
+        left_reference = self.arm_positions("left")
+        right_reference = self.arm_positions("right")
+        measured_slide = self.joints.get("slide_joint")
+        if (left_tcp is None or right_tcp is None
+                or left_reference is None or right_reference is None
+                or measured_slide is None):
+            return False
+
+        centre = 0.5 * (np.asarray(left_tcp) + np.asarray(right_tcp))
+        offset_xy = self.place_world[:2] - centre[:2]
+        left_goal = np.asarray(left_tcp, dtype=float).copy()
+        right_goal = np.asarray(right_tcp, dtype=float).copy()
+        left_goal[:2] += offset_xy
+        right_goal[:2] += offset_xy
+
+        left_target = np.eye(4)
+        right_target = np.eye(4)
+        left_target[:3, 3] = self.world_to_footprint(left_goal)
+        right_target[:3, 3] = self.world_to_footprint(right_goal)
+        slide = float(measured_slide)
+        reference = np.concatenate((
+            [slide],
+            np.asarray(left_reference, dtype=float),
+            np.asarray(right_reference, dtype=float),
+        ))
+        try:
+            solutions = self.kdl.inverse_kinematics(
+                T_left=left_target,
+                T_right=right_target,
+                target_height=slide,
+                ref_pos=reference)
+        except Exception as exc:  # noqa: BLE001 - report a safe place failure
+            self.get_logger().error(
+                f"[place-dual] assigned-slot IK raised: {exc}")
+            return False
+        if solutions is None or len(solutions) == 0:
+            self.get_logger().error(
+                "[place-dual] no IK solution for assigned slot "
+                f"{np.round(self.place_world[:2], 3)}")
+            return False
+
+        candidates = [
+            np.asarray(item[1:], dtype=float) for item in solutions]
+        arms_reference = reference[1:]
+        best = min(
+            candidates,
+            key=lambda item: float(np.max(
+                np.abs(item - arms_reference))))
+        self.des_left_arm = best[:6].copy()
+        self.des_right_arm = best[6:].copy()
+        self.commands_ready_since = None
+        self._dual_place_target_sent = True
+        self.place_t0 = self.now()
+        self.get_logger().info(
+            f"[place-dual] moving clamped tissue to slot="
+            f"{None if self.place_slot is None else self.place_slot + 1} "
+            f"centre={np.round(centre, 3)} "
+            f"target={np.round(self.place_world[:2], 3)} "
+            f"offset={np.round(offset_xy, 3)}")
+        return True
+
     def _place_tick_dual(self, now: float) -> None:
-        """Dual-arm tissue place with measured vertical slide descent."""
+        """Dual-arm tissue place at its slot, then descend vertically."""
         if self.place_stage == 0:
             self.des_left_grip = pick.DUAL_TISSUE_GRIP_COMMAND
             self.des_right_grip = pick.DUAL_TISSUE_GRIP_COMMAND
             if not self._advance_place_creep():
                 return
-            release_world = self._dual_release_world()
-            if not self._tcp_over_delivery_table(release_world):
-                raise RuntimeError(
-                    "dual-arm release point is outside delivery tabletop: "
-                    f"{None if release_world is None else np.round(release_world, 3)}")
+            if not self._dual_place_target_sent:
+                if not self._configure_dual_place_target():
+                    raise RuntimeError(
+                        "dual-arm IK failed for assigned delivery slot")
+                return
             if not self._dual_descent_sent:
+                if not self.dual_commands_ready(
+                        arm_tolerance=0.05, slide_tolerance=0.025):
+                    if now - self.place_t0 >= PLACE_APPROACH_HARD_TIMEOUT_S:
+                        raise RuntimeError(
+                            "dual-arm assigned-slot approach did not settle "
+                            f"within {PLACE_APPROACH_HARD_TIMEOUT_S:.0f}s")
+                    return
+                release_world = self._dual_release_world()
+                if (not self._tcp_over_delivery_table(release_world)
+                        or not self._tcp_at_assigned_slot(release_world)):
+                    raise RuntimeError(
+                        "dual-arm centre missed assigned delivery slot: "
+                        f"centre={None if release_world is None else np.round(release_world, 3)} "
+                        f"slot={np.round(self.place_world[:2], 3)}")
                 measured_slide = self.joints.get("slide_joint")
                 if measured_slide is None:
                     return
@@ -965,6 +1104,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             release_world = self._dual_release_world()
             target_z = self._product_release_z()
             if (not self._tcp_over_delivery_table(release_world)
+                    or not self._tcp_at_assigned_slot(release_world)
                     or not self._tcp_at_release_height(
                         release_world, target_z)):
                 raise RuntimeError(
@@ -1165,6 +1305,11 @@ def parse_args() -> argparse.Namespace:
         "--place-z", type=float, default=DELIVERY_TABLE_PLACE_WORLD[2],
         help="minimum TCP height for the pre-release approach pose")
     parser.add_argument(
+        "--place-slot", type=int,
+        choices=range(len(DELIVERY_PLACE_SLOTS_XY)),
+        help="zero-based deterministic delivery slot; overrides "
+             "--place-x/--place-y")
+    parser.add_argument(
         "--place-release-dwell", type=float, default=2.0,
         help="seconds the gripper stays open before retreating")
     parser.add_argument(
@@ -1232,6 +1377,9 @@ def main() -> int:
     start_run_log("worker")
     args = parse_args()
     started_at = time.monotonic()
+    place_x, place_y = args.place_x, args.place_y
+    if args.place_slot is not None:
+        place_x, place_y = DELIVERY_PLACE_SLOTS_XY[args.place_slot]
     weights = str(pathlib.Path(args.weights).expanduser().resolve())
     if not pathlib.Path(weights).is_file():
         raise FileNotFoundError(f"YOLO weights not found: {weights}")
@@ -1261,7 +1409,8 @@ def main() -> int:
         controller = IntegratedNavPickPlace(
             args.target_kind, args.max_scan_cycles,
             args.tcp_diagnostic_ground_truth, args.scan_skip_lower,
-            place_x=args.place_x, place_y=args.place_y, place_z=args.place_z,
+            place_x=place_x, place_y=place_y, place_z=args.place_z,
+            place_slot=args.place_slot,
             place_release_dwell_s=args.place_release_dwell,
             place_retreat_dwell_s=args.place_retreat_dwell,
             nav_during_scan=not args.no_nav_during_scan,
@@ -1335,6 +1484,8 @@ def main() -> int:
             "error": error,
             "elapsed_s": round(time.monotonic() - started_at, 3),
             "formal_mode": bool(args.formal_mode),
+            "place_slot": args.place_slot,
+            "place_xy": [place_x, place_y],
         })
         if rclpy.ok():
             rclpy.shutdown()

@@ -38,6 +38,7 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
 DEFAULT_WORKER = HERE / "integrated_nav_pick_place.py"
 DEFAULT_WEIGHTS = HERE / "perception" / "checkpoints" / "best.pt"
+DELIVERY_PLACE_SLOT_COUNT = 5
 
 
 def atomic_write_json(path: Path, document: dict) -> None:
@@ -162,6 +163,17 @@ class CompetitionRunner(Node):
 
     def _start_worker(self, order) -> None:
         assert self.task is not None
+        # Slots are consumed only by successful deliveries.  A failed attempt
+        # therefore retries the same slot instead of leaving an empty gap on
+        # the table.
+        place_slot = sum(
+            item.status == "delivered" for item in self.task.orders)
+        if place_slot >= DELIVERY_PLACE_SLOT_COUNT:
+            self.get_logger().error(
+                "delivery placement slots exhausted; refusing to stack "
+                f"another order on slot {DELIVERY_PLACE_SLOT_COUNT - 1}")
+            self._finish_match("placement_slots_exhausted")
+            return
         run_dir = (
             Path(self.args.runtime_dir)
             / safe_component(self.task.run_prefix))
@@ -182,6 +194,7 @@ class CompetitionRunner(Node):
             "--max-scan-cycles", str(self.args.max_scan_cycles),
             "--result-file", str(result_path),
             "--formal-mode",
+            "--place-slot", str(place_slot),
         ]
         command.extend(marker_arguments(self.task.excluded_markers(order.kind)))
         # 只有本场第一次抓货从 E 货架（最近站点）开始；之后每单从 A 货架开始
@@ -198,6 +211,7 @@ class CompetitionRunner(Node):
         self.worker_terminate_at = None
         self.get_logger().info(
             f"starting order id={order.id} kind={order.kind} "
+            f"place_slot={place_slot + 1}/{DELIVERY_PLACE_SLOT_COUNT} "
             f"attempt={order.attempts + 1}/{self.args.max_attempts} "
             f"excluded_markers={self.task.excluded_markers(order.kind)}")
         try:
