@@ -84,6 +84,8 @@ def generate_orders(count: int, seed: int | None) -> list[str]:
 DROP_GOAL = DELIVERY_APPROACH  # (-1.80, -2.60, -pi/2)
 # 返回抓货区：回到黄线走廊东端起点（货架扫描站附近），面北等待下一单。
 SHELF_RETURN_GOAL = (1.92, pick.SCAN_Y, pick.YAW_NORTH)
+# 后续订单（从 A 货架开始扫）返回西端起点，避免先回 E 再折返 A。
+SHELF_RETURN_GOAL_WEST = (pick.SCAN_X[-1], pick.SCAN_Y, pick.YAW_NORTH)
 
 DROP_RELEASE_DWELL_S = 1.5     # 张爪后停留时间，让货物完全脱手
 DROP_RETREAT_DWELL_S = 1.0     # 手臂收回后的停留时间
@@ -186,7 +188,7 @@ class ContinuousOrderController(IntegratedNavPickPlace):
 
         self.get_logger().info(
             f"[continuous] order controller ready kind={target_kind} "
-            f"drop_goal={DROP_GOAL} return_goal={SHELF_RETURN_GOAL}")
+            f"drop_goal={DROP_GOAL} return_goal={SHELF_RETURN_GOAL_WEST}")
 
     # ------------------------------------------------------------------
     # 抓取阶段（复用父级状态机，但屏蔽 abort 时的全局 shutdown）
@@ -275,7 +277,10 @@ class ContinuousOrderController(IntegratedNavPickPlace):
                     self.get_logger().warn(
                         "[drop-raise] IK failed; falling back to "
                         "extend/release")
-                    self.place_stage = 2
+                    # 不跳过向桌子的最后一段前进：右臂 raise 失败时也要先
+                    # 走完 stage 1 的 0.5m creep，否则会在离桌一小段处直接
+                    # 释放（左臂 raise 成功会走完这段，右臂却放不到位）。
+                    self.place_stage = 1
                     self.place_t0 = now
                     return
             if (self.commands_ready(
@@ -471,19 +476,24 @@ class ContinuousOrderController(IntegratedNavPickPlace):
     # ------------------------------------------------------------------
     # 返回抓货区
     # ------------------------------------------------------------------
+    def _return_goal(self):
+        """卸货后一律回西端（A 货架旁）：下一单从 A 开始扫，避免回 E 再折返。"""
+        return SHELF_RETURN_GOAL_WEST
+
     def _start_return_to_shelf(self) -> None:
         self.flow_phase = "return_to_shelf"
         self._nav_goal = None
         self._nav_last_log = 0.0
         self._watchdog_phase = None   # 强制看门狗重新计时
-        self.nav.set_goal(*SHELF_RETURN_GOAL)
+        goal = self._return_goal()
+        self.nav.set_goal(*goal)
         self.get_logger().info(
             f"[flow] drop done; navigating back to the grab area "
-            f"{SHELF_RETURN_GOAL}")
+            f"{goal}")
 
     def _return_to_shelf_tick(self) -> None:
         now = self.now()
-        self._nav_watchdog_check(SHELF_RETURN_GOAL)
+        self._nav_watchdog_check(self._return_goal())
         if self.order_aborted:
             return
         if self._laser_stale(now):
@@ -709,6 +719,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    from run_log import start_run_log
+    start_run_log("gui_client_continuous")
     args = parse_args()
     weights = str(pathlib.Path(args.weights).expanduser().resolve())
     if not pathlib.Path(weights).is_file():
@@ -756,6 +768,8 @@ def main() -> None:
                 close_recheck=not args.no_close_recheck)
             ctrl.order_index = index
             ctrl.order_count = len(orders)
+            # 只有第一单从最近的 E 货架开始扫；之后每单从最西侧 A 货架开始
+            ctrl.scan_prefer_west_start = index > 0
             # 重试时排除上次抓取失败的槽位 marker，让扫描去找同类商品的
             # 另一个位置，避免每次重试都撞同一个卡住的槽位（死循环感）。
             if exclude_marker_ids:

@@ -18,6 +18,7 @@ models/3dgs/
 *.tar
 *.tar.gz
 *.zip
+logs/
 .cache/
 *.log
 .claude/

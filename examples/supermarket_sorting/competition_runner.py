@@ -64,6 +64,7 @@ class CompetitionRunner(Node):
         self.current_order = None
         self.worker_stop_reason: str | None = None
         self.worker_terminate_at: float | None = None
+        self.spawned_workers = 0
         self.finished = False
         self.latest_yolo: tuple[int, list[dict]] | None = None
         self.latest_aruco: tuple[int, list[dict]] | None = None
@@ -107,6 +108,7 @@ class CompetitionRunner(Node):
 
         self.task = incoming
         self.task_started_at = time.monotonic()
+        self.spawned_workers = 0
         self.finished = False
         self.inventory.clear()
         self.latest_yolo = None
@@ -182,10 +184,14 @@ class CompetitionRunner(Node):
             "--formal-mode",
         ]
         command.extend(marker_arguments(self.task.excluded_markers(order.kind)))
+        # 只有本场第一次抓货从 E 货架（最近站点）开始；之后每单从 A 货架开始
+        if self.spawned_workers > 0:
+            command.append("--scan-start-west")
         if self.args.show:
             command.append("--show")
 
         self.current_order = order
+        self.spawned_workers += 1
         self.worker_result_path = result_path
         self.worker_started_at = time.monotonic()
         self.worker_stop_reason = None
@@ -485,6 +491,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    from run_log import start_run_log
+    start_run_log("competition_runner")
     args = parse_args()
     rclpy.init()
     node = CompetitionRunner(args)
