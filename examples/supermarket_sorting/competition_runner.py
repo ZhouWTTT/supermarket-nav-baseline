@@ -264,11 +264,17 @@ class CompetitionRunner(Node):
                 error=None if delivered else str(error),
                 max_attempts=self.args.max_attempts,
             )
-            level = self.get_logger().info if delivered else self.get_logger().error
-            level(
+            summary = (
                 f"order id={order.id} kind={order.kind} "
                 f"status={order.status} marker={marker_id} "
                 f"attempts={order.attempts}")
+            # 注意: rclpy 按"调用点"缓存日志严重级别, 同一行不能在不同调用间
+            # 切换 info/error, 否则抛 "Logger severity cannot be changed"。
+            # 拆成两个调用点即可各自独立缓存。
+            if delivered:
+                self.get_logger().info(summary)
+            else:
+                self.get_logger().error(summary)
             self._write_summary("worker_finished")
 
         self.worker = None

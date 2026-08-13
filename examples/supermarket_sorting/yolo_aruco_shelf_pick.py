@@ -234,7 +234,7 @@ NAV_X_MAX = 2.05
 # while correcting heading once the error is moderate, keep a minimum approach
 # speed, and accept the final heading with a deadband so odom yaw noise cannot
 # stall the phase.
-NAV_LINEAR_MAX_MPS = 0.80
+NAV_LINEAR_MAX_MPS = 0.90
 NAV_LINEAR_MIN_MPS = 0.10
 NAV_ROTATE_GATE_RAD = 0.45
 NAV_ANGULAR_MAX_RADPS = 1.50
@@ -1609,7 +1609,7 @@ class ShelfPickController(Node):
             f"grip={gripper} preshape={self.grip_preshape_command:.3f}")
 
     def set_twist(self, linear: float, angular: float) -> None:
-        self.des_linear = float(np.clip(linear, -0.80, 0.80))
+        self.des_linear = float(np.clip(linear, -0.90, 0.90))
         self.des_angular = float(np.clip(angular, -1.40, 1.40))
 
     def begin_manip_base_hold(self) -> None:

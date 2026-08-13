@@ -699,7 +699,7 @@ class NavigationController:
         self.nav_goal_x = self.nav_goal_y = None
 
         # Velocity limits
-        self.max_lin = 0.70
+        self.max_lin = 0.90
         self.max_ang = 2.5
         self.max_lin_acc = 1.2
         self.max_ang_acc = 5.0
@@ -983,8 +983,8 @@ class NavigationController:
         # obstacles we allow combined forward + rotation ("creep") so the
         # robot does not sweep its arms while rotating in place.
         v_des = min(self.max_lin, self.k_lin * dist_to_goal)
-        if dist_to_goal < 0.80:
-            v_des = min(v_des, 0.18)
+        if dist_to_goal < 0.60:
+            v_des = min(v_des, 0.22)
         v_des *= max(0.0, math.cos(heading_err))
         corner_scale = max(0.20, 1.0 - abs(heading_err) / 0.65)
         v_des *= corner_scale
@@ -1018,9 +1018,9 @@ class NavigationController:
 
         v = self._ramp_lin(v_des)
         w = self._ramp_ang(w_des)
-        if dist_to_goal < 0.80 and v > 0.18:
-            self.cur_lin = 0.18
-            v = 0.18
+        if dist_to_goal < 0.60 and v > 0.22:
+            self.cur_lin = 0.22
+            v = 0.22
 
         # ── emergency stop (per-sensor) ──
         if forward_intent and self.lidar_clearance <= self._stop_dist:
