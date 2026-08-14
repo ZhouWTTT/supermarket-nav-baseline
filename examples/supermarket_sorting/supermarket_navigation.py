@@ -701,6 +701,10 @@ class NavigationController:
         # Velocity limits
         self.max_lin = 0.90
         self.max_ang = 2.5
+        # Keep useful speed through the last open-space approach.  Obstacle
+        # clearance scaling and all hard-stop checks below still take
+        # precedence, so this only raises the cap when the route is clear.
+        self.near_goal_max_lin = 0.35
         self.max_lin_acc = 1.2
         self.max_ang_acc = 5.0
         self.dt = 0.02
@@ -717,6 +721,11 @@ class NavigationController:
         # Gains
         self.k_ang = 2.5
         self.k_lin = 1.0
+        # Moderate heading errors can follow a safe, very small-radius arc
+        # instead of spending several seconds rotating with zero translation.
+        # Larger errors still require alignment in place, and trajectory/
+        # clearance checks below remain authoritative.
+        self.translation_heading_gate = 0.85
 
         # Tolerances
         self.pos_tol = 0.10
@@ -761,6 +770,17 @@ class NavigationController:
         self._reverse_recovery_attempts = 0
         self._reverse_recovery_max_attempts = 2
         self._reverse_recovery_cooldown_until = float('-inf')
+        # A recovery's own 0.12 m reverse motion must not count as useful
+        # navigation progress.  Reset the attempt budget only after the robot
+        # subsequently gets materially closer to the goal.
+        self._reverse_recovery_goal_dist = None
+        self._reverse_recovery_progress_reset_m = 0.30
+        self._lateral_escape_attempts = 0
+        self._lateral_escape_max_attempts = 2
+        self._lateral_escape_offset_m = 0.38
+        self._lateral_escape_backoff_m = 0.08
+        self._last_lateral_escape_sign = 0
+        self._recovery_action = None
 
         # Replanning/progress state
         self._last_replan_time = float('-inf')
@@ -819,6 +839,10 @@ class NavigationController:
         self._reverse_recovery_started_at = 0.0
         self._reverse_recovery_attempts = 0
         self._reverse_recovery_cooldown_until = float('-inf')
+        self._reverse_recovery_goal_dist = None
+        self._lateral_escape_attempts = 0
+        self._last_lateral_escape_sign = 0
+        self._recovery_action = None
         self._last_replan_time = float('-inf')
         self._replan_hold_until = float('-inf')
         self._best_goal_dist = float('inf')
@@ -893,7 +917,8 @@ class NavigationController:
             if self._maybe_start_reverse_recovery(
                     "rotation_loop", base_x, base_y, base_yaw,
                     laser_msg, now):
-                self.stop_reason = "reverse_recovery_start"
+                self.stop_reason = (
+                    self._recovery_action or "reverse_recovery_start")
             return 0.0, 0.0, False
 
         # Plan periodically so newly observed boxes trigger a prompt detour.
@@ -919,6 +944,14 @@ class NavigationController:
         dx = self.nav_goal_x - base_x
         dy = self.nav_goal_y - base_y
         dist_to_goal = math.hypot(dx, dy)
+        if (self._reverse_recovery_goal_dist is not None
+                and dist_to_goal
+                <= self._reverse_recovery_goal_dist
+                - self._reverse_recovery_progress_reset_m):
+            self._reverse_recovery_attempts = 0
+            self._lateral_escape_attempts = 0
+            self._reverse_recovery_goal_dist = None
+            self._last_lateral_escape_sign = 0
 
         # The planner may move a temporarily occupied goal to the nearest free
         # cell.  Use that effective endpoint until a later replan can restore
@@ -984,7 +1017,7 @@ class NavigationController:
         # robot does not sweep its arms while rotating in place.
         v_des = min(self.max_lin, self.k_lin * dist_to_goal)
         if dist_to_goal < 0.60:
-            v_des = min(v_des, 0.22)
+            v_des = min(v_des, self.near_goal_max_lin)
         v_des *= max(0.0, math.cos(heading_err))
         corner_scale = max(0.20, 1.0 - abs(heading_err) / 0.65)
         v_des *= corner_scale
@@ -997,7 +1030,7 @@ class NavigationController:
         # ── decide stop reason ──
         new_reason = None
 
-        if abs(heading_err) > 0.65:
+        if abs(heading_err) > self.translation_heading_gate:
             if composite < self._slow_dist:
                 v_des = min(v_des, 0.06)
             else:
@@ -1018,9 +1051,9 @@ class NavigationController:
 
         v = self._ramp_lin(v_des)
         w = self._ramp_ang(w_des)
-        if dist_to_goal < 0.60 and v > 0.22:
-            self.cur_lin = 0.22
-            v = 0.22
+        if dist_to_goal < 0.60 and v > self.near_goal_max_lin:
+            self.cur_lin = self.near_goal_max_lin
+            v = self.near_goal_max_lin
 
         # ── emergency stop (per-sensor) ──
         if forward_intent and self.lidar_clearance <= self._stop_dist:
@@ -1083,7 +1116,8 @@ class NavigationController:
         self.stop_reason = new_reason
         if self._maybe_start_reverse_recovery(
                 new_reason, base_x, base_y, base_yaw, laser_msg, now):
-            self.stop_reason = "reverse_recovery_start"
+            self.stop_reason = (
+                self._recovery_action or "reverse_recovery_start")
             return 0.0, 0.0, False
 
         return v, w, False
@@ -1209,7 +1243,6 @@ class NavigationController:
             self._rotation_anchor_y = by
             self._rotation_accum = 0.0
             self._rotation_recoveries = 0
-            self._reverse_recovery_attempts = 0
         elif self._last_base_yaw is not None:
             self._rotation_accum += abs(angdist(
                 self._last_base_yaw, byaw))
@@ -1227,6 +1260,7 @@ class NavigationController:
     def _maybe_start_reverse_recovery(
             self, reason, bx, by, byaw, laser_msg, now):
         """Enter measured straight backup after a persistent local block."""
+        self._recovery_action = None
         recoverable = {"lidar_stop", "arc_blocked", "rotation_loop"}
         if reason not in recoverable:
             self._reverse_recovery_blocked_time = max(
@@ -1266,6 +1300,19 @@ class NavigationController:
             return False
         if (self._reverse_recovery_attempts
                 >= self._reverse_recovery_max_attempts):
+            if (self._lateral_escape_attempts
+                    >= self._lateral_escape_max_attempts):
+                return False
+            if self._install_lateral_escape_path(bx, by, byaw, now):
+                self._lateral_escape_attempts += 1
+                self._reverse_recovery_blocked_time = 0.0
+                self._reverse_recovery_block_anchor_x = float(bx)
+                self._reverse_recovery_block_anchor_y = float(by)
+                self._reverse_recovery_cooldown_until = float(now) + 3.0
+                self.cur_lin = 0.0
+                self.cur_ang = 0.0
+                self._recovery_action = "lateral_escape_replan"
+                return True
             return False
         if not self._rear_scan_available(laser_msg):
             return False
@@ -1282,10 +1329,62 @@ class NavigationController:
         self._reverse_recovery_start_y = float(by)
         self._reverse_recovery_start_yaw = float(byaw)
         self._reverse_recovery_started_at = float(now)
+        if self._reverse_recovery_goal_dist is None:
+            self._reverse_recovery_goal_dist = math.hypot(
+                self.goal_x - bx, self.goal_y - by)
         self._reverse_recovery_attempts += 1
         self._reverse_recovery_blocked_time = 0.0
         self.cur_lin = 0.0
         self.cur_ang = 0.0
+        return True
+
+    def _install_lateral_escape_path(self, bx, by, byaw, now):
+        """Plan through a side waypoint after straight backup repeats.
+
+        A straight reverse creates turning room but does not change which side
+        of the obstacle the follower approaches.  Evaluate both sides in the
+        current costmap and install a complete via-waypoint route so the next
+        command necessarily contains lateral motion.
+        """
+        heading_x = math.cos(byaw)
+        heading_y = math.sin(byaw)
+        left_x = -heading_y
+        left_y = heading_x
+        candidates = []
+        for sign in (1, -1):
+            wx = (
+                bx - self._lateral_escape_backoff_m * heading_x
+                + sign * self._lateral_escape_offset_m * left_x)
+            wy = (
+                by - self._lateral_escape_backoff_m * heading_y
+                + sign * self._lateral_escape_offset_m * left_y)
+            if not self.cm.is_free_world(wx, wy):
+                continue
+            first = self._try_plan_with_fallback(bx, by, wx, wy)
+            if not first:
+                continue
+            second = self._try_plan_with_fallback(
+                wx, wy, self.goal_x, self.goal_y)
+            if not second:
+                continue
+            path = list(first) + list(second[1:])
+            score = self._polyline_length(path)
+            if sign == self._last_lateral_escape_sign:
+                score += 0.25
+            candidates.append((score, sign, path))
+
+        if not candidates:
+            return False
+        _, sign, path = min(candidates, key=lambda item: item[0])
+        self._install_path(path)
+        self._last_lateral_escape_sign = sign
+        # Protect the escape prefix from the normal short-path replacement
+        # long enough for the chassis to reach its lateral waypoint.
+        self._last_replan_time = float(now)
+        self._replan_hold_until = float(now) + 8.0
+        self._best_goal_dist = math.hypot(
+            self.goal_x - bx, self.goal_y - by)
+        self._last_progress_time = float(now)
         return True
 
     def _finish_reverse_recovery(self, bx, by, byaw, now):
@@ -1660,8 +1759,10 @@ class SupermarketNavigator:
         self._goal = None
         self._goal_start_pose = None
         self._goal_path_snapshot = None
+        self._suppress_path_memory_save = False
         self._cached_path_active = False
         self._cached_path_info = {"enabled": False, "cache_hit": False}
+        self._cached_goal_offset_limit = None
         self.path_memory = PathMemory(
             enabled=os.environ.get("SUPERMARKET_PATH_MEMORY", "0") == "1",
             storage_path=os.environ.get(
@@ -1674,13 +1775,17 @@ class SupermarketNavigator:
             "cache_hit": False,
         }
 
-    def set_goal(self, x, y, yaw=None):
+    def set_goal(self, x, y, yaw=None, cached_goal_offset_limit=None):
         self.controller.set_goal(x, y, yaw)
         self._reached = False
         self._goal = (float(x), float(y), None if yaw is None else float(yaw))
         self._goal_start_pose = None
         self._goal_path_snapshot = None
+        self._suppress_path_memory_save = False
         self._cached_path_active = False
+        self._cached_goal_offset_limit = (
+            None if cached_goal_offset_limit is None
+            else max(0.0, float(cached_goal_offset_limit)))
         self._cached_path_info = {"enabled": self.path_memory.enabled, "cache_hit": False}
 
     def _try_restore_cached_path(self, base_x, base_y, base_yaw, now):
@@ -1694,6 +1799,15 @@ class SupermarketNavigator:
             goal_y=self._goal[1],
             goal_yaw=self._goal[2],
         )
+        if (path
+                and self._cached_goal_offset_limit is not None
+                and info.get("reason") == "nearby_match"
+                and float(info.get("goal_delta_m", float("inf")))
+                > self._cached_goal_offset_limit):
+            info["cache_hit"] = False
+            info["reason"] = "nearby_goal_offset"
+            info["goal_offset_limit_m"] = self._cached_goal_offset_limit
+            path = None
         self._cached_path_info = info
         if path:
             self.controller._install_path(path)
@@ -1703,7 +1817,8 @@ class SupermarketNavigator:
 
     def _save_successful_path(self, base_x, base_y, base_yaw):
         if (not self.path_memory.enabled or self._goal is None
-                or not self.controller.path):
+                or not self.controller.path
+                or self._suppress_path_memory_save):
             return
         start_pose = self._goal_start_pose
         if start_pose is None:
@@ -1754,6 +1869,23 @@ class SupermarketNavigator:
             laser_msg=laser_msg,
             depth_clearance=depth_clearance,
             time_now=current_now)
+
+        # A remembered route that already required recovery is no longer a
+        # trustworthy success candidate.  Keep following the controller's
+        # newly planned path, but stop labelling/saving the original cached
+        # snapshot as successful when the goal is eventually reached.
+        if (self._cached_path_active
+                and self.controller.stop_reason in {
+                    "reverse_recovery_start",
+                    "lateral_escape_replan",
+                    "rotation_loop",
+                }):
+            self._cached_path_active = False
+            self._cached_path_info["cached_path_invalidated"] = True
+            self._cached_path_info["invalidation_reason"] = (
+                self.controller.stop_reason)
+            self._suppress_path_memory_save = True
+            self._goal_path_snapshot = None
 
         if self._goal is not None and self._goal_path_snapshot is None and self.controller.path:
             # Keep the first full path produced for this goal.  Near-goal

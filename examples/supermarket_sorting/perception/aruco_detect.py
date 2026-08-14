@@ -86,6 +86,7 @@ class ArucoDetectNode(Node):
         self.marker_size = marker_size
         self.publish_tf = publish_tf
         self.publish_result_image = publish_result_image
+        self.enabled = True
         self.bridge = CvBridge()
         self.camera_matrix = None
         self.distortion = np.zeros(5, dtype=float)
@@ -130,12 +131,23 @@ class ArucoDetectNode(Node):
         self.get_logger().info(
             f"listening on {image_topic}; dictionary=DICT_4X4_50, marker_size={marker_size:.3f}m")
 
+    def set_enabled(self, enabled: bool) -> None:
+        """Pause RGB marker detection while retaining fresh state/depth."""
+        enabled = bool(enabled)
+        changed = enabled != self.enabled
+        self.enabled = enabled
+        if changed:
+            self.get_logger().info(
+                f"ArUco detection {'enabled' if enabled else 'paused'}")
+
     def camera_info_cb(self, msg):
         self.camera_matrix = np.asarray(msg.k, dtype=float).reshape(3, 3)
         if msg.d:
             self.distortion = np.asarray(msg.d, dtype=float)
 
     def depth_cb(self, msg):
+        if not self.enabled:
+            return
         self.depth_image = self.bridge.imgmsg_to_cv2(
             msg, desired_encoding="passthrough")
         self.depth_stamp_ns = (
@@ -242,6 +254,8 @@ class ArucoDetectNode(Node):
         return valid
 
     def image_cb(self, msg):
+        if not self.enabled:
+            return
         if self.camera_matrix is None:
             return
         image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")

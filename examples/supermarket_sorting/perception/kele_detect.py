@@ -223,7 +223,7 @@ def foreground_depth_estimate(depth_img, bbox_xyxy, K, T_cam_world):
 class KeleDetectNode(Node):
     def __init__(self, backend="blob", pub_res_img=True, device="auto",
                  weights=None, target_kind=None, confidence=0.45, show=False,
-                 camera_names=("head",)):
+                 camera_names=("head",), max_inference_hz=0.0):
         super().__init__("kele_detect")
         self.bridge = CvBridge()
         self.pub_res_img = pub_res_img
@@ -232,6 +232,15 @@ class KeleDetectNode(Node):
         unknown = set(self.camera_names) - set(CAMERAS)
         if unknown or not self.camera_names:
             raise ValueError(f"invalid camera names: {sorted(unknown)}")
+        self.max_inference_hz = float(max_inference_hz)
+        if (not np.isfinite(self.max_inference_hz)
+                or self.max_inference_hz < 0.0):
+            raise ValueError("max_inference_hz must be finite and >= 0")
+        self._inference_interval_ns = (
+            0 if self.max_inference_hz <= 0.0
+            else max(1, int(1_000_000_000 / self.max_inference_hz)))
+        self._last_inference_stamp_ns = {
+            name: None for name in self.camera_names}
 
         # Intrinsics/depth are maintained independently for every RGB stream.
         # Only the head camera has an aligned depth publisher in this server.
@@ -248,6 +257,7 @@ class KeleDetectNode(Node):
         # three camera streams from competing for one YOLO model.
         self._active_camera_lock = threading.Lock()
         self._active_cameras = set(self.camera_names)
+        self._enabled = True
         # Three YOLO RGB callbacks intentionally remain in the node's default
         # mutually-exclusive group because they share one model and one FK
         # object.  Fast state/depth callbacks use separate groups so continuous
@@ -283,7 +293,9 @@ class KeleDetectNode(Node):
         self.get_logger().info(
             f"goods detector up; backend={backend} target={target_kind or 'all'} "
             f"weights={weights or DEFAULT_GOODS_CKPT} "
-            f"cameras={','.join(self.camera_names)}")
+            f"cameras={','.join(self.camera_names)} "
+            f"max_inference_hz="
+            f"{self.max_inference_hz if self.max_inference_hz > 0 else 'unlimited'}")
 
         # subscriptions
         for camera_name in self.camera_names:
@@ -324,6 +336,16 @@ class KeleDetectNode(Node):
         if changed:
             self.get_logger().info(
                 f"active YOLO cameras={','.join(sorted(requested))}")
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Pause expensive RGB inference while retaining fresh robot state."""
+        enabled = bool(enabled)
+        with self._active_camera_lock:
+            changed = enabled != self._enabled
+            self._enabled = enabled
+        if changed:
+            self.get_logger().info(
+                f"YOLO inference {'enabled' if enabled else 'paused'}")
 
     # ---- state callbacks ----
     def camera_info_cb(self, camera_name: str, msg: CameraInfo):
@@ -401,17 +423,25 @@ class KeleDetectNode(Node):
     # ---- main RGB callback ----
     def rgb_cb(self, camera_name: str, msg: Image):
         with self._active_camera_lock:
-            if camera_name not in self._active_cameras:
+            if (not self._enabled
+                    or camera_name not in self._active_cameras):
                 return
         K = self.K[camera_name]
         if K is None:
             return
+        rgb_stamp_ns = stamp_ns(msg)
+        if self.backend_name == "yolo" and self._inference_interval_ns > 0:
+            previous = self._last_inference_stamp_ns[camera_name]
+            if (previous is not None
+                    and rgb_stamp_ns > previous
+                    and rgb_stamp_ns - previous < self._inference_interval_ns):
+                return
+            self._last_inference_stamp_ns[camera_name] = rgb_stamp_ns
         T_cam_world = self.camera_world_tmat(camera_name)
         if T_cam_world is None:
             return
 
         rgb = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-        rgb_stamp_ns = stamp_ns(msg)
         if self.backend_name == "yolo":
             # YOLO itself is RGB-only.  Run inference first so the separately
             # scheduled depth callback has time to receive the matching/future
@@ -567,6 +597,9 @@ def main():
     parser.add_argument("--cameras", nargs="+", choices=CAMERAS,
                         default=["head"],
                         help="RGB cameras used by the shared YOLO model")
+    parser.add_argument(
+        "--max-inference-hz", type=float, default=0.0,
+        help="YOLO source-frame rate limit; 0 processes every received frame")
     args = parser.parse_args()
 
     rclpy.init()
@@ -574,7 +607,8 @@ def main():
                           device=args.device, weights=args.weights,
                           target_kind=args.target_kind,
                           confidence=args.confidence, show=args.show,
-                          camera_names=args.cameras)
+                          camera_names=args.cameras,
+                          max_inference_hz=args.max_inference_hz)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
