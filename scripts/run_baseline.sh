@@ -21,8 +21,10 @@ runner=(
     --max-scan-cycles "${SUPERMARKET_MAX_SCAN_CYCLES:-2}"
     --max-attempts "${SUPERMARKET_MAX_ATTEMPTS:-2}"
     --inventory-confirmations "${SUPERMARKET_INVENTORY_CONFIRMATIONS:-3}"
+    --candidate-attempt-budget "${SUPERMARKET_CANDIDATE_ATTEMPT_BUDGET:-45}"
     --order-timeout "${SUPERMARKET_ORDER_TIMEOUT:-0}"
     --match-timeout "${SUPERMARKET_MATCH_TIMEOUT:-570}"
+    --memory-mode "${SUPERMARKET_MEMORY_MODE:-off}"
 )
 
 if [ "${SUPERMARKET_SHOW:-0}" = "1" ]; then

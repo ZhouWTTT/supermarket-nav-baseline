@@ -667,6 +667,21 @@ class NavigationController:
         self.dt = 0.02
         self._last_update_time = None
 
+        # Carrying uses a deliberately gentler local-control profile.  The
+        # default remains the original empty-navigation profile; callers must
+        # opt in explicitly after a grasp has been verified.
+        self.carrying = False
+        self.carrying_max_ang = 1.0
+        self._carrying_heading_trigger_s = 3.0
+        self._carrying_heading_recovery_timeout_s = 6.0
+        self._carrying_heading_creep_mps = 0.05
+        self._carrying_heading_alignment_since = None
+        self._carrying_heading_recovery_until = None
+        self._carrying_heading_recovery_anchor = None
+        self._carrying_heading_recovery_target = None
+        self._carrying_heading_recoveries = 0
+        self._carrying_heading_recovery_timeouts = 0
+
         # Current smoothed velocities
         self.cur_lin = 0.0
         self.cur_ang = 0.0
@@ -724,6 +739,20 @@ class NavigationController:
         self._last_plan_lidar_count = 0
         self._last_plan_vision_count = 0
 
+    def set_carrying(self, carrying):
+        """Select the carrying-only control profile without changing a goal."""
+        carrying = bool(carrying)
+        if carrying == self.carrying:
+            return
+        self.carrying = carrying
+        self._clear_carrying_heading_recovery(clear_alignment=True)
+        self._rotation_accum = 0.0
+        self._rotation_anchor_x = None
+        self._rotation_anchor_y = None
+        self._last_base_yaw = None
+        self.cur_lin = 0.0
+        self.cur_ang = 0.0
+
     def set_goal(self, x, y, yaw=None):
         """Set a new navigation goal.  Clears the current path."""
         self.goal_x = float(x)
@@ -742,6 +771,9 @@ class NavigationController:
         self._rotation_anchor_y = None
         self._last_base_yaw = None
         self._rotation_recoveries = 0
+        self._clear_carrying_heading_recovery(clear_alignment=True)
+        self._carrying_heading_recoveries = 0
+        self._carrying_heading_recovery_timeouts = 0
         self.stop_reason = None
         self._last_logged_reason = None
         self.lidar_clearance = float('inf')
@@ -779,8 +811,17 @@ class NavigationController:
         if self.goal_x is None:
             return 0.0, 0.0, True
 
-        rotation_loop = self._update_rotation_watchdog(
-            base_x, base_y, base_yaw)
+        # Once a carrying heading-alignment stall is being timed, its bounded
+        # recovery owns the response.  The generic rotation watchdog would
+        # otherwise fire just before the >3 s carrying trigger and repeatedly
+        # reset the local target without allowing translation.
+        carrying_heading_owned = (
+            self.carrying and
+            (self._carrying_heading_alignment_since is not None or
+             self._carrying_heading_recovery_until is not None))
+        rotation_loop = (
+            False if carrying_heading_owned else
+            self._update_rotation_watchdog(base_x, base_y, base_yaw))
         if rotation_loop:
             new_path = self._try_plan_with_fallback(
                 base_x, base_y, self.goal_x, self.goal_y)
@@ -891,8 +932,9 @@ class NavigationController:
         v_des *= max(0.0, math.cos(heading_err))
         corner_scale = max(0.20, 1.0 - abs(heading_err) / 0.65)
         v_des *= corner_scale
-        w_des = max(-self.max_ang,
-                    min(self.max_ang, self.k_ang * heading_err))
+        angular_limit = self._angular_limit()
+        w_des = max(-angular_limit,
+                    min(angular_limit, self.k_ang * heading_err))
 
         # Composite clearance for scaling (the tighter sensor governs braking)
         composite = min(self.lidar_clearance, self.depth_clearance_val)
@@ -900,11 +942,43 @@ class NavigationController:
         # ── decide stop reason ──
         new_reason = None
 
-        if abs(heading_err) > 0.65:
+        open_space_alignment_stop = (
+            abs(heading_err) > 0.65 and composite >= self._slow_dist)
+        if open_space_alignment_stop:
+            # Preserve the original fail-safe immediate stop before deciding
+            # whether the carrying-only bounded creep is authorized.
+            self.cur_lin = 0.0
+
+        qualifying_alignment_stall = (
+            abs(heading_err) > 0.65 and abs(self.cur_lin) < 0.01)
+
+        recovery_state = self._update_carrying_heading_recovery(
+            now, base_x, base_y,
+            qualifying_alignment_stall=qualifying_alignment_stall)
+
+        if recovery_state == "timeout":
+            self.cur_lin = self.cur_ang = 0.0
+            self.stop_reason = "heading_recovery_timeout"
+            return 0.0, 0.0, False
+
+        if recovery_state == "active":
+            target = self._carrying_heading_recovery_target
+            if target is None:
+                target = self._lookahead_point(
+                    base_x, base_y, self.lookahead_min)
+                self._carrying_heading_recovery_target = target
+            recovery_heading = math.atan2(
+                target[1] - base_y, target[0] - base_x)
+            heading_err = angdist(base_yaw, recovery_heading)
+            v_des = self._carrying_heading_creep_mps
+            w_des = max(-angular_limit,
+                        min(angular_limit, self.k_ang * heading_err))
+            new_reason = "heading_recovery"
+
+        elif abs(heading_err) > 0.65:
             if composite < self._slow_dist:
                 v_des = min(v_des, 0.06)
             else:
-                self.cur_lin = 0.0
                 v_des = 0.0
             new_reason = "heading_alignment"
 
@@ -1095,6 +1169,84 @@ class NavigationController:
         self._last_base_yaw = byaw
         return self._rotation_accum > self._rotation_loop_limit
 
+    def _clear_carrying_heading_recovery(self, *, clear_alignment):
+        self._carrying_heading_recovery_until = None
+        self._carrying_heading_recovery_anchor = None
+        self._carrying_heading_recovery_target = None
+        if clear_alignment:
+            self._carrying_heading_alignment_since = None
+
+    def _select_carrying_recovery_target(self, bx, by):
+        """Freeze a newly selected visible local target for one recovery."""
+        if not self.path:
+            return None
+        distance = min(0.75, max(self.lookahead_min, self.lookahead_base))
+        target = self._lookahead_point(bx, by, distance)
+        while (distance > self.cm.resolution and
+               not self.cm.line_is_free(bx, by, target[0], target[1])):
+            distance *= 0.5
+            target = self._lookahead_point(bx, by, distance)
+        return target
+
+    def _begin_carrying_heading_recovery(self, now, bx, by):
+        # This is local-controller recovery only: it requests the existing A*
+        # planner with unchanged map, footprint, inflation and delivery goal.
+        new_path = self._try_plan_with_fallback(
+            bx, by, self.goal_x, self.goal_y)
+        self._last_replan_time = now
+        if new_path is not None:
+            self._install_path(new_path)
+        self._carrying_heading_recovery_target = (
+            self._select_carrying_recovery_target(bx, by))
+        self._carrying_heading_recovery_anchor = (bx, by)
+        self._carrying_heading_recovery_until = (
+            now + self._carrying_heading_recovery_timeout_s)
+        self._carrying_heading_recoveries += 1
+        self._rotation_accum = 0.0
+        self._rotation_anchor_x = bx
+        self._rotation_anchor_y = by
+
+    def _update_carrying_heading_recovery(
+            self, now, bx, by, *, qualifying_alignment_stall):
+        if not self.carrying:
+            return None
+
+        if self._carrying_heading_recovery_until is not None:
+            anchor = self._carrying_heading_recovery_anchor
+            translated = (0.0 if anchor is None else math.hypot(
+                bx - anchor[0], by - anchor[1]))
+            if translated > 0.08:
+                self._clear_carrying_heading_recovery(
+                    clear_alignment=True)
+                self._rotation_accum = 0.0
+                self._rotation_anchor_x = bx
+                self._rotation_anchor_y = by
+                return None
+            if now >= self._carrying_heading_recovery_until:
+                # Bound the creep.  A timeout stops first and requires a new
+                # >3 s qualifying stall before another recovery can start.
+                self._carrying_heading_recovery_timeouts += 1
+                self._clear_carrying_heading_recovery(
+                    clear_alignment=True)
+                self._rotation_accum = 0.0
+                self._rotation_anchor_x = bx
+                self._rotation_anchor_y = by
+                return "timeout"
+            return "active"
+
+        if not qualifying_alignment_stall:
+            self._carrying_heading_alignment_since = None
+            return None
+        if self._carrying_heading_alignment_since is None:
+            self._carrying_heading_alignment_since = now
+            return None
+        if (now - self._carrying_heading_alignment_since <=
+                self._carrying_heading_trigger_s):
+            return None
+
+        self._begin_carrying_heading_recovery(now, bx, by)
+        return "active"
+
     def _closest_index(self, bx, by):
         best_i, best_d2 = 0, float('inf')
         for i, (px, py) in enumerate(self.path):
@@ -1166,11 +1318,17 @@ class NavigationController:
 
     def _ramp_ang(self, des):
         """Acceleration-limited angular velocity."""
-        des = max(-self.max_ang, min(self.max_ang, des))
+        angular_limit = self._angular_limit()
+        des = max(-angular_limit, min(angular_limit, des))
         delta = max(-self.max_ang_acc * self.dt,
                     min(self.max_ang_acc * self.dt, des - self.cur_ang))
         self.cur_ang += delta
+        self.cur_ang = max(-angular_limit,
+                           min(angular_limit, self.cur_ang))
         return self.cur_ang
+
+    def _angular_limit(self):
+        return self.carrying_max_ang if self.carrying else self.max_ang
 
     def _front_clearance(self, laser_msg):
         """Minimum valid range in the forward cone, independent of scan layout."""
@@ -1264,6 +1422,9 @@ class SupermarketNavigator:
     def set_goal(self, x, y, yaw=None):
         self.controller.set_goal(x, y, yaw)
         self._reached = False
+
+    def set_carrying(self, carrying):
+        self.controller.set_carrying(carrying)
 
     def update(self, base_x, base_y, base_yaw, laser_msg=None,
                depth_clearance=None, depth_token=None, time_now=None):

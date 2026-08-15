@@ -38,6 +38,7 @@ import json
 import math
 import sys
 import threading
+import time
 from collections import deque
 from functools import lru_cache
 from pathlib import Path
@@ -64,9 +65,17 @@ if str(PERCEPTION_DIR) not in sys.path:
     sys.path.insert(0, str(PERCEPTION_DIR))
 
 from discoverse.robots.mmk2.mmk2_fik import MMK2FIK
+from discoverse.robots.mmk2.mmk2_fk import MMK2FK
 from mmk2_kdl import MMK2Kdl
 from perception.aruco_detect import ArucoDetectNode
 from perception.kele_detect import KeleDetectNode
+from strict_localization_stability_trace import (
+    AssociationDecision,
+    FrozenRecord,
+    StrictTraceRuntime,
+    latest_not_after,
+    marker_geometry,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -591,7 +600,8 @@ def decode_list(message: String) -> list[dict]:
         if isinstance(value, list) else []
 
 
-def marker_below_yolo(detection: dict, markers: list[dict]) -> dict | None:
+def association_decision(detection: dict,
+                         markers: list[dict]) -> AssociationDecision:
     """Bind a product to its nearest marker that is not above it.
 
     Image Y increases downward.  Candidates must lie in the lower half of the
@@ -599,13 +609,29 @@ def marker_below_yolo(detection: dict, markers: list[dict]) -> dict | None:
     agree with the product's YOLO world-Z when depth is available.  The final
     choice is the Euclidean-nearest marker to the box's bottom centre.
     """
+    inputs = FrozenRecord.from_mapping({
+        "detection": {
+            "bbox_xyxy": detection.get("bbox_xyxy"),
+            "class": detection.get("class"),
+            "world": detection.get("world"),
+        },
+        "markers": [{"id": marker.get("id"),
+                     "pixel_center": marker.get("pixel_center"),
+                     "position_world": marker.get("position_world")}
+                    for marker in markers[:128]],
+    })
+
+    def reject(reason: str) -> AssociationDecision:
+        return AssociationDecision(False, reason, None, inputs)
+
     try:
         x0, y0, x1, y1 = map(float, detection["bbox_xyxy"])
     except (KeyError, TypeError, ValueError):
-        return None
+        return reject("invalid_target_bbox")
     width, height = x1 - x0, y1 - y0
-    if width <= 2.0 or height <= 2.0:
-        return None
+    if (not all(math.isfinite(value) for value in (x0, y0, x1, y1))
+            or width <= 2.0 or height <= 2.0):
+        return reject("invalid_target_bbox")
 
     centre_x = 0.5 * (x0 + x1)
     minimum_marker_y = y0 + 0.50 * height
@@ -622,7 +648,7 @@ def marker_below_yolo(detection: dict, markers: list[dict]) -> dict | None:
     product_height = PRODUCT_CENTER_ABOVE_MARKER_M.get(
         detection.get("class"))
     candidates = []
-    for marker in markers:
+    for marker_index, marker in enumerate(markers):
         try:
             marker_id = int(marker["id"])
             marker_x, marker_y = map(float, marker["pixel_center"])
@@ -652,10 +678,20 @@ def marker_below_yolo(detection: dict, markers: list[dict]) -> dict | None:
                     > DEPTH_TARGET_MARKER_XY_MAX_M):
                 continue
         pixel_distance = math.hypot(marker_x - centre_x, marker_y - y1)
-        candidates.append((pixel_distance, marker_id, marker))
+        candidates.append((pixel_distance, marker_id, marker_index))
     if not candidates:
+        return reject("no_marker_satisfies_association")
+    marker_index = min(candidates, key=lambda item: (item[0], item[1]))[2]
+    return AssociationDecision(True, "accepted", marker_index, inputs)
+
+
+def marker_below_yolo(detection: dict, markers: list[dict]) -> dict | None:
+    """Return the unique marker selected by the association decision source."""
+    try:
+        decision = association_decision(detection, markers)
+    except ValueError:
         return None
-    return min(candidates, key=lambda item: (item[0], item[1]))[2]
+    return markers[decision.marker_index] if decision.accepted else None
 
 
 def fixed_slot_nearest_marker(marker_world: np.ndarray):
@@ -708,6 +744,15 @@ class ShelfPickController(Node):
         self.initialized = False
         self.ik = MMK2FIK()
         self.kdl = MMK2Kdl()
+        self.strict_trace_runtime = StrictTraceRuntime()
+        self.diagnostic_fk = (
+            MMK2FK() if self.strict_trace_runtime.sample_records_enabled
+            else None)
+        self.diagnostic_odom_history = deque(maxlen=256)
+        self.diagnostic_joint_history = deque(maxlen=256)
+        self.strict_trace_context = {}
+        self.strict_trace_identity = None
+        self.strict_trace_sink = None
 
         self.state = STATE_GO_SCAN
         self.state_t0 = self.now()
@@ -737,6 +782,11 @@ class ShelfPickController(Node):
         # kind instead of repeatedly selecting the same slot.
         self.excluded_marker_ids = set()
         self.preferred_marker_id = None
+        # ``preferred_marker_id`` is a viewpoint hint only.  A hard identity
+        # constraint may only be installed after authoritative localisation;
+        # formal candidate replay therefore leaves this unset during scan.
+        self.required_exact_marker_id = None
+        self.scan_dwell_s = SCAN_DWELL_S
         self.close_recheck = bool(close_recheck)
         self.recheck_marker_skips = set()
         self.recheck_confirmation_times = deque(maxlen=12)
@@ -901,6 +951,72 @@ class ShelfPickController(Node):
     def now(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
+    def replay_observation_snapshot(self) -> dict:
+        """Return a detached, read-only view of strict-localizer progress.
+
+        The snapshot exposes counters and timestamps only.  It neither alters
+        the association/sample buffers nor participates in any localization
+        acceptance decision.
+        """
+        with self.lock:
+            yolo_stamps = [int(frame[0]) for frame in self.yolo_frames]
+            aruco_stamps = [int(frame[0]) for frame in self.aruco_frames]
+            yolo_stamp = None
+            target_kind_detections = 0
+            if self.yolo_frames:
+                yolo_stamp, detections = self.yolo_frames[-1]
+                target_kind_detections = len(detections)
+            aruco_stamp = None
+            aruco_detections = 0
+            if self.aruco_frames:
+                if yolo_stamp is None:
+                    aruco_stamp, markers = self.aruco_frames[-1]
+                else:
+                    aruco_stamp, markers = min(
+                        self.aruco_frames,
+                        key=lambda frame: abs(frame[0] - yolo_stamp))
+                aruco_detections = len(markers)
+            spread = 0.0
+            if len(self.marker_positions) >= 2:
+                spread = float(np.max(np.ptp(
+                    np.asarray(self.marker_positions, dtype=float), axis=0)))
+            pair_delta_ns = None
+            if yolo_stamp is not None and aruco_stamp is not None:
+                pair_delta_ns = abs(int(aruco_stamp) - int(yolo_stamp))
+            synchronized_pairs = set()
+            if aruco_stamps:
+                for stamp in yolo_stamps:
+                    nearest = min(aruco_stamps, key=lambda value: abs(
+                        value - stamp))
+                    if abs(nearest - stamp) <= ARUCO_SYNC_TOLERANCE_NS:
+                        synchronized_pairs.add((stamp, nearest))
+            duplicate_count = (
+                len(yolo_stamps) - len(set(yolo_stamps))
+                + len(aruco_stamps) - len(set(aruco_stamps)))
+            freshness_rejections = sum(
+                current < previous
+                for stamps in (yolo_stamps, aruco_stamps)
+                for previous, current in zip(stamps, stamps[1:]))
+            return {
+                "state": self.state,
+                "yolo_stamp_ns": yolo_stamp,
+                "aruco_stamp_ns": aruco_stamp,
+                "target_kind_detection_count": target_kind_detections,
+                "aruco_detection_count": aruco_detections,
+                "pair_delta_ns": pair_delta_ns,
+                "fresh_synchronized_pair_count": len(synchronized_pairs),
+                "duplicate_count": duplicate_count,
+                "freshness_rejection_count": freshness_rejections,
+                "association_pair": self.last_association_pair,
+                "association_candidate_present": (
+                    self.association_candidate_id is not None),
+                "association_confirmation_count": int(
+                    self.association_confirmation_count),
+                "accepted_sample_count": len(self.marker_positions),
+                "marker_spread_m": spread,
+                "localized": self.target_world is not None,
+            }
+
     def odom_cb(self, message: Odometry) -> None:
         position = message.pose.pose.position
         orientation = message.pose.pose.orientation
@@ -909,6 +1025,23 @@ class ShelfPickController(Node):
             orientation.x, orientation.y, orientation.z, orientation.w,
         ]).as_euler("xyz")[2])
         self.last_odom_time = self.now()
+        stamp_ns = self._message_source_stamp_ns(message)
+        if (stamp_ns is not None
+                and self.strict_trace_runtime.sample_records_enabled):
+            self.diagnostic_odom_history.append({
+                "source_stamp_ns": stamp_ns,
+                "base_pose": [float(position.x), float(position.y),
+                              float(self.base_yaw)],
+                "base_pos": [float(position.x), float(position.y),
+                             float(position.z)],
+                "base_quat_wxyz": [float(orientation.w), float(orientation.x),
+                                   float(orientation.y), float(orientation.z)],
+                "base_linear_speed_mps": float(math.hypot(
+                    message.twist.twist.linear.x,
+                    message.twist.twist.linear.y)),
+                "base_yaw_rate_radps": float(message.twist.twist.angular.z),
+                "receipt_monotonic_ns": time.monotonic_ns(),
+            })
 
     def joint_cb(self, message: JointState) -> None:
         self.joints = {
@@ -917,6 +1050,147 @@ class ShelfPickController(Node):
             if index < len(message.position)
         }
         self.last_joint_time = self.now()
+        stamp_ns = self._message_source_stamp_ns(message)
+        if (stamp_ns is not None
+                and self.strict_trace_runtime.sample_records_enabled):
+            velocities = {
+                name: float(message.velocity[index])
+                for index, name in enumerate(message.name)
+                if index < len(message.velocity)
+                and math.isfinite(float(message.velocity[index]))
+            }
+            self.diagnostic_joint_history.append({
+                "source_stamp_ns": stamp_ns,
+                "head_pose": [
+                    float(self.joints.get("slide_joint", 0.0)),
+                    float(self.joints.get("head_yaw_joint", 0.0)),
+                    float(self.joints.get("head_pitch_joint", 0.0)),
+                ],
+                "joints": dict(self.joints),
+                "head_motion_rate": max((abs(velocities.get(name, 0.0))
+                                         for name in (
+                                             "slide_joint", "head_yaw_joint",
+                                             "head_pitch_joint")), default=0.0),
+                "receipt_monotonic_ns": time.monotonic_ns(),
+            })
+
+    @staticmethod
+    def _message_source_stamp_ns(message) -> int | None:
+        try:
+            value = (int(message.header.stamp.sec) * 1_000_000_000
+                     + int(message.header.stamp.nanosec))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return value if value >= 0 else None
+
+    def _diagnostic_camera_world_tmat(self, odom_state, joint_state):
+        if odom_state is None or joint_state is None:
+            return None
+        joints = joint_state["joints"]
+        fk = self.diagnostic_fk
+        fk.set_base_pose(odom_state["base_pos"],
+                         odom_state["base_quat_wxyz"])
+        fk.set_slide_joint(float(joints.get("slide_joint", 0.0)))
+        fk.set_head_joints([
+            float(joints.get("head_yaw_joint", 0.0)),
+            float(joints.get("head_pitch_joint", 0.0)),
+        ])
+        fk.set_left_arm_joints([
+            float(joints.get(f"left_arm_joint{index + 1}", 0.0))
+            for index in range(6)])
+        fk.set_right_arm_joints([
+            float(joints.get(f"right_arm_joint{index + 1}", 0.0))
+            for index in range(6)])
+        position, quat_wxyz = fk.get_head_camera_pose()
+        transform = np.eye(4)
+        transform[:3, 3] = position
+        transform[:3, :3] = Rotation.from_quat(
+            quat_wxyz[[1, 2, 3, 0]]).as_matrix()
+        return transform.tolist()
+
+    def _runtime_camera_world_tmat(self):
+        if not self.diagnostic_odom_history or not self.diagnostic_joint_history:
+            return None
+        return self._diagnostic_camera_world_tmat(
+            self.diagnostic_odom_history[-1],
+            self.diagnostic_joint_history[-1])
+
+    @staticmethod
+    def _marker_runtime_camera_world_tmat(marker: dict):
+        """Recover the exact detector transform without changing its schema."""
+        try:
+            rotation = np.asarray(
+                marker["camera_world_rotation"], dtype=float).reshape(3, 3)
+            camera = np.asarray(
+                marker.get("position_camera", marker["position"]),
+                dtype=float).reshape(3)
+            world = np.asarray(marker["position_world"], dtype=float).reshape(3)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not (np.all(np.isfinite(rotation)) and np.all(np.isfinite(camera))
+                and np.all(np.isfinite(world))):
+            return None
+        transform = np.eye(4)
+        transform[:3, :3] = rotation
+        transform[:3, 3] = world - rotation @ camera
+        return transform.tolist()
+
+    def _strict_trace_emit(self, event: str, **payload) -> None:
+        self.strict_trace_runtime.emit(
+            self.strict_trace_sink, event, **payload)
+
+    def _strict_trace_context_snapshot(self) -> dict:
+        context = dict(self.strict_trace_context)
+        context.update({
+            "run_prefix": getattr(self, "run_prefix", context.get("run_prefix")),
+            "order_id": getattr(self, "order_id", context.get("order_id")),
+            "attempt_id": getattr(self, "attempt_id", context.get("attempt_id")),
+            "candidate_id": ((getattr(self, "candidate_hint", None) or {}).get(
+                "candidate_id", context.get("candidate_id"))),
+            "kind": self.target_kind,
+        })
+        viewpoint = getattr(self, "replay_viewpoint_controller", None)
+        if viewpoint is not None:
+            snapshot = viewpoint.snapshot()
+            context.update({"scan_epoch_id": snapshot.scan_epoch_id,
+                            "pose_id": snapshot.pose_id})
+        return context
+
+    def _strict_trace_prepare_context(self) -> dict:
+        context = self._strict_trace_context_snapshot()
+        identity = (context.get("run_prefix"), context.get("order_id"),
+                    context.get("attempt_id"), context.get("candidate_id"))
+        if identity != self.strict_trace_identity:
+            self.strict_trace_runtime.reset_attempt()
+            self.strict_trace_identity = identity
+        self.strict_trace_context = dict(context)
+        return context
+
+    def strict_trace_reset_attempt(self, context: dict | None = None) -> None:
+        self.strict_trace_runtime.reset_attempt()
+        self.strict_trace_context = dict(context or {})
+
+    def strict_trace_summary(self) -> dict:
+        summary = self.strict_trace_runtime.counters()
+        summary.update({
+            "trace_mode": self.strict_trace_runtime.mode,
+            "pair_count": self.strict_trace_runtime.pair_count,
+            "accepted_sample_count":
+                self.strict_trace_runtime.accepted_sample_count,
+            "final_spread_m": self.strict_trace_runtime.final_spread_m,
+        })
+        if self.strict_trace_runtime.ledger is not None:
+            summary.update(self.strict_trace_runtime.ledger.summary())
+        return summary
+
+    def strict_trace_emit_summary(self, *, first_failure_stage=None,
+                                  final_outcome=None) -> bool:
+        return self.strict_trace_runtime.emit_summary(
+            self.strict_trace_sink,
+            **self._strict_trace_context_snapshot(),
+            first_failure_stage=first_failure_stage,
+            final_outcome=final_outcome,
+            **self.strict_trace_runtime.counters())
 
     def yolo_cb(self, message: String) -> None:
         records = [record for record in decode_list(message)
@@ -945,6 +1219,184 @@ class ShelfPickController(Node):
             self.try_association_locked()
             self.try_recheck_locked()
 
+    def _strict_trace_record_pair(self, *, yolo_stamp, aruco_stamp,
+                                  detections, best_pair,
+                                  best_decision) -> None:
+        """Build a heavy pair record only in explicit full mode."""
+        trace_context = self._strict_trace_prepare_context()
+        self.strict_trace_runtime.observe_pair()
+        pair_record = {
+            **trace_context,
+            "yolo_source_stamp_ns": int(yolo_stamp),
+            "aruco_source_stamp_ns": int(aruco_stamp),
+            "pair_delta_ns": abs(int(aruco_stamp) - int(yolo_stamp)),
+            "receipt_monotonic_ns": time.monotonic_ns(),
+            "association_boolean_result": best_pair is not None,
+            "association_rejection_reason": (
+                "accepted" if best_pair is not None else
+                ("invalid_diagnostic_input" if best_decision is None else
+                 best_decision.diagnostic_reason)),
+        }
+        if detections:
+            target = max(detections,
+                         key=lambda item: float(item.get("conf", 0.0)))
+            bbox = target.get("bbox_xyxy")
+            try:
+                x0, y0, x1, y1 = map(float, bbox)
+                pair_record.update({
+                    "target_bbox_xyxy": [x0, y0, x1, y1],
+                    "target_bbox_center": [(x0 + x1) * 0.5,
+                                           (y0 + y1) * 0.5],
+                    "target_bbox_bottom_center": [(x0 + x1) * 0.5, y1],
+                    "target_confidence": float(target.get("conf", 0.0)),
+                })
+            except (TypeError, ValueError):
+                pass
+        if best_pair is not None:
+            target, selected = best_pair
+            pair_record.update(marker_geometry(selected.get("corners")))
+            pair_record["marker_id"] = int(selected["id"])
+            try:
+                x0, y0, x1, y1 = map(float, target["bbox_xyxy"])
+                mx, my = map(float, selected["pixel_center"])
+                pair_record.update({
+                    "association_horizontal_offset_px": mx - (x0 + x1) * 0.5,
+                    "association_vertical_offset_px": my - (y0 + y1) * 0.5,
+                    "association_bottom_distance_px": math.hypot(
+                        mx - (x0 + x1) * 0.5, my - y1),
+                })
+            except (KeyError, TypeError, ValueError):
+                pass
+        try:
+            pair_event = self.strict_trace_runtime.append_pair(pair_record)
+            self._strict_trace_emit("strict_localization_pair", **pair_event)
+        except ValueError:
+            pass
+
+    def _strict_trace_record_sample(
+            self, *, detection, marker, marker_id, marker_world,
+            yolo_stamp, aruco_stamp) -> None:
+        """Build FK/counterfactual sample evidence only in full mode."""
+        trace_context = self._strict_trace_prepare_context()
+        source_odom = latest_not_after(
+            self.diagnostic_odom_history, aruco_stamp,
+            max_delta_ns=500_000_000)
+        source_joint = latest_not_after(
+            self.diagnostic_joint_history, aruco_stamp,
+            max_delta_ns=500_000_000)
+        source_odom_state, odom_delta = (
+            (None, None) if source_odom is None else source_odom)
+        source_joint_state, joint_delta = (
+            (None, None) if source_joint is None else source_joint)
+        runtime_odom = (None if not self.diagnostic_odom_history
+                        else self.diagnostic_odom_history[-1])
+        runtime_joint = (None if not self.diagnostic_joint_history
+                         else self.diagnostic_joint_history[-1])
+        geometry = marker_geometry(marker.get("corners"))
+        raw_quaternion = marker.get("quaternion_xyzw")
+        raw_rvec = None
+        try:
+            quaternion = np.asarray(raw_quaternion, dtype=float).reshape(4)
+            if np.all(np.isfinite(quaternion)):
+                raw_rvec = Rotation.from_quat(quaternion).as_rotvec().tolist()
+        except (TypeError, ValueError):
+            pass
+        viewpoint = getattr(self, "replay_viewpoint_controller", None)
+        viewpoint_snapshot = None if viewpoint is None else viewpoint.snapshot()
+        base_target_error = base_yaw_target_error = None
+        head_errors = [None, None, None]
+        hint = getattr(self, "candidate_hint", None) or {}
+        target_base = hint.get("observed_base_pose")
+        if (runtime_odom is not None and isinstance(target_base, (list, tuple))
+                and len(target_base) == 3):
+            base_target_error = math.hypot(
+                runtime_odom["base_pose"][0] - float(target_base[0]),
+                runtime_odom["base_pose"][1] - float(target_base[1]))
+            base_yaw_target_error = abs(wrap_to_pi(
+                runtime_odom["base_pose"][2] - float(target_base[2])))
+        current_pose_getter = getattr(self, "current_scan_camera_pose", None)
+        if runtime_joint is not None and current_pose_getter is not None:
+            target_head = current_pose_getter()
+            head_errors = [abs(runtime_joint["head_pose"][index]
+                               - float(target_head[index + 1]))
+                           for index in range(3)]
+        sample_record = {
+            **trace_context,
+            **geometry,
+            "sample_index": len(self.marker_positions),
+            "accepted": True,
+            "duplicate": False,
+            "rejection_reason": None,
+            "marker_id": marker_id,
+            "yolo_source_stamp_ns": int(yolo_stamp),
+            "aruco_source_stamp_ns": int(aruco_stamp),
+            "receipt_monotonic_ns": time.monotonic_ns(),
+            "position_source": marker.get("position_source"),
+            "raw_marker_camera_xyz_m": marker.get(
+                "position_camera", marker.get("position")),
+            "raw_marker_rvec": raw_rvec,
+            "raw_marker_tvec": marker.get(
+                "position_camera", marker.get("position")),
+            "base_pose_used_for_transform": (
+                None if runtime_odom is None else runtime_odom["base_pose"]),
+            "head_pose_used_for_transform": (
+                None if runtime_joint is None else runtime_joint["head_pose"]),
+            "joint_state_stamp_ns": (
+                None if runtime_joint is None else
+                runtime_joint["source_stamp_ns"]),
+            "odom_source_stamp_ns": (
+                None if runtime_odom is None else runtime_odom["source_stamp_ns"]),
+            "base_pose_at_receipt": (
+                None if runtime_odom is None else runtime_odom["base_pose"]),
+            "head_pose_at_receipt": (
+                None if runtime_joint is None else runtime_joint["head_pose"]),
+            "marker_world_xyz_m": marker_world.tolist(),
+            "base_target_error_m": base_target_error,
+            "base_yaw_target_error_rad": base_yaw_target_error,
+            "head_slide_error_m": head_errors[0],
+            "head_yaw_error_rad": head_errors[1],
+            "head_pitch_error_rad": head_errors[2],
+            "nearest_odom_stamp_delta_ns": odom_delta,
+            "nearest_joint_stamp_delta_ns": joint_delta,
+            "base_linear_speed_mps": (
+                0.0 if runtime_odom is None else
+                runtime_odom["base_linear_speed_mps"]),
+            "base_yaw_rate_radps": (
+                0.0 if runtime_odom is None else
+                runtime_odom["base_yaw_rate_radps"]),
+            "head_motion_rate": (
+                0.0 if runtime_joint is None else
+                runtime_joint["head_motion_rate"]),
+            "camera_settled": (
+                True if viewpoint_snapshot is None else
+                viewpoint_snapshot.camera_settled_after_target_reached),
+            "stability_gate_passed": (
+                True if viewpoint_snapshot is None else
+                viewpoint_snapshot.strict_scan_allowed),
+            "_base_yaw_scalar": (
+                0.0 if runtime_odom is None else runtime_odom["base_pose"][2]),
+            "_head_slide_scalar": (
+                0.0 if runtime_joint is None else runtime_joint["head_pose"][0]),
+            "_head_yaw_scalar": (
+                0.0 if runtime_joint is None else runtime_joint["head_pose"][1]),
+            "_head_pitch_scalar": (
+                0.0 if runtime_joint is None else runtime_joint["head_pose"][2]),
+            "_runtime_camera_world_tmat": (
+                self._marker_runtime_camera_world_tmat(marker)),
+            "_source_time_camera_world_tmat": self._diagnostic_camera_world_tmat(
+                source_odom_state, source_joint_state),
+        }
+        try:
+            sample_event, decomposition = (
+                self.strict_trace_runtime.append_sample(sample_record))
+            self._strict_trace_emit(
+                "strict_localization_sample", **sample_event)
+            self._strict_trace_emit(
+                "strict_localization_variance", **self.strict_trace_context,
+                **decomposition)
+        except ValueError:
+            pass
+
     def try_association_locked(self) -> None:
         if self.state != STATE_SCAN or self.now() - self.state_t0 < SCAN_SETTLE_S:
             return
@@ -962,13 +1414,28 @@ class ShelfPickController(Node):
         self.last_association_pair = association_pair
 
         best_pair = None
+        best_decision = None
         for detection in sorted(
                 detections, key=lambda item: float(item.get("conf", 0.0)),
                 reverse=True):
-            marker = marker_below_yolo(detection, markers)
-            if marker is not None:
+            try:
+                decision = association_decision(detection, markers)
+            except ValueError:
+                decision = None
+            if decision is not None and decision.accepted:
+                marker = markers[decision.marker_index]
                 best_pair = (detection, marker)
+                best_decision = decision
                 break
+            if best_decision is None:
+                best_decision = decision
+        if self.strict_trace_runtime.pair_records_enabled:
+            self._strict_trace_record_pair(
+                yolo_stamp=yolo_stamp, aruco_stamp=aruco_stamp,
+                detections=detections, best_pair=best_pair,
+                best_decision=best_decision)
+        else:
+            self.strict_trace_runtime.observe_pair()
         if best_pair is None:
             return
 
@@ -978,8 +1445,8 @@ class ShelfPickController(Node):
             return
         if marker_id in self.recheck_marker_skips:
             return
-        if (self.preferred_marker_id is not None
-                and marker_id != self.preferred_marker_id):
+        if (self.required_exact_marker_id is not None
+                and marker_id != self.required_exact_marker_id):
             return
         marker_world = np.asarray(marker["position_world"], dtype=float)
         if marker_id in self.skipped_tissue_markers:
@@ -1048,6 +1515,16 @@ class ShelfPickController(Node):
         if marker_id != self.target_marker_id:
             return
         self.marker_positions.append(marker_world)
+        if self.strict_trace_runtime.mode != "off":
+            samples = np.asarray(self.marker_positions, dtype=float)
+            self.strict_trace_runtime.observe_sample(
+                accepted=True,
+                spread_m=float(np.max(np.ptp(samples, axis=0))))
+        if self.strict_trace_runtime.sample_records_enabled:
+            self._strict_trace_record_sample(
+                detection=detection, marker=marker, marker_id=marker_id,
+                marker_world=marker_world, yolo_stamp=yolo_stamp,
+                aruco_stamp=aruco_stamp)
         depth_world = None
         try:
             candidate = np.asarray(detection.get("world"), dtype=float)
@@ -3540,7 +4017,7 @@ class ShelfPickController(Node):
                 self.current_scan_camera_pose())
             self.des_slide = slide_target
             self.des_head[:] = [yaw_target, pitch_target]
-            if self.now() - self.state_t0 > SCAN_DWELL_S:
+            if self.now() - self.state_t0 > self.scan_dwell_s:
                 self.scan_pose_index += 1
                 self.scan_camera_ready_since = None
                 if self.scan_pose_index >= len(self.scan_poses):
