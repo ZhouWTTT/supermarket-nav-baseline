@@ -49,6 +49,19 @@ class FakeDepthImage:
         self.data = array.tobytes()
 
 
+class StraightPathPlanner:
+    """Fast controller-test double; A* behavior is tested separately."""
+
+    def __init__(self):
+        self.failure_reason = None
+        self.plan_count = 0
+
+    def plan(self, start_x, start_y, goal_x, goal_y):
+        self.plan_count += 1
+        self.failure_reason = None
+        return [(start_x, start_y), (goal_x, goal_y)]
+
+
 def add_fixed_xml_obstacles(costmap):
     """Add the five default XML boxes in world coordinates."""
     boxes = [
@@ -252,6 +265,89 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(reached)
         self.assertEqual(v, 0.0)
         self.assertNotEqual(w, 0.0)
+
+    def test_empty_heading_alignment_behavior_is_unchanged(self):
+        self.controller.planner = StraightPathPlanner()
+        self.assertFalse(self.controller.carrying)
+        self.assertEqual(self.controller._angular_limit(), 2.5)
+        self.controller.set_goal(-1.0, 2.0, 0.0)
+        scan = FakeScan([float("inf")] * 360)
+        v, w, reached = self.controller.compute_velocity(
+            -1.0, 0.0, -math.pi / 2.0, scan, time_now=1.0)
+        self.assertFalse(reached)
+        self.assertEqual(v, 0.0)
+        self.assertNotEqual(w, 0.0)
+        self.assertEqual(self.controller.stop_reason, "heading_alignment")
+        self.assertIsNone(
+            self.controller._carrying_heading_alignment_since)
+
+    def test_carrying_heading_stall_replans_retargets_and_creeps(self):
+        self.controller.planner = StraightPathPlanner()
+        self.controller.set_carrying(True)
+        self.controller.set_goal(-1.0, 2.0, 0.0)
+        scan = FakeScan([float("inf")] * 360)
+
+        v, _, _ = self.controller.compute_velocity(
+            -1.0, 0.0, -math.pi / 2.0, scan, time_now=1.0)
+        self.assertEqual(v, 0.0)
+        plans_before = self.controller.planner.plan_count
+
+        v, w, reached = self.controller.compute_velocity(
+            -1.0, 0.0, -math.pi / 2.0, scan, time_now=4.01)
+        self.assertFalse(reached)
+        self.assertGreater(v, 0.0)
+        self.assertLessEqual(abs(w), 1.0)
+        self.assertEqual(self.controller.stop_reason, "heading_recovery")
+        self.assertGreater(self.controller.planner.plan_count, plans_before)
+        self.assertIsNotNone(
+            self.controller._carrying_heading_recovery_target)
+        self.assertEqual(self.controller._carrying_heading_recoveries, 1)
+
+    def test_carrying_angular_limit_applies_outside_recovery_too(self):
+        self.controller.planner = StraightPathPlanner()
+        self.controller.set_carrying(True)
+        self.controller.set_goal(-1.0, 2.0, 0.0)
+        scan = FakeScan([float("inf")] * 360)
+        w = 0.0
+        for tick in range(20):
+            _, w, _ = self.controller.compute_velocity(
+                -1.0, 0.0, -math.pi / 2.0, scan,
+                time_now=1.0 + tick * 0.02)
+        self.assertLessEqual(abs(w), 1.0)
+
+    def test_carrying_heading_recovery_times_out_stopped(self):
+        self.controller.planner = StraightPathPlanner()
+        self.controller.set_carrying(True)
+        self.controller.set_goal(-1.0, 2.0, 0.0)
+        scan = FakeScan([float("inf")] * 360)
+        self.controller.compute_velocity(
+            -1.0, 0.0, -math.pi / 2.0, scan, time_now=1.0)
+        self.controller.compute_velocity(
+            -1.0, 0.0, -math.pi / 2.0, scan, time_now=4.01)
+        v, w, reached = self.controller.compute_velocity(
+            -1.0, 0.0, -math.pi / 2.0, scan, time_now=10.02)
+        self.assertEqual((v, w, reached), (0.0, 0.0, False))
+        self.assertEqual(
+            self.controller.stop_reason, "heading_recovery_timeout")
+        self.assertEqual(
+            self.controller._carrying_heading_recovery_timeouts, 1)
+
+    def test_carrying_recovery_keeps_lidar_stop_while_retargeting(self):
+        self.controller.planner = StraightPathPlanner()
+        self.controller.set_carrying(True)
+        self.controller.set_goal(-1.0, 2.0, 0.0)
+        ranges = [float("inf")] * 360
+        ranges[180] = 0.31
+        scan = FakeScan(ranges)
+        self.controller.compute_velocity(
+            -1.0, 0.0, -math.pi / 2.0, scan, time_now=1.0)
+        v, w, reached = self.controller.compute_velocity(
+            -1.0, 0.0, -math.pi / 2.0, scan, time_now=4.01)
+        self.assertFalse(reached)
+        self.assertEqual(v, 0.0)
+        self.assertLessEqual(abs(w), 1.0)
+        self.assertEqual(self.controller.stop_reason, "heading_recovery")
+        self.assertEqual(self.controller._carrying_heading_recoveries, 1)
 
     def test_close_obstacle_bypasses_velocity_ramp_and_stops(self):
         self.controller.set_goal(-1.0, 2.0, math.pi / 2.0)
