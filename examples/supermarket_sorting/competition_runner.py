@@ -21,7 +21,7 @@ import time
 
 import rclpy
 from geometry_msgs.msg import Twist
-from rclpy.executors import ExternalShutdownException
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
@@ -30,9 +30,9 @@ from competition_task import (
     CompetitionTask,
     GRASP_COST,
     TaskMessageError,
-    associate_detection_marker,
     marker_arguments,
 )
+from memory_matrix import MemoryMatrixTracker, select_memory_hint
 
 
 HERE = Path(__file__).resolve().parent
@@ -77,12 +77,10 @@ class CompetitionRunner(Node):
         self.worker_terminate_at: float | None = None
         self.spawned_workers = 0
         self.finished = False
-        self.latest_yolo: tuple[int, list[dict]] | None = None
-        self.latest_aruco: tuple[int, list[dict]] | None = None
-        self.last_inventory_pair: tuple[int, int] | None = None
-        self.last_inventory_yolo_stamp: int | None = None
-        self.inventory: dict[int, dict] = {}
-        self.selected_inventory_entry: dict | None = None
+        self.selected_memory_hint: dict | None = None
+        self.failed_memory_slots: dict[str, set[str]] = {}
+        self.memory_path = Path(self.args.runtime_dir) / (
+            f"memory_matrix_waiting_{os.getpid()}.json")
         self.order_first_started: dict[str, tuple[float, str]] = {}
         self.order_active_elapsed_s: dict[str, float] = {}
         self.order_timings: dict[str, dict] = {}
@@ -95,14 +93,13 @@ class CompetitionRunner(Node):
         )
         self.create_subscription(
             String, "/supermarket_sorting/task", self._task_cb, qos)
-        self.create_subscription(
-            String, "/goods/yolo_detections", self._yolo_cb, 10)
-        self.create_subscription(
-            String, "/aruco/head/detections", self._aruco_cb, 10)
         self.stop_publisher = self.create_publisher(Twist, "/cmd_vel", 10)
         self.perception_control_publisher = self.create_publisher(
             Bool, "/supermarket_sorting/perception_enable", 10)
         self.create_timer(0.20, self._tick)
+        self.memory_tracker = MemoryMatrixTracker(
+            confirmations=self.args.memory_confirmations,
+            output_path=self.memory_path)
         self.get_logger().info(
             "competition runner ready; waiting for transient task on "
             "/supermarket_sorting/task")
@@ -130,17 +127,18 @@ class CompetitionRunner(Node):
         self.task_started_at = time.monotonic()
         self.spawned_workers = 0
         self.finished = False
-        self.inventory.clear()
-        self.selected_inventory_entry = None
+        run_dir = (
+            Path(self.args.runtime_dir)
+            / safe_component(incoming.run_prefix))
+        self.memory_path = run_dir / "memory_matrix.json"
+        self.memory_tracker.start_run(self.memory_path)
+        self.selected_memory_hint = None
+        self.failed_memory_slots.clear()
         self.worker_candidate_kinds.clear()
         self.order_first_started.clear()
         self.order_active_elapsed_s.clear()
         self.order_timings.clear()
         self.attempt_timings.clear()
-        self.latest_yolo = None
-        self.latest_aruco = None
-        self.last_inventory_pair = None
-        self.last_inventory_yolo_stamp = None
         self.get_logger().info(
             f"accepted task run={incoming.run_prefix} "
             f"count={len(incoming.orders)} kinds="
@@ -250,14 +248,25 @@ class CompetitionRunner(Node):
             for marker_id in self.task.excluded_markers(kind)
         })
         command.extend(marker_arguments(excluded_markers))
+        excluded_slots = sorted({
+            slot_key
+            for kind in candidate_kinds
+            for slot_key in self.failed_memory_slots.get(kind, set())
+        })
+        for slot_key in excluded_slots:
+            command.extend(["--exclude-slot-key", slot_key])
+        command.extend([
+            "--memory-file", str(self.memory_path),
+            "--memory-confidence-threshold",
+            str(self.args.memory_confidence_threshold),
+        ])
         scan_hint_x = None
         scan_marker_z = None
-        if self.selected_inventory_entry is not None:
+        if self.selected_memory_hint is not None:
             try:
-                position_world = self.selected_inventory_entry["position_world"]
-                scan_hint_x = float(position_world[0])
-                scan_marker_z = float(position_world[2])
-            except (KeyError, TypeError, ValueError, IndexError):
+                scan_hint_x = float(self.selected_memory_hint["x"])
+                scan_marker_z = float(self.selected_memory_hint["z"])
+            except (KeyError, TypeError, ValueError):
                 scan_hint_x = None
                 scan_marker_z = None
         if scan_hint_x is not None:
@@ -288,7 +297,8 @@ class CompetitionRunner(Node):
             f"scan_marker_z={scan_marker_z} "
             f"persistent_perception={int(external_perception)} "
             f"single_item_candidates={candidate_kinds} "
-            f"excluded_markers={excluded_markers}")
+            f"excluded_markers={excluded_markers} "
+            f"excluded_slots={excluded_slots}")
         try:
             self.worker = subprocess.Popen(
                 command,
@@ -500,6 +510,11 @@ class CompetitionRunner(Node):
         marker_id = result.get("marker_id")
         if not isinstance(marker_id, int):
             marker_id = None
+        result_slot = result.get("slot")
+        if (not isinstance(result_slot, list)
+                or len(result_slot) != 3
+                or not all(isinstance(value, str) for value in result_slot)):
+            result_slot = None
         if not reported_kind_valid:
             # A malformed or out-of-scope result must not blacklist a marker
             # under the dispatch order's (possibly different) product class.
@@ -527,11 +542,22 @@ class CompetitionRunner(Node):
                 error=None if delivered else str(error),
                 max_attempts=self.args.max_attempts,
             )
+            if result_slot is not None:
+                shelf, level, column = result_slot
+                if delivered:
+                    # The worker normally publishes this immediately after
+                    # shelf exit.  Repeat it here as an idempotent fallback.
+                    self.memory_tracker.consume_slot(
+                        shelf, level, column, kind=order.kind)
+                else:
+                    self.failed_memory_slots.setdefault(
+                        order.kind, set()).add(
+                            f"{level}|{shelf}|{column}")
             self._ensure_order_timing_started(order)
             self._record_order_timing(order, result)
             summary = (
                 f"order id={order.id} kind={order.kind} "
-                f"status={order.status} marker={marker_id} "
+                f"status={order.status} marker={marker_id} slot={result_slot} "
                 f"attempts={order.attempts}")
             # 注意: rclpy 按"调用点"缓存日志严重级别, 同一行不能在不同调用间
             # 切换 info/error, 否则抛 "Logger severity cannot be changed"。
@@ -616,9 +642,8 @@ class CompetitionRunner(Node):
             return
         document = self.task.summary()
         document["reason"] = reason
-        document["inventory"] = [
-            dict(entry) for _, entry in sorted(self.inventory.items())
-        ]
+        document["memory_matrix"] = self.memory_tracker.matrix.to_json()
+        document["memory_matrix_file"] = str(self.memory_path)
         document["order_timings"] = [
             dict(record) for record in self.order_timings.values()
         ]
@@ -668,91 +693,9 @@ class CompetitionRunner(Node):
         except Exception:  # noqa: BLE001 - ROS context may already be closed
             pass
 
-    @staticmethod
-    def _decode_records(message: String) -> list[dict]:
-        try:
-            value = json.loads(message.data)
-        except (json.JSONDecodeError, TypeError):
-            return []
-        return [item for item in value if isinstance(item, dict)] \
-            if isinstance(value, list) else []
-
-    def _yolo_cb(self, message: String) -> None:
-        records = [item for item in self._decode_records(message)
-                   if item.get("camera", "head") == "head"]
-        if not records:
-            return
-        try:
-            stamp = int(records[0]["stamp_ns"])
-        except (KeyError, TypeError, ValueError):
-            return
-        self.latest_yolo = (stamp, records)
-        self._update_inventory()
-
-    def _aruco_cb(self, message: String) -> None:
-        records = [item for item in self._decode_records(message)
-                   if item.get("camera", "head") == "head"]
-        if not records:
-            return
-        try:
-            stamp = int(records[0]["stamp_ns"])
-        except (KeyError, TypeError, ValueError):
-            return
-        self.latest_aruco = (stamp, records)
-        self._update_inventory()
-
-    def _update_inventory(self) -> None:
-        if self.task is None or self.latest_yolo is None or self.latest_aruco is None:
-            return
-        yolo_stamp, detections = self.latest_yolo
-        aruco_stamp, markers = self.latest_aruco
-        if abs(yolo_stamp - aruco_stamp) > 200_000_000:
-            return
-        pair = (yolo_stamp, aruco_stamp)
-        if (pair == self.last_inventory_pair
-                or yolo_stamp == self.last_inventory_yolo_stamp):
-            return
-        self.last_inventory_pair = pair
-        self.last_inventory_yolo_stamp = yolo_stamp
-        wanted = {order.kind for order in self.task.orders
-                  if order.status == "pending"}
-        for detection in detections:
-            kind = detection.get("class")
-            if kind not in wanted:
-                continue
-            marker = associate_detection_marker(detection, markers)
-            if marker is None:
-                continue
-            marker_id = int(marker["id"])
-            previous = self.inventory.get(marker_id)
-            confirmations = (
-                int(previous["confirmations"]) + 1
-                if previous is not None and previous.get("kind") == kind
-                else 1)
-            try:
-                confidence = float(detection.get("conf", 0.0))
-            except (TypeError, ValueError):
-                confidence = 0.0
-            entry = {
-                "marker_id": marker_id,
-                "kind": kind,
-                "position_world": marker.get("position_world"),
-                "confidence": round(max(
-                    confidence,
-                    float(previous.get("confidence", 0.0))
-                    if previous is not None else 0.0), 4),
-                "confirmations": min(confirmations, 1000),
-                "stamp_ns": yolo_stamp,
-            }
-            self.inventory[marker_id] = entry
-            if confirmations == self.args.inventory_confirmations:
-                self.get_logger().info(
-                    f"inventory confirmed marker={marker_id} "
-                    f"kind={kind} confidence={entry['confidence']:.3f}")
-
     def _select_order(self):
         assert self.task is not None
-        self.selected_inventory_entry = None
+        self.selected_memory_hint = None
         candidates = [
             order for order in self.task.orders
             if order.status == "pending"
@@ -761,45 +704,27 @@ class CompetitionRunner(Node):
         if not candidates:
             return None
 
-        def inventory_for(order):
-            excluded = set(self.task.excluded_markers(order.kind))
-            entries = [
-                entry for marker_id, entry in self.inventory.items()
-                if marker_id not in excluded
-                and entry.get("kind") == order.kind
-                and entry.get("confirmations", 0)
-                >= self.args.inventory_confirmations
-            ]
-            if not entries:
-                return None
-
-            def delivery_distance(entry):
-                try:
-                    x, y = map(float, entry["position_world"][:2])
-                    return ((x + 1.94) ** 2 + (y + 3.41) ** 2) ** 0.5
-                except (KeyError, TypeError, ValueError):
-                    return float("inf")
-
-            return min(entries, key=lambda item: (
-                delivery_distance(item), -float(item.get("confidence", 0.0))))
-
         ranked = []
         for order in candidates:
-            entry = inventory_for(order)
-            distance = float("inf")
-            if entry is not None:
-                try:
-                    x, y = map(float, entry["position_world"][:2])
-                    distance = ((x + 1.94) ** 2 + (y + 3.41) ** 2) ** 0.5
-                except (KeyError, TypeError, ValueError):
-                    pass
+            memory_candidates, observer_xy = (
+                self.memory_tracker.routing_snapshot(order.kind))
+            hint = select_memory_hint(
+                memory_candidates,
+                observer_xy,
+                self.args.memory_confidence_threshold,
+                exclude_slots=self.failed_memory_slots.get(
+                    order.kind, set()),
+                reliable_only=True)
+            travel = (
+                float("inf") if hint is None
+                else float(hint.get("travel", float("inf"))))
             ranked.append((
-                (order.attempts, entry is None, distance,
+                (order.attempts, hint is None, travel,
                  GRASP_COST.get(order.kind, 10.0), order.source_index),
-                order, entry))
-        _, order, entry = min(ranked, key=lambda item: item[0])
-        self.selected_inventory_entry = (
-            None if entry is None else dict(entry))
+                order, hint))
+        _, order, hint = min(ranked, key=lambda item: item[0])
+        self.selected_memory_hint = (
+            None if hint is None else dict(hint))
         return order
 
     def stop(self) -> None:
@@ -842,7 +767,14 @@ def parse_args() -> argparse.Namespace:
         help="maximum YOLO source-frame rate during active scan states")
     parser.add_argument("--max-scan-cycles", type=int, default=2)
     parser.add_argument("--max-attempts", type=int, default=2)
-    parser.add_argument("--inventory-confirmations", type=int, default=3)
+    parser.add_argument(
+        "--memory-confirmations", "--inventory-confirmations",
+        dest="memory_confirmations", type=int, default=3,
+        help="YOLO frames required by the memory matrix; the inventory name "
+             "is retained as a compatibility alias")
+    parser.add_argument(
+        "--memory-confidence-threshold", type=float, default=0.90,
+        help="minimum confidence for normal memory-directed shelf routing")
     parser.add_argument(
         "--order-timeout", type=float, default=0.0,
         help="per-order timeout in seconds; 0 disables it")
@@ -864,10 +796,12 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"weights not found: {args.weights}")
     if not 0.0 <= args.confidence <= 1.0:
         parser.error("--confidence must be in [0, 1]")
+    if not 0.0 <= args.memory_confidence_threshold <= 1.0:
+        parser.error("--memory-confidence-threshold must be in [0, 1]")
     if not 0.0 < args.inference_hz < float("inf"):
         parser.error("--inference-hz must be finite and positive")
     if (args.max_scan_cycles < 1 or args.max_attempts < 1
-            or args.inventory_confirmations < 1):
+            or args.memory_confirmations < 1):
         parser.error("scan cycles, attempts, and confirmations must be >= 1")
     if args.order_timeout < 0.0:
         parser.error("--order-timeout must be >= 0")
@@ -884,18 +818,27 @@ def main() -> None:
     args = parse_args()
     rclpy.init()
     node = CompetitionRunner(args)
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
+    executor.add_node(node.memory_tracker)
     try:
         # Do not call rclpy.shutdown() from a timer callback.  In the official
         # Humble image that can wait on the callback currently executing and
         # leave both the runner and its persistent perception child alive
         # after all orders are terminal.  Let the callback set ``finished``;
-        # the main thread then leaves spin_once and performs orderly cleanup.
+        # the main thread then leaves the executor and performs orderly cleanup.
+        # The runner and matrix tracker retain their default mutually-exclusive
+        # callback groups, so each node stays internally serial while the two
+        # independent nodes can service callbacks concurrently.
         while rclpy.ok() and not node.finished:
-            rclpy.spin_once(node, timeout_sec=0.20)
+            executor.spin_once(timeout_sec=0.05)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        executor.shutdown()
         node.stop()
+        node.memory_tracker.tick_write()
+        node.memory_tracker.destroy_node()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

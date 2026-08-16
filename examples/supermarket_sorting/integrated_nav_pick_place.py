@@ -9,7 +9,7 @@ Attempted end-to-end flow:
 
     start
       -> navigator drives to the shelf scan stations (GO_SCAN transit)
-      -> YOLO + ArUco visual localisation (unchanged parent states)
+      -> YOLO depth + optional ArUco visual localisation
       -> grasp the requested goods (unchanged parent states)
       -> navigator drives through the obstacle corridor to the delivery table
       -> arm extends, lowers the held product near the table, releases, retreats
@@ -42,9 +42,20 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import yolo_aruco_shelf_pick as pick  # noqa: E402  (parent pipeline, unmodified)
+from memory_matrix import (  # noqa: E402
+    LEVEL_MARKER_Z,
+    MEMORY_CONSUME_TOPIC,
+    MEMORY_REROUTE_SAVING_M,
+    STATION_Y_MAX,
+    STATION_Y_MIN,
+    primary_candidates_from_document,
+    read_memory_document,
+    select_memory_hint,
+    shelf_for_scan_x,
+)
 
 from sensor_msgs.msg import LaserScan  # noqa: E402
-from std_msgs.msg import Bool  # noqa: E402
+from std_msgs.msg import Bool, String  # noqa: E402
 from supermarket_navigation import (  # noqa: E402  (baseline nav, unmodified)
     DELIVERY_APPROACH,
     DELIVERY_TABLE_COSTMAP_BOUNDS,
@@ -152,8 +163,12 @@ PLACE_RELEASE_HEIGHT_LOWER_TOLERANCE_M = 0.010
 PLACE_RELEASE_HEIGHT_UPPER_TOLERANCE_M = 0.035
 PLACE_DESCENT_SLIDE_STEP_M = 0.0030
 PLACE_CLEAR_TABLE_MARGIN_M = 0.060
-PLACE_CLEAR_TABLE_SPEED_MPS = 0.30
+PLACE_CLEAR_TABLE_SPEED_MPS = 0.60
 PLACE_CLEAR_TABLE_TIMEOUT_S = 15.0
+# Keep the released arm pose while the product is still beside the robot.
+# Retraction starts only after half of the required table-clearance progress,
+# leaving the second half of the reverse motion for whole-body recovery.
+PLACE_RETREAT_RECOVERY_START_FRACTION = 0.50
 # Keep the fast, obstacle-aware navigator active until its 0.10 m coarse
 # tolerance.  The parent controller is retained only for the final few
 # centimetres needed by perception/manipulation alignment.  The old 0.35 m
@@ -186,7 +201,7 @@ SPHERE_TRANSPORT_GRIP_COMMAND = 0.06
 # low-speed hand-off.  The physical chassis front remains clear of the table
 # at the nominal endpoint.
 PLACE_CREEP_DISTANCE_M = 0.25
-PLACE_CREEP_SPEED_MPS = 0.25
+PLACE_CREEP_SPEED_MPS = 0.50
 PLACE_CREEP_FRONT_STOP_M = 0.25
 # Preserve the successful longitudinal arm reach measured on the deepest
 # slot, but do not drive the same 0.25 m for outer slots that are substantially
@@ -212,11 +227,13 @@ PLACE_APPROACH_PROGRESS_LOG_S = 2.0
 # unconditional 3 s dwell accumulated once per order without adding safety.
 FLOW_DONE_SETTLE_S = 0.25
 
-# Fixed initial arm posture from ``supermarket_sorting_client.INIT_ARM``.
-# Both arms return here after every release; restoring only the selected arm
-# can preserve a stale pose inherited from an earlier failed order.
+# Fixed initial whole-body manipulation posture.  Both arms and the head return
+# here after every release; restoring only the selected arm or leaving the
+# previous shelf-view pitch can leak a stale pose into the next order.
 PLACE_RETREAT_ARM_L = [0.0, -0.166, 0.032, 0.0, 1.571, 2.223]
 PLACE_RETREAT_ARM_R = [0.0, -0.166, 0.032, 0.0, -1.571, -2.223]
+PLACE_RETREAT_HEAD_YAW_PITCH = [0.0, 0.0]
+PLACE_RETREAT_HEAD_TOLERANCE_RAD = 0.05
 
 
 class IntegratedNavPickPlace(pick.ShelfPickController):
@@ -280,6 +297,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self._scan_cb, 10)
         self.perception_enable_pub = self.create_publisher(
             Bool, "/supermarket_sorting/perception_enable", 10)
+        self.memory_consume_pub = self.create_publisher(
+            String, MEMORY_CONSUME_TOPIC, 10)
         self.manage_external_perception = False
         self.local_perception_nodes = ()
         self._perception_requested = None
@@ -308,6 +327,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._place_arm_target_sent = False
         self._place_descent_sent = False
         self._place_retreat_sent = False
+        self._place_retreat_start_clearance = None
         self._dual_descent_sent = False
         self._dual_place_target_sent = False
         self.dual_release_slide_cmd = None
@@ -326,6 +346,22 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._table_escape_logged = False
         self._laser_warn_log = 0.0
         self._state_warn_log = 0.0
+
+        # Runner-owned matrix routing is optional for standalone workers.  In
+        # formal mode the runner passes one atomic JSON file shared across
+        # process boundaries; this controller only reads it and publishes an
+        # immediate consume event after the product leaves the shelf.
+        self.memory_file = None
+        self.memory_confidence_threshold = 0.90
+        self.memory_active_hint = None
+        self.memory_failed_hint = None
+        self.memory_failed_hint_levels = set()
+        self.memory_exhausted_shelves = set()
+        self.memory_last_scan_station_x = None
+        self.memory_rerouted = False
+        self.memory_reroute_not_before = time.time()
+        self._memory_last_reroute_check = 0.0
+        self._memory_consumed = False
 
         self.get_logger().info(
             "integrated nav+pick+place ready; "
@@ -432,6 +468,140 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._perception_request_last_at = float("-inf")
         self._publish_perception_request(False, force=True)
 
+    def configure_memory_routing(
+            self, path: str | None, confidence_threshold: float,
+            initial_x: float | None = None,
+            initial_z: float | None = None) -> None:
+        """Read runner-owned matrix hints without sharing process state."""
+        self.memory_file = (
+            None if not path else pathlib.Path(path).expanduser().resolve())
+        self.memory_confidence_threshold = float(confidence_threshold)
+        self.memory_reroute_not_before = time.time()
+        if initial_x is not None:
+            shelf = shelf_for_scan_x(initial_x)
+            level = None
+            if initial_z is not None:
+                level = min(
+                    LEVEL_MARKER_Z,
+                    key=lambda name: abs(
+                        LEVEL_MARKER_Z[name] - float(initial_z)))
+            if level is not None:
+                self.memory_active_hint = (shelf, level)
+            self.memory_last_scan_station_x = float(initial_x)
+        self.get_logger().info(
+            f"[memory] routing file={self.memory_file} "
+            f"threshold={self.memory_confidence_threshold:.2f} "
+            f"initial_hint={self.memory_active_hint}")
+
+    def _select_live_memory_hint(
+            self, *, reliable_only: bool,
+            min_last_seen: float | None = None):
+        if self.memory_file is None:
+            return None
+        document = read_memory_document(self.memory_file)
+        candidates = primary_candidates_from_document(
+            document, self.target_kind)
+        return select_memory_hint(
+            candidates, self.base_xy,
+            self.memory_confidence_threshold,
+            exclude_slots=self.excluded_slot_keys,
+            exclude_shelves=self.memory_exhausted_shelves,
+            exclude_shelf_levels=self.memory_failed_hint_levels,
+            min_last_seen=min_last_seen,
+            reliable_only=reliable_only)
+
+    def _apply_memory_hint(self, hint: dict, reason: str) -> None:
+        hint_x = float(hint["x"])
+        hint_z = float(hint["z"])
+        self.configure_inventory_scan_hint(hint_x, hint_z)
+        self.memory_active_hint = (
+            str(hint["shelf"]), str(hint["level"]))
+        self.scan_station_order = None
+        self.scan_index = 0
+        self.scan_pose_index = 0
+        self.scan_camera_ready_since = None
+        self.memory_last_scan_station_x = hint_x
+        self.get_logger().info(
+            f"[memory] {reason} -> {self.memory_active_hint} "
+            f"x={hint_x:.3f} travel={float(hint['travel']):.2f}m "
+            f"observed={float(hint['observed_distance']):.2f}m "
+            f"conf={float(hint['confidence']):.3f}")
+
+    def _update_memory_scan_progress(self) -> None:
+        if self.scan_station_order is None:
+            return
+        current_x = float(self.current_scan_station_x())
+        previous_x = self.memory_last_scan_station_x
+        if previous_x is None:
+            self.memory_last_scan_station_x = current_x
+            return
+        if abs(current_x - float(previous_x)) <= 0.40:
+            return
+        shelf = shelf_for_scan_x(float(previous_x))
+        self.memory_exhausted_shelves.add(shelf)
+        self.memory_last_scan_station_x = current_x
+        self.get_logger().info(
+            f"[memory] shelf {shelf} fully scanned without localisation; "
+            "suppressing dynamic revisit for this order")
+
+    def _memory_route_tick(self) -> None:
+        if self.memory_file is None or self.state != pick.STATE_GO_SCAN:
+            return
+        if self.target_world is not None:
+            return
+
+        if self.memory_failed_hint is not None:
+            failed_hint = self.memory_failed_hint
+            self.memory_failed_hint = None
+            self.memory_failed_hint_levels.add(failed_hint)
+            next_hint = self._select_live_memory_hint(reliable_only=True)
+            if next_hint is not None:
+                self._apply_memory_hint(
+                    next_hint,
+                    f"hint {failed_hint} failed; matrix failover")
+                return
+            self.get_logger().info(
+                f"[memory] hint {failed_hint} failed; no reliable matrix "
+                "candidate remains, resuming fallback scan")
+
+        self._update_memory_scan_progress()
+        now = time.monotonic()
+        if (self.memory_rerouted
+                or now - self._memory_last_reroute_check < 0.25):
+            return
+        self._memory_last_reroute_check = now
+        refreshed = self._select_live_memory_hint(
+            reliable_only=True,
+            min_last_seen=self.memory_reroute_not_before)
+        if refreshed is None:
+            return
+        current_x = (
+            float(self.scan_preferred_x)
+            if self.scan_station_order is None
+            and self.scan_preferred_x is not None
+            else float(self.current_scan_station_x()))
+        current_travel = math.hypot(
+            float(self.base_xy[0]) - current_x,
+            float(self.base_xy[1]) - pick.SCAN_Y)
+        new_travel = float(refreshed["travel"])
+        if (abs(float(refreshed["x"]) - current_x) <= 0.40
+                or new_travel + MEMORY_REROUTE_SAVING_M
+                >= current_travel):
+            return
+        self._apply_memory_hint(
+            refreshed,
+            f"dynamic reroute {current_x:.3f}->{float(refreshed['x']):.3f}")
+        self.memory_rerouted = True
+
+    def _restore_full_scan_after_inventory_hint(self) -> None:
+        """Expose a failed matrix shelf/level to immediate route failover."""
+        was_active = self.inventory_scan_hint_active
+        failed_hint = self.memory_active_hint
+        super()._restore_full_scan_after_inventory_hint()
+        if was_active and failed_hint is not None:
+            self.memory_failed_hint = failed_hint
+            self.memory_active_hint = None
+
     def _publish_perception_request(
             self, enabled: bool, force: bool = False) -> None:
         if (not self.manage_external_perception
@@ -486,9 +656,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         if table_clearance < safe_clearance:
             # This branch is also the fail-safe exit for a new worker that
             # inherits a deployed placement arm from a failed predecessor.
-            # Any commanded retreat from the delivery table must retract both
-            # arms at the same time; reassert the posture on every tick until
-            # the chassis is outside the whole-body keep-out.
+            # Any fail-safe retreat from the delivery table must restore both
+            # arms and the neutral head posture; reassert it on every tick
+            # until the chassis is outside the whole-body keep-out.
             self._command_initial_arm_posture()
             yaw_error = pick.wrap_to_pi(-math.pi / 2.0 - self.base_yaw)
             if abs(yaw_error) <= 0.20:
@@ -505,7 +675,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     "starting inside delivery-table keep-out; "
                     f"clearance={table_clearance:.3f}m "
                     f"required={safe_clearance:.3f}m; reversing north "
-                    "and restoring both arms before normal navigation")
+                    "and restoring the initial manipulation posture before "
+                    "normal navigation")
             return False
         if self._table_escape_logged:
             self._table_escape_logged = False
@@ -599,6 +770,23 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         # The parent reaches DONE only after horizontal withdrawal is complete.
         # Increase holding preload now, then restore during straight backup;
         # rotation waits for verified height feedback.
+        if not self._memory_consumed:
+            slot = self.target_slot()
+            if slot is not None:
+                shelf, level, column = slot
+                event = {
+                    "shelf": shelf,
+                    "level": level,
+                    "column": column,
+                    "kind": self.target_kind,
+                    "marker_id": self.target_marker_id,
+                }
+                self.memory_consume_pub.publish(String(
+                    data=json.dumps(event, ensure_ascii=False)))
+                self._memory_consumed = True
+                self.get_logger().info(
+                    f"[memory] immediate post-grasp consume "
+                    f"kind={self.target_kind} slot={slot}")
         self._capture_transport_grip_command()
         self.des_slide = self._transit_slide_target()
         self.get_logger().info(
@@ -827,12 +1015,58 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self._set_selected_grip(self._transport_grip_command)
 
     def _command_initial_arm_posture(self) -> None:
-        """Open both grippers and return both arms to the fixed initial pose."""
+        """Return the manipulators and camera assembly to the initial pose."""
         self.des_left_arm = np.asarray(PLACE_RETREAT_ARM_L, dtype=float)
         self.des_right_arm = np.asarray(PLACE_RETREAT_ARM_R, dtype=float)
         self.des_left_grip = pick.GRIP_OPEN
         self.des_right_grip = pick.GRIP_OPEN
         self.des_slide = pick.SLIDE_REFERENCE_COMMAND
+        self.des_head = np.asarray(
+            PLACE_RETREAT_HEAD_YAW_PITCH, dtype=float)
+
+    def _initial_head_posture_ready(self) -> bool:
+        """Whether measured head joints have reached the neutral transit pose."""
+        yaw = self.joints.get("head_yaw_joint")
+        pitch = self.joints.get("head_pitch_joint")
+        if yaw is None or pitch is None:
+            return False
+        measured = np.asarray([yaw, pitch], dtype=float)
+        return bool(
+            np.all(np.isfinite(measured))
+            and np.max(np.abs(
+                measured - PLACE_RETREAT_HEAD_YAW_PITCH))
+            <= PLACE_RETREAT_HEAD_TOLERANCE_RAD)
+
+    def _start_place_retreat(self, now: float) -> None:
+        """Begin table retreat without disturbing the release arm pose."""
+        self.place_stage = 4
+        self.place_t0 = now
+        self._place_retreat_sent = False
+        self.commands_ready_since = None
+        self._place_retreat_start_clearance = point_to_rect_clearance(
+            float(self.base_xy[0]), float(self.base_xy[1]),
+            DELIVERY_TABLE_COSTMAP_BOUNDS)
+        required = WHOLE_BODY_KEEP_OUT_RADIUS + PLACE_CLEAR_TABLE_MARGIN_M
+        recovery_start = self._place_retreat_start_clearance + (
+            PLACE_RETREAT_RECOVERY_START_FRACTION
+            * max(0.0, required - self._place_retreat_start_clearance))
+        self.get_logger().info(
+            "[place] gripper released; holding release pose for first half "
+            "of table retreat "
+            f"(clearance={self._place_retreat_start_clearance:.3f}m, "
+            f"arm_recovery_at={recovery_start:.3f}m, "
+            f"required={required:.3f}m)")
+
+    def _start_place_arm_recovery(self, clearance: float) -> None:
+        """Start whole-arm recovery once retreat has passed its midpoint."""
+        if self._place_retreat_sent:
+            return
+        self._place_retreat_sent = True
+        self.commands_ready_since = None
+        self._command_initial_arm_posture()
+        self.get_logger().info(
+            "[place] retreat midpoint reached; restoring both arms and "
+            f"slide during second half (clearance={clearance:.3f}m)")
 
     def _product_release_z(self) -> float:
         """Return TCP height that leaves the product just above the table.
@@ -1192,13 +1426,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         elif self.place_stage == 2:
             self._set_selected_grip(pick.GRIP_OPEN)
             if now - self.place_t0 >= self.place_release_dwell_s:
-                self.get_logger().info(
-                    "[place] gripper released; restoring both arms while "
-                    "backing away from the table")
-                self._command_initial_arm_posture()
-                self.place_stage = 4
-                self.place_t0 = now
-                self._place_retreat_sent = False
+                self._start_place_retreat(now)
 
     def _configure_dual_place_target(self) -> bool:
         """Translate the clamped tissue centre to the assigned slot."""
@@ -1340,20 +1568,33 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self.des_left_grip = pick.GRIP_OPEN
             self.des_right_grip = pick.GRIP_OPEN
             if now - self.place_t0 >= self.place_release_dwell_s:
-                self._command_initial_arm_posture()
-                self.place_stage = 4
-                self.place_t0 = now
+                self._start_place_retreat(now)
 
     def _clear_delivery_table_tick(self, now: float) -> None:
         """Back away after release so the next order can safely turn."""
-        # Keep both arms in the initial posture throughout the base retreat,
-        # independent of which arm performed the grasp.
-        self._command_initial_arm_posture()
-
         clearance = point_to_rect_clearance(
             float(self.base_xy[0]), float(self.base_xy[1]),
             DELIVERY_TABLE_COSTMAP_BOUNDS)
         required = WHOLE_BODY_KEEP_OUT_RADIUS + PLACE_CLEAR_TABLE_MARGIN_M
+        if self._place_retreat_start_clearance is None:
+            self._place_retreat_start_clearance = min(clearance, required)
+        recovery_start = self._place_retreat_start_clearance + (
+            PLACE_RETREAT_RECOVERY_START_FRACTION
+            * max(0.0, required - self._place_retreat_start_clearance))
+
+        if clearance >= recovery_start:
+            self._start_place_arm_recovery(clearance)
+        if self._place_retreat_sent:
+            # Reassert the recovery target every tick, independent of which
+            # arm performed the grasp.  Completion is feedback-gated below.
+            self._command_initial_arm_posture()
+        else:
+            # The arm and slide targets remain exactly at the verified release
+            # pose during the first half.  Only keep both released grippers
+            # explicitly open while the base moves away from the product.
+            self.des_left_grip = pick.GRIP_OPEN
+            self.des_right_grip = pick.GRIP_OPEN
+
         if clearance >= required:
             self.set_twist(0.0, 0.0)
             self.cmd_linear = 0.0
@@ -1361,7 +1602,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             if (now - self.place_t0 < self.place_retreat_dwell_s
                     or not self.dual_commands_ready(
                         arm_tolerance=0.08,
-                        slide_tolerance=0.05)):
+                        slide_tolerance=0.05)
+                    or not self._initial_head_posture_ready()):
                 return
             self._set_flow_phase("done")
             self.place_t0 = now
@@ -1477,10 +1719,15 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self.last_joint_time is None
             or now - self.last_joint_time > NAV_STATE_STALE_S)
         laser_stale = self._laser_stale(now)
+        memory_corridor_transit = (
+            self.memory_file is not None
+            and self.state == pick.STATE_GO_SCAN
+            and STATION_Y_MIN <= float(self.base_xy[1]) <= STATION_Y_MAX)
         stable_perception_state = (
             self.state == pick.STATE_SCAN
             or (self.state in {pick.STATE_REVISIT, pick.STATE_RECHECK}
-                and self.scan_camera_ready_since is not None))
+                and self.scan_camera_ready_since is not None)
+            or memory_corridor_transit)
         perception_needed = (
             not (odom_stale or joints_stale or laser_stale)
             and self.flow_phase == "grab"
@@ -1505,6 +1752,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self.initialize_commands()
 
         if self.flow_phase == "grab":
+            self._memory_route_tick()
             prev_state = self.state
             super().tick()
             if (prev_state != pick.STATE_DONE
@@ -1586,6 +1834,14 @@ def parse_args() -> argparse.Namespace:
         "--exclude-marker-id", action="append", type=int, default=[],
         help="ignore a marker already delivered or failed in this match")
     parser.add_argument(
+        "--exclude-slot-key", action="append", default=[],
+        help="ignore a failed YOLO-only slot formatted as Lx|Shelf|Column")
+    parser.add_argument(
+        "--memory-file",
+        help="runner-owned atomic memory-matrix JSON used for live routing")
+    parser.add_argument(
+        "--memory-confidence-threshold", type=float, default=0.90)
+    parser.add_argument(
         "--formal-mode", action="store_true",
         help="disable all fixed-layout diagnostic shortcuts")
     parser.add_argument(
@@ -1657,6 +1913,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not 0.0 <= args.confidence <= 1.0:
         parser.error("--confidence must be in [0, 1]")
+    if not 0.0 <= args.memory_confidence_threshold <= 1.0:
+        parser.error("--memory-confidence-threshold must be in [0, 1]")
     if not 0.0 < args.max_inference_hz < float("inf"):
         parser.error("--max-inference-hz must be finite and positive")
     if args.max_scan_cycles < 1:
@@ -1679,6 +1937,16 @@ def parse_args() -> argparse.Namespace:
                        if value < 0 or value > 44]
     if invalid_markers:
         parser.error(f"invalid ArUco marker ids: {invalid_markers}")
+    invalid_slots = []
+    for value in args.exclude_slot_key:
+        parts = str(value).split("|")
+        if (len(parts) != 3
+                or parts[0] not in {"L1", "L2", "L3"}
+                or parts[1] not in {"A", "B", "C", "D", "E"}
+                or parts[2] not in {"1", "2", "3"}):
+            invalid_slots.append(value)
+    if invalid_slots:
+        parser.error(f"invalid memory slot keys: {invalid_slots}")
     return args
 
 
@@ -1744,6 +2012,12 @@ def main() -> int:
             controller.configure_inventory_scan_hint(
                 args.scan_start_x, args.scan_marker_z)
         controller.excluded_marker_ids = set(args.exclude_marker_id)
+        controller.excluded_slot_keys = set(args.exclude_slot_key)
+        controller.configure_memory_routing(
+            args.memory_file,
+            args.memory_confidence_threshold,
+            initial_x=args.scan_start_x,
+            initial_z=args.scan_marker_z)
         if controller.excluded_marker_ids:
             controller.get_logger().info(
                 "excluding markers from earlier attempts: "
@@ -1816,6 +2090,7 @@ def main() -> int:
         phase = None if controller is None else controller.flow_phase
         marker_id = (
             None if controller is None else controller.target_marker_id)
+        slot = None if controller is None else controller.target_slot()
         error = None if delivered else (
             caught_error or f"worker stopped in phase={phase} state={state}")
         result_document = {
@@ -1827,6 +2102,10 @@ def main() -> int:
             "requested_kind": args.target_kind,
             "status": "delivered" if delivered else "failed",
             "marker_id": marker_id,
+            "slot": None if slot is None else list(slot),
+            "slot_key": (
+                None if controller is None
+                else controller.target_slot_key()),
             "phase": phase,
             "state": state,
             "error": error,

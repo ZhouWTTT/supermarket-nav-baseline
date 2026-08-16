@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Find one requested goods class, localise it by the ArUco below, and pick it.
+"""Find one requested goods class, localise it with YOLO/optional ArUco, and pick it.
 
 Pipeline:
 
 1. Scan the shelf row with the head camera and YOLO ``best.pt``.
 2. Keep only ``--target-kind`` YOLO boxes.
-3. In a time-synchronised head-camera frame, associate an ArUco whose centre
-   is at/below the YOLO box's bottom edge.  Markers above the box are rejected.
-4. Median-filter the measured ArUco world position and derive the product
-   centre from the marker plus the selected class's physical centre height.
+3. Lock a stable multi-frame YOLO depth position into the fixed shelf grid;
+   when a synchronized ArUco is visible it remains an optional refinement.
+4. Recheck the selected class and 3-D slot at close range before grasping.
 5. Compose shelf level and object geometry: generic goods retain their layer
    motion; top and middle apples/oranges share a feedback-driven sphere
    approach and stable closure.  Top spheres lift with arm IK, while middle
@@ -65,6 +64,7 @@ if str(PERCEPTION_DIR) not in sys.path:
 
 from discoverse.robots.mmk2.mmk2_fik import MMK2FIK
 from mmk2_kdl import MMK2Kdl
+from memory_matrix import SLOT_BY_MARKER, fixed_slot_from_world
 from perception.aruco_detect import ArucoDetectNode
 from perception.kele_detect import KeleDetectNode
 
@@ -93,6 +93,22 @@ PRODUCT_CENTER_ABOVE_MARKER_M = {
     "pingguo": 0.034,
     "chengzi": 0.036,
 }
+
+# Physical half-heights used to clamp a YOLO-only centre estimate to the
+# selected shelf surface.  This keeps depth noise from lifting the fingers
+# into the shelf above when no ArUco pose is available.
+PRODUCT_HALF_HEIGHT_M = {
+    "sanmingzhi": 0.0494,
+    "heweidao": 0.0525,
+    "shupian": 0.1050,
+    "zhijin": 0.0440,
+    "maidong": 0.1050,
+    "kele": 0.0725,
+    "kouxiangtang": 0.0400,
+    "pingguo": 0.0350,
+    "chengzi": 0.0370,
+}
+PRODUCT_CENTER_Z_TOLERANCE_M = 0.015
 
 # Physical lateral widths from the scene collision geometry.  Gripper
 # pre-shaping uses one formula for every class; these are dimensions, not
@@ -136,6 +152,9 @@ DEPTH_TARGET_MAX_DELTA_MS = 150.0
 DEPTH_TARGET_MARKER_XY_MAX_M = 0.20
 DEPTH_TARGET_Z_MIN_M = 0.40
 DEPTH_TARGET_Z_MAX_M = 1.35
+YOLO_ONLY_TARGET_CONFIRMATIONS = 4
+YOLO_ONLY_TARGET_SPREAD_MAX_M = 0.09
+YOLO_ONLY_TARGET_CONF_MIN = 0.80
 # Horizontal depth-to-marker distance below which the product is considered
 # still in its nominal slot.  In that case the depth-measured Z is biased high
 # by the downward camera angle and the marker-derived Z is biased low by the
@@ -194,11 +213,11 @@ SCAN_CAMERA_POSES = (
 # 未锁定目标时触发，不影响"样本足够直接抓取"的原路径。
 REVISIT_POSES = SCAN_CAMERA_POSES
 REVISIT_MAX_POSES = len(REVISIT_POSES)
-REVISIT_DWELL_S = 1.5
+REVISIT_DWELL_S = 1.0
 # 补拍首姿态（已知最后关联成功的视角）驻留更长：稀疏检测槽位（如 B 货架
 # 顶层薯片）往往只在特定姿态偶尔冒出一两帧，多停一会儿能显著提高补拍命中率；
 # 其余兜底姿态仍按 REVISIT_DWELL_S 快速过。
-REVISIT_FIRST_POSE_DWELL_S = 5.0
+REVISIT_FIRST_POSE_DWELL_S = 2.5
 REVISIT_MAX_ROUNDS_PER_MARKER = 1
 REVISIT_MAX_ROUNDS_PER_SCAN = 4
 SCAN_CAMERA_REACHED_SLIDE_M = 0.015
@@ -207,9 +226,9 @@ SCAN_CAMERA_REACHED_HEAD_RAD = 0.030
 # 5 marker samples, which complete in well under a second at the perception
 # frame rate.  Previously the 2.5 s dwell per pose added ~75 s of pure wait
 # per full shelf sweep.
-SCAN_CAMERA_STABLE_S = 0.15
-SCAN_SETTLE_S = 0.20
-SCAN_DWELL_S = 1.2
+SCAN_CAMERA_STABLE_S = 0.10
+SCAN_SETTLE_S = 0.15
+SCAN_DWELL_S = 0.6
 # During a formal multi-order run, the first *graspable* pending class at a scan
 # pose is usually much cheaper to finish than crossing several shelf stations
 # for the class chosen before perception started.  Do not commit on YOLO alone:
@@ -811,6 +830,7 @@ class ShelfPickController(Node):
         self.revisit_box_world = None
         self.revisit_box_conf = 0.0
         self.revisit_box_confirmations = 0
+        self.revisit_box_key = None
         self.scan_diag_last_log = 0.0
         self.default_scan_poses = (
             SCAN_OVERVIEW_POSES
@@ -844,6 +864,9 @@ class ShelfPickController(Node):
         # attempt, so a retry searches for another physical item of the same
         # kind instead of repeatedly selecting the same slot.
         self.excluded_marker_ids = set()
+        # YOLO-only localisation has no decoded marker identity.  Failed
+        # attempts therefore blacklist the fixed matrix slot instead.
+        self.excluded_slot_keys = set()
         self.close_recheck = bool(close_recheck)
         self.recheck_marker_skips = set()
         self.recheck_confirmation_times = deque(maxlen=12)
@@ -857,6 +880,7 @@ class ShelfPickController(Node):
         self.target_marker_id = None
         self.target_physical_marker_id = None
         self.target_world = None
+        self.committed_slot = None
         self.grasp_arm = "r"
         self.align_base_x = None
         self.align_base_y = SCAN_Y
@@ -1050,14 +1074,31 @@ class ShelfPickController(Node):
             if not records:
                 return
             self.yolo_frames.append((stamp_ns, records))
-            if self.state == STATE_SCAN:
+            collect_yolo_only = (
+                self.state == STATE_SCAN
+                or (self.state == STATE_REVISIT
+                    and self.revisit_box_key is not None))
+            if collect_yolo_only:
                 # 有框无码候选：记录 YOLO 目标类框（按世界 x/z 或像素归并），
                 # 让"检测到但没解到码"的货物也能触发定点补拍。
                 for record in records:
                     world = record.get("world")
-                    if (isinstance(world, (list, tuple)) and len(world) == 3
-                            and all(isinstance(v, (int, float))
-                                    for v in world)):
+                    slot = None
+                    if (isinstance(world, (list, tuple))
+                            and len(world) == 3):
+                        try:
+                            # Stable fixed-grid grouping prevents one product
+                            # from becoming several rounded-coordinate boxes.
+                            slot = fixed_slot_from_world(
+                                float(world[0]), float(world[2]))
+                        except (TypeError, ValueError):
+                            slot = None
+                    if slot is not None:
+                        box_key = slot
+                    elif (isinstance(world, (list, tuple))
+                          and len(world) == 3
+                          and all(isinstance(v, (int, float))
+                                  for v in world)):
                         box_key = (
                             round(float(world[0]), 1),
                             round(float(world[2]), 1))
@@ -1068,10 +1109,18 @@ class ShelfPickController(Node):
                             self.current_scan_camera_pose()[0],
                             int(round(float(pixel[0]) / 40)),
                             int(round(float(pixel[1]) / 40)))
+                    if (self.state == STATE_REVISIT
+                            and self.revisit_box_key is not None
+                            and box_key != self.revisit_box_key):
+                        continue
                     entry = self.scan_unlocked_boxes.setdefault(
                         box_key, {"confirmations": 0, "pose": None,
-                                  "world": None, "max_conf": 0.0})
-                    entry["confirmations"] += 1
+                                  "world": None, "max_conf": 0.0,
+                                  "worlds": deque(maxlen=15),
+                                  "last_stamp_ns": None})
+                    if entry.get("last_stamp_ns") != stamp_ns:
+                        entry["confirmations"] += 1
+                        entry["last_stamp_ns"] = stamp_ns
                     entry["pose"] = self.current_scan_camera_pose()[0]
                     try:
                         entry["max_conf"] = max(
@@ -1081,9 +1130,12 @@ class ShelfPickController(Node):
                         pass
                     if isinstance(world, (list, tuple)) and len(world) == 3:
                         try:
-                            entry["world"] = np.asarray(world, dtype=float)
+                            world_array = np.asarray(world, dtype=float)
+                            entry["world"] = world_array
+                            entry["worlds"].append(world_array)
                         except (TypeError, ValueError):
                             pass
+                self._maybe_lock_yolo_only_target_locked()
             self.try_association_locked()
             self.try_recheck_locked()
 
@@ -1242,6 +1294,190 @@ class ShelfPickController(Node):
             self.try_association_locked()
             self.try_recheck_locked()
 
+    def _maybe_lock_yolo_only_target_locked(self) -> None:
+        """Lock a stable fixed-grid YOLO target without requiring ArUco."""
+        if (self.state not in (STATE_SCAN, STATE_REVISIT)
+                or (self.state == STATE_REVISIT
+                    and self.revisit_box_key is None)
+                or self.target_marker_id is not None
+                or self.target_world is not None
+                or self.now() - self.state_t0 < SCAN_SETTLE_S):
+            return
+        candidates = []
+        for entry in self.scan_unlocked_boxes.values():
+            if entry.get("confirmations", 0) < YOLO_ONLY_TARGET_CONFIRMATIONS:
+                continue
+            worlds = entry.get("worlds")
+            if not worlds:
+                continue
+            try:
+                samples = np.asarray(list(worlds), dtype=float)
+            except (TypeError, ValueError):
+                continue
+            if (samples.ndim != 2 or samples.shape[1] != 3
+                    or len(samples) < YOLO_ONLY_TARGET_CONFIRMATIONS
+                    or not np.all(np.isfinite(samples))):
+                continue
+            if (float(np.max(np.ptp(samples, axis=0)))
+                    > YOLO_ONLY_TARGET_SPREAD_MAX_M):
+                continue
+            try:
+                confidence = float(entry.get("max_conf", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            if confidence < YOLO_ONLY_TARGET_CONF_MIN:
+                continue
+            candidates.append((
+                int(entry["confirmations"]), confidence,
+                np.median(samples, axis=0)))
+        if not candidates:
+            return
+
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        _confirmations, confidence, median = candidates[0]
+        x, y, z = (float(value) for value in median)
+        # Navigation already identifies the current station.  Keep the shelf
+        # fixed to that station so a noisy oblique view cannot jump an aisle.
+        slot = fixed_slot_from_world(
+            x, z, shelf=self._current_station_shelf())
+        if slot is None:
+            return
+        shelf, level, column = slot
+        if f"{level}|{shelf}|{column}" in self.excluded_slot_keys:
+            return
+        level_name = {"L3": "top", "L2": "middle", "L1": "lower"}[level]
+        surface_z = SHELF_SURFACE_Z_M[level_name]
+        target_z = min(
+            z,
+            surface_z + PRODUCT_HALF_HEIGHT_M[self.target_kind]
+            + PRODUCT_CENTER_Z_TOLERANCE_M)
+        column_x = (
+            SCAN_X[self._scan_x_index_for_shelf(shelf)]
+            + {"1": -0.22, "2": 0.00, "3": 0.22}[column])
+        target_world = np.array([
+            column_x,
+            y + PRODUCT_HALF_DEPTH_M[self.target_kind],
+            target_z,
+        ], dtype=float)
+        self.get_logger().warn(
+            f"[yolo-only] locked kind={self.target_kind} "
+            f"slot=({shelf}, {level}, {column}) conf={confidence:.3f} "
+            f"world_median={np.round(median, 3)} -> target="
+            f"{np.round(target_world, 3)}")
+        self._commit_yolo_only_target(target_world, slot)
+
+    @staticmethod
+    def _scan_x_index_for_shelf(shelf: str) -> int:
+        return {
+            "E": 0, "D": 1, "C": 2, "B": 3, "A": 4,
+        }.get(str(shelf).upper(), 0)
+
+    def _current_station_shelf(self) -> str:
+        index = self.scan_index
+        if self.scan_station_order:
+            index = self.scan_station_order[
+                self.scan_index % len(self.scan_station_order)]
+        return ("E", "D", "C", "B", "A")[index % len(SCAN_X)]
+
+    def _commit_yolo_only_target(
+            self, target_world: np.ndarray,
+            slot: tuple[str, str, str]) -> None:
+        """Configure the existing grasp state machine from a YOLO-only slot."""
+        self.target_world = np.asarray(target_world, dtype=float)
+        self.target_marker_id = None
+        self.target_physical_marker_id = None
+        self.committed_slot = tuple(slot)
+        self._recheck_passed = False
+
+        # Preserve the existing dual-tissue wall clearance even though target
+        # identity no longer comes from a marker.
+        if (self.use_dual_tissue_grasp
+                and (self.target_world[0] < DUAL_TISSUE_MIN_SAFE_X_M
+                     or self.target_world[0] > DUAL_TISSUE_MAX_SAFE_X_M)):
+            self.excluded_slot_keys.add(self.target_slot_key())
+            self.get_logger().warn(
+                f"[yolo-only] tissue slot {slot} is outside safe X band; "
+                "continuing scan")
+            self.target_world = None
+            self.committed_slot = None
+            return
+
+        if self.use_dual_tissue_grasp:
+            self.grasp_arm = "r"
+            desired_base_x = self.target_world[0]
+        else:
+            desired_right_base_x = (
+                self.target_world[0] - ARM_LATERAL_BIAS_M)
+            if slot[0] == "A" or desired_right_base_x < NAV_X_MIN:
+                self.grasp_arm = "l"
+                desired_base_x = (
+                    self.target_world[0] + ARM_LATERAL_BIAS_M)
+            else:
+                self.grasp_arm = "r"
+                desired_base_x = desired_right_base_x
+        self.align_base_x = float(np.clip(
+            desired_base_x, NAV_X_MIN, NAV_X_MAX))
+        if self.target_world[2] >= TOP_SHELF_Z_M:
+            self.shelf_level = "top"
+        elif self.target_world[2] >= MIDDLE_SHELF_Z_MIN_M:
+            self.shelf_level = "middle"
+        else:
+            self.shelf_level = "lower"
+        self.object_geometry = (
+            "sphere" if self.target_kind in SPHERE_RADIUS_M else "generic")
+        self.is_top_shelf = self.shelf_level == "top"
+        self.use_sphere_grasp = bool(
+            self.object_geometry == "sphere"
+            and self.shelf_level in ("top", "middle"))
+        if self.is_top_shelf:
+            self.align_base_y = float(
+                self.target_world[1] - TOP_GRASP_CENTER_DISTANCE_M)
+        elif self.use_dual_tissue_grasp:
+            self.align_base_y = (
+                SCAN_Y + GENERIC_EXTENSION_ALIGN_FORWARD_M
+                + DUAL_TISSUE_ALIGN_FORWARD_M)
+        elif (self.shelf_level in ("middle", "lower")
+              and self.object_geometry != "sphere"):
+            self.align_base_y = (
+                SCAN_Y + GENERIC_EXTENSION_ALIGN_FORWARD_M)
+        else:
+            self.align_base_y = SCAN_Y
+        self.slide_grasp = float(np.clip(
+            SLIDE_REFERENCE_COMMAND
+            - (self.target_world[2] - SLIDE_REFERENCE_Z_M),
+            SLIDE_MIN, SLIDE_MAX))
+        self.ik_retry_forward_m = 0.0
+        self.set_state(STATE_ALIGN)
+        self.get_logger().info(
+            f"[localised] source=yolo_only marker=None "
+            f"product_world={np.round(self.target_world, 3)} "
+            f"arm={'both' if self.use_dual_tissue_grasp else self.grasp_arm} "
+            f"grasp_profile={self.grasp_profile_name()} "
+            f"align_y={self.align_base_y:.3f} slot={slot}")
+
+    def target_slot(self) -> tuple[str, str, str] | None:
+        """Return the fixed matrix slot committed for the current target."""
+        if self.committed_slot is not None:
+            return tuple(self.committed_slot)
+        if self.target_marker_id is not None:
+            marker_slot = SLOT_BY_MARKER.get(int(self.target_marker_id))
+            if marker_slot is not None:
+                return tuple(marker_slot)
+        if self.target_world is None:
+            return None
+        try:
+            return fixed_slot_from_world(
+                float(self.target_world[0]), float(self.target_world[2]))
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def target_slot_key(self) -> str | None:
+        slot = self.target_slot()
+        if slot is None:
+            return None
+        shelf, level, column = slot
+        return f"{level}|{shelf}|{column}"
+
     def try_association_locked(self) -> None:
         if (self.state not in (STATE_SCAN, STATE_REVISIT)
                 or self.now() - self.state_t0 < SCAN_SETTLE_S):
@@ -1341,6 +1577,7 @@ class ShelfPickController(Node):
                 return
             self.target_marker_id = marker_id
             self.target_physical_marker_id = physical_marker_id
+            self.committed_slot = None
             self._recheck_passed = False
             self.marker_positions.clear()
             self.depth_target_samples.clear()
@@ -1575,7 +1812,9 @@ class ShelfPickController(Node):
         """Count fresh close-view class confirmations once per YOLO frame."""
         if self.state != STATE_RECHECK or self.current_recheck_pose() is None:
             return
-        if self.target_marker_id is None or not self.yolo_frames:
+        # A YOLO-only target has no decoded marker but still receives the same
+        # close-view depth verification before any arm motion.
+        if not self.yolo_frames:
             return
         if not self.scan_camera_ready(self.current_recheck_pose()):
             return
@@ -1626,14 +1865,17 @@ class ShelfPickController(Node):
     def _recheck_detection_matches(
             self, detection: dict,
             markers: list[dict]) -> tuple[bool, str]:
-        """Verify the same marker, or the same 3-D slot if it is occluded."""
+        """Verify a matching marker or fall through to the same 3-D slot."""
         marker = marker_below_yolo(detection, markers)
+        marker_id = None
         if marker is not None:
             try:
-                matched = int(marker["id"]) == self.target_marker_id
+                marker_id = int(marker["id"])
             except (KeyError, TypeError, ValueError):
-                matched = False
-            return matched, "aruco"
+                marker_id = None
+            if (self.target_marker_id is not None
+                    and marker_id == int(self.target_marker_id)):
+                return True, "aruco"
 
         try:
             world = np.asarray(detection.get("world"), dtype=float)
@@ -1648,7 +1890,15 @@ class ShelfPickController(Node):
             abs(float(world[0] - target[0])) <= CLOSE_RECHECK_XY_MAX_M
             and abs(float(world[1] - target[1])) <= CLOSE_RECHECK_XY_MAX_M
             and abs(float(world[2] - target[2])) <= CLOSE_RECHECK_Z_MAX_M)
-        return matched, "depth"
+        if marker_id is None:
+            source = "depth(no-aruco)"
+        elif self.target_marker_id is None:
+            source = f"depth(ignore-aruco={marker_id})"
+        else:
+            source = (
+                f"depth(ignore-aruco={marker_id},"
+                f"expected={self.target_marker_id})")
+        return matched, source
 
     def _recheck_confirmed(self) -> bool:
         cutoff = self.now() - CLOSE_RECHECK_WINDOW_S
@@ -1680,6 +1930,10 @@ class ShelfPickController(Node):
         marker_id = self.target_marker_id
         if marker_id is not None:
             self.recheck_marker_skips.add(marker_id)
+        else:
+            skipped_slot = self.target_slot_key()
+            if skipped_slot is not None:
+                self.excluded_slot_keys.add(skipped_slot)
         self.get_logger().warn(
             f"[close-recheck] FAILED marker={marker_id} "
             f"kind={self.target_kind}; all close-view poses exhausted; "
@@ -1692,6 +1946,7 @@ class ShelfPickController(Node):
         self.target_marker_id = None
         self.target_physical_marker_id = None
         self.target_world = None
+        self.committed_slot = None
         self.association_candidate_id = None
         self.association_confirmation_count = 0
         self.marker_positions.clear()
@@ -1986,8 +2241,9 @@ class ShelfPickController(Node):
     def _start_revisit(self) -> None:
         """对当前位姿"已关联但未锁定"或"有框无码"的候选做定点多角度补拍。
 
-        锁定门槛与正常扫描完全一致（2 帧确认 + 5 个 marker 样本 + 4cm 扩散）；
-        补拍只是把同一站点的多个角度都用于采集样本，样本跨补拍姿态累计。
+        marker 锁定门槛与正常扫描完全一致（2 帧确认 + 5 个 marker
+        样本 + 4cm 扩散）；无码候选同样保留并继续累计原有的 4 帧、
+        9cm 扩散和置信度门槛。补拍只增加采样视角，不降低任何锁定门槛。
         """
         marker_candidates = {
             marker_id: entry for marker_id, entry in
@@ -2005,6 +2261,7 @@ class ShelfPickController(Node):
         self.revisit_box_world = None
         self.revisit_box_conf = 0.0
         self.revisit_box_confirmations = 0
+        self.revisit_box_key = None
         if marker_candidates:
             if (self.target_marker_id is not None
                     and self.target_marker_id in marker_candidates):
@@ -2023,6 +2280,7 @@ class ShelfPickController(Node):
             candidate_key = max(
                 box_candidates,
                 key=lambda bk: box_candidates[bk]["confirmations"])
+            self.revisit_box_key = candidate_key
             last_pose = box_candidates[candidate_key].get("pose")
             filter_marker = None
             box_world = box_candidates[candidate_key].get("world")
@@ -2084,7 +2342,14 @@ class ShelfPickController(Node):
             self.target_marker_id = None
             self.target_physical_marker_id = None
         self.scan_unlocked_markers.clear()
-        self.scan_unlocked_boxes.clear()
+        if self.revisit_box_key is None:
+            self.scan_unlocked_boxes.clear()
+        else:
+            selected_box = self.scan_unlocked_boxes.get(
+                self.revisit_box_key)
+            self.scan_unlocked_boxes = (
+                {} if selected_box is None
+                else {self.revisit_box_key: selected_box})
         self.scan_camera_ready_since = None
         self.set_state(STATE_REVISIT)
         self.get_logger().info(
@@ -2138,118 +2403,73 @@ class ShelfPickController(Node):
                 and not self.tcp_diagnostic_ground_truth
                 and self._try_position_fallback()):
             self.revisit_box_world = None
+            self.revisit_box_key = None
             return
         self.revisit_box_world = None
+        self.revisit_box_key = None
         self._advance_scan_pose()
 
     def _try_position_fallback(self) -> bool:
         """方向3备选：ArUco 码无法解码时，用 YOLO 框世界坐标推断固定槽位。
 
-        仅在 box 补拍失败后触发；推断出的槽位作为虚拟 marker，后续对齐、
-        近距离复核（码或深度）与正常流程完全一致，不改变抓取门槛。
+        固定格只提供几何，不伪造一次真实的 marker 解码。后续仍执行
+        与正常路径相同的近距离 YOLO 深度复核。
         """
-        box_world = np.asarray(self.revisit_box_world, dtype=float)
-        if box_world.shape != (3,) or not np.all(np.isfinite(box_world)):
+        entry = self.scan_unlocked_boxes.get(self.revisit_box_key)
+        if not isinstance(entry, dict):
             return False
-        if self.revisit_box_conf < 0.85:
+        try:
+            confirmations = int(entry.get("confirmations", 0))
+            confidence = float(entry.get("max_conf", 0.0))
+            samples = np.asarray(list(entry.get("worlds", ())), dtype=float)
+        except (TypeError, ValueError):
+            return False
+        if (confirmations < YOLO_ONLY_TARGET_CONFIRMATIONS
+                or samples.ndim != 2 or samples.shape[1:] != (3,)
+                or len(samples) < YOLO_ONLY_TARGET_CONFIRMATIONS
+                or not np.all(np.isfinite(samples))):
+            return False
+        spread = float(np.max(np.ptp(samples, axis=0)))
+        if spread > YOLO_ONLY_TARGET_SPREAD_MAX_M:
+            self.get_logger().warn(
+                "[position-fallback] skipped: YOLO-only sample spread "
+                f"{spread:.3f}m > {YOLO_ONLY_TARGET_SPREAD_MAX_M:.3f}m")
+            return False
+        if confidence < YOLO_ONLY_TARGET_CONF_MIN:
             self.get_logger().warn(
                 "[position-fallback] skipped: box conf "
-                f"{self.revisit_box_conf:.3f} < 0.85")
+                f"{confidence:.3f} < {YOLO_ONLY_TARGET_CONF_MIN:.3f}")
             return False
-        if self.revisit_box_confirmations < 2:
+        box_world = np.median(samples, axis=0)
+        slot = fixed_slot_from_world(
+            float(box_world[0]), float(box_world[2]),
+            shelf=self._current_station_shelf())
+        if slot is None:
             return False
-        z = float(box_world[2])
-        if not (0.40 <= z <= 1.40):
+        shelf, level, column = slot
+        slot_key = f"{level}|{shelf}|{column}"
+        if slot_key in self.excluded_slot_keys:
             return False
-        level = (
-            "L3" if z >= TOP_SHELF_Z_M
-            else ("L2" if z >= MIDDLE_SHELF_Z_MIN_M else "L1"))
-        slots = [slot for slot in fixed_layout_by_marker().values()
-                 if slot.get("level") == level]
-        if not slots:
-            return False
-        slot = min(
-            slots, key=lambda s: abs(
-                float(s["world_position"][0]) - box_world[0]))
-        if abs(float(slot["world_position"][0]) - box_world[0]) > 0.08:
-            self.get_logger().warn(
-                "[position-fallback] skipped: no slot within 8cm of "
-                f"box x={box_world[0]:.3f} level={level}")
-            return False
-        marker_id = int(slot["aruco_id"])
-        if marker_id in self.excluded_marker_ids:
-            return False
-        if marker_id in self.recheck_marker_skips:
-            return False
-        if marker_id in self.skipped_tissue_markers:
-            return False
-        if (self.target_kind == "zhijin"
-                and (box_world[0] < DUAL_TISSUE_MIN_SAFE_X_M
-                     or box_world[0] > DUAL_TISSUE_MAX_SAFE_X_M)):
-            return False
-
-        self.target_world = np.array([
-            float(slot["world_position"][0]),
+        level_name = {"L3": "top", "L2": "middle", "L1": "lower"}[level]
+        z = min(
+            float(box_world[2]),
+            SHELF_SURFACE_Z_M[level_name]
+            + PRODUCT_HALF_HEIGHT_M[self.target_kind]
+            + PRODUCT_CENTER_Z_TOLERANCE_M)
+        column_x = (
+            SCAN_X[self._scan_x_index_for_shelf(shelf)]
+            + {"1": -0.22, "2": 0.00, "3": 0.22}[column])
+        target_world = np.array([
+            column_x,
             float(box_world[1] + PRODUCT_HALF_DEPTH_M[self.target_kind]),
             z], dtype=float)
-        self.target_marker_id = marker_id
-        self.target_physical_marker_id = None
-        self._recheck_passed = False
         self.get_logger().warn(
-            f"[position-fallback] marker={marker_id} undecodable; "
+            f"[position-fallback] ArUco undecodable; "
             f"using YOLO world {np.round(box_world, 3)} -> target "
-            f"{np.round(self.target_world, 3)} kind={self.target_kind} "
-            f"level={level}")
-
-        if self.use_dual_tissue_grasp:
-            self.grasp_arm = "r"
-            desired_base_x = self.target_world[0]
-        else:
-            west_slot = fixed_layout_by_marker().get(marker_id)
-            west_column = bool(west_slot and west_slot.get("shelf") == "A")
-            desired_right_base_x = (
-                self.target_world[0] - ARM_LATERAL_BIAS_M)
-            if west_column or desired_right_base_x < NAV_X_MIN:
-                self.grasp_arm = "l"
-                desired_base_x = (
-                    self.target_world[0] + ARM_LATERAL_BIAS_M)
-            else:
-                self.grasp_arm = "r"
-                desired_base_x = desired_right_base_x
-        self.align_base_x = float(np.clip(
-            desired_base_x, NAV_X_MIN, NAV_X_MAX))
-        if self.target_world[2] >= TOP_SHELF_Z_M:
-            self.shelf_level = "top"
-        elif self.target_world[2] >= MIDDLE_SHELF_Z_MIN_M:
-            self.shelf_level = "middle"
-        else:
-            self.shelf_level = "lower"
-        self.object_geometry = (
-            "sphere" if self.target_kind in SPHERE_RADIUS_M else "generic")
-        self.is_top_shelf = self.shelf_level == "top"
-        self.use_sphere_grasp = bool(
-            self.object_geometry == "sphere"
-            and self.shelf_level in ("top", "middle"))
-        if self.is_top_shelf:
-            self.align_base_y = float(
-                self.target_world[1] - TOP_GRASP_CENTER_DISTANCE_M)
-        elif self.use_dual_tissue_grasp:
-            self.align_base_y = (
-                SCAN_Y + GENERIC_EXTENSION_ALIGN_FORWARD_M
-                + DUAL_TISSUE_ALIGN_FORWARD_M)
-        elif (self.shelf_level in ("middle", "lower")
-              and self.object_geometry != "sphere"):
-            self.align_base_y = (
-                SCAN_Y + GENERIC_EXTENSION_ALIGN_FORWARD_M)
-        else:
-            self.align_base_y = SCAN_Y
-        self.slide_grasp = float(np.clip(
-            SLIDE_REFERENCE_COMMAND
-            - (self.target_world[2] - SLIDE_REFERENCE_Z_M),
-            SLIDE_MIN, SLIDE_MAX))
-        self.ik_retry_forward_m = 0.0
-        self.set_state(STATE_ALIGN)
-        return True
+            f"{np.round(target_world, 3)} kind={self.target_kind} "
+            f"slot={slot}")
+        self._commit_yolo_only_target(target_world, slot)
+        return self.target_world is not None and self.state == STATE_ALIGN
 
     def _advance_scan_pose(self) -> bool:
         """推进到下一个扫描位姿/站点/周期；返回 True 表示扫描仍在继续。"""
@@ -4374,13 +4594,21 @@ class ShelfPickController(Node):
         if self.state == STATE_GO_SCAN:
             pose_name, slide_target, yaw_target, pitch_target = (
                 self.current_scan_camera_pose())
-            self.des_slide = slide_target
-            self.des_head[:] = [yaw_target, pitch_target]
             if self.scan_station_order is None:
                 self.scan_station_order = self._nearest_scan_stations()
             navigation_ready = self.drive_to(
                 [self.current_scan_station_x(), SCAN_Y], YAW_NORTH, 0.08)
-            camera_ready = self.scan_camera_ready()
+            # Keep the camera assembly at the posture inherited when this
+            # order started while crossing the delivery/obstacle corridor.
+            # Lowering or pitching it during base transit is unnecessary and
+            # can put the head in a poor clearance posture.  Only command the
+            # selected shelf view after the base has reached and aligned at
+            # the scan station; the normal settling gate below then waits for
+            # the camera motion to finish before enabling the scan state.
+            if navigation_ready:
+                self.des_slide = slide_target
+                self.des_head[:] = [yaw_target, pitch_target]
+            camera_ready = navigation_ready and self.scan_camera_ready()
             if navigation_ready and camera_ready:
                 if self.scan_camera_ready_since is None:
                     self.scan_camera_ready_since = self.now()
@@ -4757,25 +4985,40 @@ class ShelfPickController(Node):
             close_elapsed = self.now() - self.state_t0
             if close_elapsed >= DUAL_TISSUE_CLAMP_DWELL_S:
                 self.dual_lift_use_arm = False
-                if (self.slide_grasp - DUAL_TISSUE_LIFT_M
-                        < SLIDE_MIN + 0.005):
+                if self.shelf_level == "top":
                     # Top shelf: the slide is already pinned at its upper
                     # limit, so the slide lift would be a no-op.  Lift via the
-                    # arm joints so the box clears the board before the
-                    # horizontal retreat.
+                    # arm joints so the box clears the board before retreat.
+                    # There is no shelf above this layer.
                     if self.configure_dual_tissue_arm_lift():
                         self.dual_lift_use_arm = True
                     else:
-                        self.get_logger().warn(
-                            "[dual-tissue] arm lift IK failed; "
-                            "falling back to the slide lift")
-                self.dual_lift_settled_since = None
-                self.get_logger().info(
-                    f"[dual-tissue-clamp] lateral squeeze held for "
-                    f"{close_elapsed:.2f}s; lifting via "
-                    f"{'arm joints' if self.dual_lift_use_arm else 'slide'} "
-                    "without a capture gate")
-                self.set_state(STATE_LIFT)
+                        self.get_logger().error(
+                            "[dual-tissue] top-shelf arm lift IK failed; "
+                            "refusing a same-height retreat across the board")
+                        self.set_state(STATE_ABORT)
+                        return
+                    self.dual_lift_settled_since = None
+                    self.get_logger().info(
+                        f"[dual-tissue-clamp] lateral squeeze held for "
+                        f"{close_elapsed:.2f}s; top shelf has no overhead "
+                        "board, performing the established arm lift")
+                    self.set_state(STATE_LIFT)
+                else:
+                    # Match wxj: middle/lower tissue leaves the shelf at its
+                    # measured grasp height before transport-height recovery.
+                    self.get_logger().info(
+                        f"[dual-tissue-clamp] lateral squeeze held for "
+                        f"{close_elapsed:.2f}s; retracting at grasp height "
+                        "before restoring transport height")
+                    self.start_dual_tissue_motion(
+                        "retreat_at_grasp_height",
+                        self.dual_retreat_left_joints,
+                        self.dual_retreat_right_joints,
+                        DUAL_TISSUE_PREGRASP_BACKOFF_M
+                        + self.dual_insert_forward_m,
+                        DUAL_TISSUE_RETREAT_SPEED_MPS,
+                        STATE_RETREAT)
 
         elif self.state == STATE_CLOSE:
             close_command = (
@@ -4814,22 +5057,18 @@ class ShelfPickController(Node):
                             f"[sphere-grip] stable capture verified: "
                             f"position={gripper:.3f} "
                             f"range={spread:.3f} over {span:.2f}s")
-                        if self.target_kind in {"pingguo", "chengzi"}:
-                            # Apples and oranges can be squeezed into the
-                            # shelf above by even a small post-grasp lift.
-                            # Keep the measured grasp height and withdraw to
-                            # the same-height pregrasp pose before any outer
-                            # transport-height restoration.
+                        if self.shelf_level == "middle":
+                            # Match wxj: a middle-shelf sphere withdraws at
+                            # the exact grasp height; top spheres retain the
+                            # established trial/full arm-lift sequence.
                             self.des_slide = self.sphere_slide_command
                             self.sphere_retreat_arm_joints = (
                                 self.pregrasp_arm_joints.copy())
                             self.set_selected_arm_target(
                                 self.sphere_retreat_arm_joints)
                             self.get_logger().info(
-                                f"[sphere-no-lift-retreat] kind="
-                                f"{self.target_kind} layer={self.shelf_level}; "
-                                "retracting at grasp height without trial or "
-                                "full lift")
+                                "[middle-sphere-retreat] retracting at "
+                                "grasp height before any vertical motion")
                             self.set_state(STATE_RETREAT)
                         elif self.configure_sphere_lift_from_measured():
                             self.set_state(STATE_TRIAL_LIFT)
