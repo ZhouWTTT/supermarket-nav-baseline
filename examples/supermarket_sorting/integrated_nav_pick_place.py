@@ -181,18 +181,26 @@ TRANSPORT_GRIP_PRELOAD_COMMAND = 0.04
 SPHERE_TRANSPORT_GRIP_COMMAND = 0.06
 
 # A* stops outside the table's inflated costmap.  From that safe pose, make a
-# short, slow, yaw-controlled final approach before extending the arm.  The
-# physical chassis front remains clear of the table at the nominal endpoint.
-PLACE_CREEP_DISTANCE_M = 0.20
-PLACE_CREEP_SPEED_MPS = 0.12
-PLACE_CREEP_FRONT_STOP_M = 0.30
+# short, yaw-controlled final approach before extending the arm.  Keep the
+# speed well below normal navigation while avoiding an unnecessarily long
+# low-speed hand-off.  The physical chassis front remains clear of the table
+# at the nominal endpoint.
+PLACE_CREEP_DISTANCE_M = 0.25
+PLACE_CREEP_SPEED_MPS = 0.25
+PLACE_CREEP_FRONT_STOP_M = 0.25
 # Preserve the successful longitudinal arm reach measured on the deepest
-# slot, but do not drive the same 0.20 m for outer slots that are substantially
+# slot, but do not drive the same 0.25 m for outer slots that are substantially
 # closer to the aisle.  The normal configured creep remains a hard upper cap.
-PLACE_BASE_TO_SLOT_LONGITUDINAL_M = 0.67
+PLACE_BASE_TO_SLOT_LONGITUDINAL_M = 0.62
 PLACE_CREEP_GOAL_TOLERANCE_M = 0.01
 PLACE_CREEP_YAW_GAIN = 2.0
 PLACE_CREEP_MAX_ANGULAR_RPS = 0.30
+# The parent limiter permits 0.022 rad every 20 ms (about 1.1 rad/s) and can
+# apply that full step as soon as placement starts.  Ramp the loaded arm from
+# rest and cap it at the gentler shelf-contact rate so the held product is not
+# shocked loose.  Empty-arm recovery after release keeps the normal speed.
+PLACE_LOADED_ARM_MAX_STEP_RAD = 0.006
+PLACE_LOADED_ARM_STEP_RAMP_RAD = 0.00025
 PLACE_RELEASE_TABLE_MARGIN_M = 0.04
 PLACE_APPROACH_SOFT_DWELL_S = 2.0
 PLACE_APPROACH_SOFT_ARM_TOLERANCE_RAD = 0.08
@@ -306,6 +314,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_creep_start_y = None
         self.place_creep_done = False
         self._place_stage0_wait_log = 0.0
+        self._place_loaded_arm_step_rad = 0.0
         self._backup_start_xy = None
         self._backup_start_yaw = 0.0
         self._backup_t0 = 0.0
@@ -475,6 +484,12 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         safe_clearance = (
             WHOLE_BODY_KEEP_OUT_RADIUS + PLACE_CLEAR_TABLE_MARGIN_M)
         if table_clearance < safe_clearance:
+            # This branch is also the fail-safe exit for a new worker that
+            # inherits a deployed placement arm from a failed predecessor.
+            # Any commanded retreat from the delivery table must retract both
+            # arms at the same time; reassert the posture on every tick until
+            # the chassis is outside the whole-body keep-out.
+            self._command_initial_arm_posture()
             yaw_error = pick.wrap_to_pi(-math.pi / 2.0 - self.base_yaw)
             if abs(yaw_error) <= 0.20:
                 self.set_twist(
@@ -490,7 +505,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     "starting inside delivery-table keep-out; "
                     f"clearance={table_clearance:.3f}m "
                     f"required={safe_clearance:.3f}m; reversing north "
-                    "before normal navigation")
+                    "and restoring both arms before normal navigation")
             return False
         if self._table_escape_logged:
             self._table_escape_logged = False
@@ -1077,7 +1092,12 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                         self.des_slide = self.place_slide_cmd
                     self.place_t0 = now
                     self._place_stage0_wait_log = 0.0
+                    self._place_loaded_arm_step_rad = 0.0
                     self._place_arm_target_sent = True
+                    self.get_logger().info(
+                        "[place] loaded-arm soft start enabled "
+                        f"max_step={PLACE_LOADED_ARM_MAX_STEP_RAD:.4f}rad/"
+                        "tick")
                 else:
                     raise RuntimeError(
                         "place IK failed; refusing to release goods off-table")
@@ -1235,6 +1255,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.des_left_arm = best[:6].copy()
         self.des_right_arm = best[6:].copy()
         self.commands_ready_since = None
+        self._place_loaded_arm_step_rad = 0.0
         self._dual_place_target_sent = True
         self.place_t0 = self.now()
         self.get_logger().info(
@@ -1368,9 +1389,39 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             float(np.clip(2.0 * yaw_error, -0.25, 0.25)))
 
     def smooth_commands(self) -> None:
-        """Use a slower slide rate during the final loaded descent."""
+        """Limit loaded placement arm motion and the final slide descent."""
         previous_slide = self.cmd_slide
+        previous_left_arm = self.cmd_left_arm.copy()
+        previous_right_arm = self.cmd_right_arm.copy()
         super().smooth_commands()
+
+        loaded_place_extension = (
+            self.flow_phase == "place"
+            and self.place_stage == 0
+            and (
+                (self.use_dual_tissue_grasp
+                 and self._dual_place_target_sent)
+                or (not self.use_dual_tissue_grasp
+                    and self._place_arm_target_sent)))
+        if loaded_place_extension:
+            self._place_loaded_arm_step_rad = min(
+                PLACE_LOADED_ARM_MAX_STEP_RAD,
+                self._place_loaded_arm_step_rad
+                + PLACE_LOADED_ARM_STEP_RAMP_RAD)
+            arm_step = self._place_loaded_arm_step_rad
+            if self.use_dual_tissue_grasp:
+                combined = self.synchronized_slew(
+                    np.concatenate((previous_left_arm, previous_right_arm)),
+                    np.concatenate((self.des_left_arm, self.des_right_arm)),
+                    arm_step)
+                self.cmd_left_arm = combined[:6]
+                self.cmd_right_arm = combined[6:]
+            elif self.grasp_arm == "l":
+                self.cmd_left_arm = self.synchronized_slew(
+                    previous_left_arm, self.des_left_arm, arm_step)
+            else:
+                self.cmd_right_arm = self.synchronized_slew(
+                    previous_right_arm, self.des_right_arm, arm_step)
 
         # NavigationController already applies acceleration ramps during
         # normal motion.  Do not apply the parent's second ramp in the unsafe

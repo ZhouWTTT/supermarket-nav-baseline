@@ -84,12 +84,12 @@ def fixed_layout_by_marker():
 
 PRODUCT_CENTER_ABOVE_MARKER_M = {
     "sanmingzhi": 0.0434,
-    "heweidao": 0.0355,
-    "shupian": 0.034,
+    "heweidao": 0.00,
+    "shupian": 0.030,
     "zhijin": 0.043,
-    "maidong": 0.054,
+    "maidong": 0.034,
     "kele": 0.0315,
-    "kouxiangtang": 0.030,
+    "kouxiangtang": 0.020,
     "pingguo": 0.034,
     "chengzi": 0.036,
 }
@@ -4757,43 +4757,25 @@ class ShelfPickController(Node):
             close_elapsed = self.now() - self.state_t0
             if close_elapsed >= DUAL_TISSUE_CLAMP_DWELL_S:
                 self.dual_lift_use_arm = False
-                if self.shelf_level == "top":
+                if (self.slide_grasp - DUAL_TISSUE_LIFT_M
+                        < SLIDE_MIN + 0.005):
                     # Top shelf: the slide is already pinned at its upper
                     # limit, so the slide lift would be a no-op.  Lift via the
-                    # arm joints so the box clears the board before retreat.
-                    # There is no shelf above this layer.
+                    # arm joints so the box clears the board before the
+                    # horizontal retreat.
                     if self.configure_dual_tissue_arm_lift():
                         self.dual_lift_use_arm = True
                     else:
-                        self.get_logger().error(
-                            "[dual-tissue] top-shelf arm lift IK failed; "
-                            "refusing a same-height retreat across the board")
-                        self.set_state(STATE_ABORT)
-                        return
-                    self.dual_lift_settled_since = None
-                    self.get_logger().info(
-                        f"[dual-tissue-clamp] lateral squeeze held for "
-                        f"{close_elapsed:.2f}s; top shelf has no overhead "
-                        "board, performing the established arm lift")
-                    self.set_state(STATE_LIFT)
-                else:
-                    # On middle/lower shelves a full vertical lift can drive
-                    # the held box into the shelf immediately above it.  Pull
-                    # horizontally clear at the measured grasp height first;
-                    # IntegratedNavPickPlace restores the slide to its 0.006 m
-                    # transport height only after this segment reaches DONE.
-                    self.get_logger().info(
-                        f"[dual-tissue-clamp] lateral squeeze held for "
-                        f"{close_elapsed:.2f}s; retracting at grasp height "
-                        "before restoring transport height")
-                    self.start_dual_tissue_motion(
-                        "retreat_at_grasp_height",
-                        self.dual_retreat_left_joints,
-                        self.dual_retreat_right_joints,
-                        DUAL_TISSUE_PREGRASP_BACKOFF_M
-                        + self.dual_insert_forward_m,
-                        DUAL_TISSUE_RETREAT_SPEED_MPS,
-                        STATE_RETREAT)
+                        self.get_logger().warn(
+                            "[dual-tissue] arm lift IK failed; "
+                            "falling back to the slide lift")
+                self.dual_lift_settled_since = None
+                self.get_logger().info(
+                    f"[dual-tissue-clamp] lateral squeeze held for "
+                    f"{close_elapsed:.2f}s; lifting via "
+                    f"{'arm joints' if self.dual_lift_use_arm else 'slide'} "
+                    "without a capture gate")
+                self.set_state(STATE_LIFT)
 
         elif self.state == STATE_CLOSE:
             close_command = (
@@ -4832,25 +4814,24 @@ class ShelfPickController(Node):
                             f"[sphere-grip] stable capture verified: "
                             f"position={gripper:.3f} "
                             f"range={spread:.3f} over {span:.2f}s")
-                        if self.shelf_level == "middle":
-                            # Do not even perform the former 10 mm trial lift
-                            # while the sphere is still below an overhead
-                            # board.  The close-state stability gate above has
-                            # already verified capture, so withdraw at the
-                            # exact grasp height and restore transport height
-                            # only after the TCP is clear of the shelf.
+                        if self.target_kind in {"pingguo", "chengzi"}:
+                            # Apples and oranges can be squeezed into the
+                            # shelf above by even a small post-grasp lift.
+                            # Keep the measured grasp height and withdraw to
+                            # the same-height pregrasp pose before any outer
+                            # transport-height restoration.
                             self.des_slide = self.sphere_slide_command
                             self.sphere_retreat_arm_joints = (
                                 self.pregrasp_arm_joints.copy())
                             self.set_selected_arm_target(
                                 self.sphere_retreat_arm_joints)
                             self.get_logger().info(
-                                "[middle-sphere-retreat] retracting at "
-                                "grasp height before any vertical motion")
+                                f"[sphere-no-lift-retreat] kind="
+                                f"{self.target_kind} layer={self.shelf_level}; "
+                                "retracting at grasp height without trial or "
+                                "full lift")
                             self.set_state(STATE_RETREAT)
                         elif self.configure_sphere_lift_from_measured():
-                            # Top shelf has no overhead board, so retain its
-                            # established trial/full arm-lift sequence.
                             self.set_state(STATE_TRIAL_LIFT)
                         else:
                             self.set_state(STATE_ABORT)
@@ -4935,22 +4916,8 @@ class ShelfPickController(Node):
                             self.set_selected_arm_target(
                                 self.pregrasp_arm_joints)
                             self.set_state(STATE_ABORT)
-                        elif self.is_top_shelf:
-                            # No shelf exists above the top layer, so retain
-                            # its small board-clearance lift.
-                            self.set_state(STATE_LIFT)
                         else:
-                            # Middle/lower goods must leave the shelf before
-                            # any large vertical motion.  The pregrasp target
-                            # is a same-height horizontal retreat; transport
-                            # height restoration starts only after STATE_DONE.
-                            self.set_selected_arm_target(
-                                self.pregrasp_arm_joints)
-                            self.get_logger().info(
-                                f"[{self.shelf_level}-generic-retreat] "
-                                "retracting at grasp height before restoring "
-                                "transport height")
-                            self.set_state(STATE_RETREAT)
+                            self.set_state(STATE_LIFT)
 
         elif self.state == STATE_TRIAL_LIFT:
             self.des_slide = (
@@ -4969,31 +4936,19 @@ class ShelfPickController(Node):
                 stable, spread, span = self.sphere_grip_is_stable(
                     self.sphere_trial_grip_samples, gripper)
                 if stable:
+                    self.get_logger().info(
+                        f"[sphere-trial-lift] {SPHERE_TRIAL_LIFT_M:.3f}m "
+                        f"test passed; grip={gripper:.3f} "
+                        f"range={spread:.3f} over {span:.2f}s; "
+                        "continuing full lift")
                     if self.shelf_level == "top":
-                        self.get_logger().info(
-                            f"[sphere-trial-lift] "
-                            f"{SPHERE_TRIAL_LIFT_M:.3f}m test passed; "
-                            f"grip={gripper:.3f} range={spread:.3f} over "
-                            f"{span:.2f}s; top shelf has no overhead board, "
-                            "continuing full lift")
                         self.set_selected_arm_target(
                             self.sphere_lift_arm_joints)
-                        self.set_state(STATE_LIFT)
                     else:
-                        # Keep only the 10 mm capture test.  A complete middle
-                        # lift before retreat can strike the shelf above; pull
-                        # out at the verified trial height, then let the outer
-                        # flow restore the transport height after clearance.
-                        self.des_slide = self.sphere_trial_slide
-                        self.set_selected_arm_target(
-                            self.sphere_retreat_arm_joints)
-                        self.get_logger().info(
-                            f"[sphere-trial-lift] "
-                            f"{SPHERE_TRIAL_LIFT_M:.3f}m capture test passed; "
-                            f"grip={gripper:.3f} range={spread:.3f} over "
-                            f"{span:.2f}s; retracting before full height "
-                            "restoration")
-                        self.set_state(STATE_RETREAT)
+                        # Middle-layer geometry remains fixed in the arm while
+                        # the layer motion raises the slide.
+                        self.des_slide = self.sphere_lift_slide
+                    self.set_state(STATE_LIFT)
             if (self.state == STATE_TRIAL_LIFT
                     and trial_elapsed >= SPHERE_TRIAL_LIFT_TIMEOUT_S):
                 self.get_logger().error(
