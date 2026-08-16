@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+from pathlib import Path
 from typing import Any, Iterable
 
 
@@ -42,6 +43,38 @@ PRODUCT_CENTER_ABOVE_MARKER_M = {
     "pingguo": 0.034,
     "chengzi": 0.036,
 }
+
+# 货架 marker 是固定场景件（不随商品随机化移动），每个 ID 的世界 Z 已知。
+# 关联时用固定 Z 做"层一致性"校验：marker 固定 Z + 货物中心高 必须与
+# YOLO 深度 Z 接近（层间相距 0.35m，0.20 容差可容忍深度偏差又不会跨层）。
+# 这样下层货物不会配到顶层 marker，同时不受 marker 实测 Z 噪声影响。
+MARKER_Z_CONSISTENCY_TOLERANCE_M = 0.20
+_FIXED_MARKER_Z: dict[int, float] | None = None
+
+
+def fixed_marker_z(marker_id: int) -> float | None:
+    """Return the static world Z of an ArUco marker from the fixed layout."""
+    global _FIXED_MARKER_Z
+    if _FIXED_MARKER_Z is None:
+        _FIXED_MARKER_Z = {}
+        try:
+            layout = json.loads(
+                Path(__file__).with_name(
+                    "retail_competition_layout.json").read_text())
+        except (OSError, ValueError):
+            return None
+        for slot in layout:
+            try:
+                marker_id_key = int(slot["aruco_id"])
+                level = str(slot["level"])
+                z = {
+                    "L1": 0.500, "L2": 0.852, "L3": 1.190,
+                }.get(level)
+                if z is not None:
+                    _FIXED_MARKER_Z[marker_id_key] = z
+            except (KeyError, TypeError, ValueError):
+                continue
+    return _FIXED_MARKER_Z.get(int(marker_id))
 
 
 class TaskMessageError(ValueError):
@@ -186,11 +219,22 @@ def marker_arguments(marker_ids: Iterable[int]) -> list[str]:
 
 
 def associate_detection_marker(
-        detection: dict[str, Any], markers: Iterable[dict[str, Any]]) -> dict | None:
+        detection: dict[str, Any], markers: Iterable[dict[str, Any]],
+        z_tolerance: float = MARKER_Z_CONSISTENCY_TOLERANCE_M,
+        planar_tolerance: float = 0.20,
+        prefer_measured_marker_z: bool = False) -> dict | None:
     """Associate one YOLO box with the shelf marker directly below it.
 
     Only public image geometry and measured world coordinates are used.  No
     fixed marker-to-product layout is consulted.
+
+    ``z_tolerance`` / ``planar_tolerance`` relax the world-coordinate gates for
+    consumers (e.g. the memory-matrix tracker) whose YOLO depth is noisier than
+    the formal alignment pipeline; the defaults keep the original behaviour.
+
+    ``prefer_measured_marker_z``: 布局表里部分 marker ID 与仿真实际摆放错位，
+    固定 z 会给出错误的高度一致性校验。设为 True 时改用 marker 实测世界
+    高度（位置准确），配合收紧的 z_tolerance 能拒绝跨层/邻列的错误关联。
     """
     try:
         x0, y0, x1, y1 = map(float, detection["bbox_xyxy"])
@@ -221,11 +265,19 @@ def associate_detection_marker(
         if marker_x < x0 - horizontal_margin or marker_x > x1 + horizontal_margin:
             continue
         if detection_world is not None and product_height is not None:
-            if abs(marker_world[2] + product_height - detection_world[2]) > 0.16:
+            if prefer_measured_marker_z:
+                marker_z_use = float(marker_world[2])
+            else:
+                marker_z_use = (
+                    fixed_marker_z(marker_id)
+                    if fixed_marker_z(marker_id) is not None
+                    else float(marker_world[2]))
+            if (abs(marker_z_use + product_height - detection_world[2])
+                    > z_tolerance):
                 continue
             planar = ((marker_world[0] - detection_world[0]) ** 2
                       + (marker_world[1] - detection_world[1]) ** 2) ** 0.5
-            if planar > 0.20:
+            if planar > planar_tolerance:
                 continue
         distance = ((marker_x - centre_x) ** 2 + (marker_y - y1) ** 2) ** 0.5
         candidates.append((distance, marker_id, marker))

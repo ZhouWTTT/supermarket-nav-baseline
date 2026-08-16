@@ -17,7 +17,7 @@ docker run --rm -dit \
   -e ROS_DOMAIN_ID=99 \
   -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
   -v "$(pwd):/workspace/baseline:ro" \
-  supermarket_sorting:client
+  crpi-1pzq998p9m7w0auy.cn-hangzhou.personal.cr.aliyuncs.com/challengecup/supermarket_sorting_final:client
 
 docker exec -it supermarket_sorting_client \
   bash -lc 'cd /workspace/baseline && ./scripts/run_baseline.sh'
@@ -38,22 +38,6 @@ The entry script supports these optional environment variables:
 Runtime summaries are written below `/tmp/supermarket_competition/<run_prefix>`
 inside the Client container.  The formal path never enables fixed-layout or
 ground-truth diagnostic options.
-
-## Run log files
-
-每个入口（连续客户端、正式 runner、单订单 worker、shelf_pick 调试脚本）启动时
-都会把进程的全部 stdout/stderr（含 rclpy/ROS 日志）同时写控制台和带时间戳的
-日志文件，默认落在仓库 `logs/` 目录：
-
-- `logs/gui_client_continuous_<时间戳>.log`  — GUI/连续多单客户端
-- `logs/competition_runner_<时间戳>.log`      — 正式比赛入口
-- `logs/worker_<时间戳>.log`                  — 每单 worker（正式入口的子进程）
-- `logs/shelf_pick_<时间戳>.log`              — 单货物抓取调试脚本
-
-可用环境变量控制：
-
-- `SUPERMARKET_LOG_DIR=/path`：日志目录（默认仓库 `logs/`，不可写时回退 `/tmp`）
-- `SUPERMARKET_RUN_LOG=0`：关闭日志落盘
 
 ## GUI launcher
 

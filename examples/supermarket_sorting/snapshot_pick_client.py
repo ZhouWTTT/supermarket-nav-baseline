@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
-"""Continuous multi-order supermarket sorting client.
+"""正式行走录入 + 记忆矩阵直达的连续多单超市分拣客户端（复制自正式 client）。
 
-整合 ``integrated_nav_pick_place.py`` 的单货物抓取流程，连续处理一批随机生成、
-不重复的货物订单（默认 5 单）：
+正式流程（continuous_goods_client.py）的复制版，只在前面增加"逐架行走录入"
+阶段，不改动任何原有抓取/导航/放置逻辑：
 
-    抓货区抓取 -> 导航到终点 -> 抬升释放（把手臂抬高到上层货架抓取高度，
-    伸长手臂后松爪） -> 收臂倒车离开 -> 导航返回抓货区 -> 开始下一个订单
+    阶段一（--record-first，默认开启）：
+        完全按照正式版的行走流程：导航器逐架走到每个货架前的标准扫描站点
+        （SCAN_X × SCAN_Y=2.475），用正式扫描位姿（7 个视角）在近距录入
+        该架全部商品，E→D→C→B→A 走完一遍，写入 3×15 记忆矩阵
+        logs/memory_matrix.json。近距录入保证层高（L1/L2/L3）判断准确，
+        也不走快照位的远距离两段式通道（省掉不必要的距离调整/旋转）；
+    阶段二：
+        连续处理订单列表，每单先查记忆矩阵：命中则用 scan hint 直达该货架/
+        该层做局部定位（避免整排货架扫描），未命中才回退全量扫描。
+
+抓取阶段沿用原流程（与 continuous_goods_client 完全一致）：
+
+    抓货区抓取 -> 导航到终点 -> 抬升释放 -> 收臂倒车离开 ->
+    导航返回抓货区 -> 开始下一个订单
 
 防死锁设计：
   * 每次卸货后强制导航回到抓货区才进入下一单，绝不在终点停住；
@@ -17,10 +29,10 @@
     流程/中止把整个客户端杀掉；
   * 卸货后先倒车一小段再返回，避免刚扔下的货物挡住激光并触发安全急停。
 
-用法（与 integrated_nav_pick_place.py 相同的容器环境）::
+用法（与 continuous_goods_client.py 相同的容器环境）::
 
-    python3 examples/supermarket_sorting/continuous_goods_client.py \
-        --orders-count 5 --seed 11 --max-scan-cycles 2
+    python3 examples/supermarket_sorting/snapshot_pick_client.py \
+        --orders-count 5 --seed 11 --record-first --max-scan-cycles 2
 
 也可用 ``--orders kele,maidong,...`` 指定订单列表（不能重复）。
 """
@@ -60,6 +72,250 @@ from supermarket_navigation import DELIVERY_APPROACH  # noqa: E402
 # ---------------------------------------------------------------------------
 ALL_GOODS_KINDS = sorted(pick.PRODUCT_CENTER_ABOVE_MARKER_M.keys())
 DEFAULT_ORDERS_COUNT = 5
+# 已完成多帧确认且在该距离内观察到的候选，即使置信度略低于常规阈值，
+# 也允许作为一次近处局部核验目标。导航仍只使用货架+层，不使用列。
+MEMORY_CLOSE_OBSERVATION_M = 1.35
+MEMORY_CLOSE_CONFIDENCE_MIN = 0.70
+# 行进中发现更近的可靠货架时，至少节省这些路程才改道；每单最多一次。
+MEMORY_REROUTE_SAVING_M = 0.30
+
+
+def _shelf_for_scan_x(world_x: float) -> str:
+    """把扫描站 x 归一到货架字母。"""
+    return min(
+        SHELF_SCAN_X,
+        key=lambda shelf: abs(SHELF_SCAN_X[shelf] - float(world_x)))
+
+
+def _memory_candidate_allowed(
+        candidate: dict, excluded_slots=(), excluded_shelves=(),
+        excluded_shelf_levels=(),
+        min_last_seen: float | None = None) -> bool:
+    """应用记忆候选的槽位、货架、层和新鲜度门槛。"""
+    if str(candidate.get("slot_key", "")) in set(excluded_slots or ()):
+        return False
+    shelf = str(candidate.get("shelf", ""))
+    level = str(candidate.get("level", ""))
+    if shelf in set(excluded_shelves or ()):
+        return False
+    if (shelf, level) in set(excluded_shelf_levels or ()):
+        return False
+    if min_last_seen is not None:
+        try:
+            last_seen = float(candidate.get("last_seen", 0.0))
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(last_seen) or last_seen < float(min_last_seen):
+            return False
+    return True
+
+
+def _select_memory_hint(
+        candidates, base_xy, conf_threshold: float,
+        exclude_slots=(), exclude_shelves=(), exclude_shelf_levels=(),
+        min_last_seen: float | None = None,
+        reliable_only: bool = False):
+    """从 GUI 主候选中选择货架+层提示，返回选择细节。
+
+    可靠候选按机器人当前行程最近优先；只有没有可靠候选且允许兜底时，
+    才按置信度选择。独立成纯函数，便于用实跑矩阵回放导航决策。
+    """
+    if base_xy is None:
+        base_xy = (float("nan"), float("nan"))
+
+    def dist_to(x: float) -> float:
+        try:
+            dx = float(base_xy[0]) - x
+            dy = float(base_xy[1]) - pick.SCAN_Y
+        except (TypeError, ValueError, IndexError):
+            return float("inf")
+        distance = math.hypot(dx, dy)
+        return distance if math.isfinite(distance) else float("inf")
+
+    best = None
+    nearest = None
+    for candidate in candidates:
+        if not _memory_candidate_allowed(
+                candidate, exclude_slots, exclude_shelves,
+                exclude_shelf_levels, min_last_seen):
+            continue
+        shelf = str(candidate.get("shelf", ""))
+        level = str(candidate.get("level", ""))
+        x = SHELF_SCAN_X.get(shelf)
+        z = LEVEL_MARKER_Z.get(level)
+        if x is None or z is None:
+            continue
+        confidence = float(candidate.get("confidence", 0.0))
+        observed_distance = candidate.get("closest_distance")
+        try:
+            observed_distance = float(observed_distance)
+        except (TypeError, ValueError):
+            observed_distance = float("inf")
+        travel = dist_to(x)
+        item = {
+            "x": x,
+            "z": z,
+            "shelf": shelf,
+            "level": level,
+            "slot_key": str(candidate.get("slot_key", "")),
+            "confidence": confidence,
+            "observed_distance": observed_distance,
+            "travel": travel,
+            "close_relaxed": False,
+            "reliable": False,
+        }
+        fallback_key = (-confidence, observed_distance, travel, x, z)
+        if best is None or fallback_key < best[0]:
+            best = (fallback_key, item)
+        close_reliable = (
+            observed_distance <= MEMORY_CLOSE_OBSERVATION_M
+            and confidence >= MEMORY_CLOSE_CONFIDENCE_MIN)
+        if confidence >= conf_threshold or close_reliable:
+            item = dict(item)
+            item["close_relaxed"] = (
+                close_reliable and confidence < conf_threshold)
+            item["reliable"] = True
+            reliable_key = (travel, observed_distance, -confidence, x, z)
+            if nearest is None or reliable_key < nearest[0]:
+                nearest = (reliable_key, item)
+    if nearest is not None:
+        return nearest[1]
+    if reliable_only or best is None:
+        return None
+    return best[1]
+
+
+def _update_memory_scan_progress(controller) -> str | None:
+    """记录本单已经完整扫完并离开的货架。
+
+    控制器在同一货架的摄像头位姿之间也会反复进入 GO_SCAN，
+    因此只有扫描站 x 真正变化时才标记上一架已扫完。
+    """
+    if controller.scan_station_order is None:
+        return None
+    current_x = float(controller.current_scan_station_x())
+    previous_x = getattr(controller, "memory_last_scan_station_x", None)
+    if previous_x is None:
+        controller.memory_last_scan_station_x = current_x
+        return None
+    if abs(current_x - float(previous_x)) <= 0.40:
+        return None
+    shelf = _shelf_for_scan_x(float(previous_x))
+    controller.memory_exhausted_shelves.add(shelf)
+    controller.memory_last_scan_station_x = current_x
+    controller.get_logger().info(
+        f"[memory] shelf {shelf} fully scanned without localisation; "
+        "suppressing dynamic revisit for this order")
+    return shelf
+
+
+def _consume_grabbed_memory(controller, matrix_tracker) -> bool:
+    """幂等地把刚确认离架的货物从矩阵中立即标为已取走。"""
+    if getattr(controller, "memory_consumed", False):
+        return False
+    slot = controller.target_slot()
+    if slot is not None:
+        matrix_tracker.consume_slot(
+            *slot, kind=controller.target_kind)
+        controller.memory_consumed = True
+        controller.get_logger().info(
+            f"[memory] immediate post-grasp consume kind="
+            f"{controller.target_kind} slot={slot}")
+        return True
+    if controller.target_marker_id is not None:
+        # 兼容旧目标；不参与矩阵导航或抓取调整逻辑。
+        matrix_tracker.consume(controller.target_marker_id)
+        controller.memory_consumed = True
+        return True
+    return False
+
+
+class FormalWalkRecorder(integrated.IntegratedNavPickPlace):
+    """正式行走式录入：按正式流程逐架走到货架前标准站点录入全部商品。
+
+    复用正式 client 的导航器 drive_to（不走远距离两段式通道），站点和扫描
+    位姿都用正式常量（SCAN_X / SCAN_Y=2.475 / SCAN_CAMERA_POSES），只在
+    关联/补拍/位置回退上保持"只记录不抓取"，感知全程常开。
+    """
+
+    def __init__(self, passes: int = 1) -> None:
+        super().__init__(
+            "kele", max_scan_cycles=1,
+            tcp_diagnostic_ground_truth=False, scan_skip_lower=False,
+            nav_during_scan=True, close_recheck=False)
+        self.stations = [float(x) for x in pick.SCAN_X]
+        self.default_scan_poses = pick.SCAN_CAMERA_POSES
+        self.scan_poses = pick.SCAN_CAMERA_POSES
+        self.max_scan_cycles = max(1, int(passes))
+        self.finished = False
+        self._last_finished_station = None
+
+    def _nearest_scan_stations(self) -> list[int]:
+        """按 E→D→C→B→A 固定顺序逐架走（与正式流程的站点顺序一致）。"""
+        return list(range(len(self.stations)))
+
+    def _publish_perception_request(self, enabled, force=False):
+        """录入阶段感知全程常开：避免冷启动漏帧。"""
+        return
+
+    def current_scan_station_x(self) -> float:
+        if self.scan_station_order is not None:
+            idx = self.scan_station_order[self.scan_index]
+        else:
+            idx = self.scan_index
+        return float(self.stations[idx % len(self.stations)])
+
+    def _advance_scan_pose(self) -> bool:
+        """用 len(self.stations) 支持逐架顺序推进；扫完一架进下一架。"""
+        self.scan_pose_index += 1
+        self.scan_camera_ready_since = None
+        if self.scan_pose_index >= len(self.scan_poses):
+            self.scan_pose_index = 0
+            self.scan_index += 1
+            if self.scan_index >= len(self.stations):
+                self.scan_index = 0
+                self.scan_cycles += 1
+                if self.scan_cycles >= self.max_scan_cycles:
+                    self.get_logger().info(
+                        f"[record] swept {len(self.stations)} stations "
+                        f"x {self.scan_cycles} pass(es); stopping")
+                    self.set_state(pick.STATE_ABORT)
+                    return False
+        if self.state != pick.STATE_ABORT:
+            self.set_state(pick.STATE_GO_SCAN)
+        return self.state != pick.STATE_ABORT
+
+    def try_association_locked(self) -> None:
+        """录入阶段不做目标关联/定位/抓取，只由 MemoryMatrixTracker 记录。"""
+        return
+
+    def _maybe_lock_yolo_only_target_locked(self) -> None:
+        """录入阶段不锁定目标、不抓取（记忆矩阵由 tracker 独立记录）。"""
+        return
+
+    def _start_revisit(self) -> None:
+        """跳过补拍（补拍失败会经 position-fallback 进入抓取）。"""
+        return
+
+    def _try_position_fallback(self) -> bool:
+        """禁用位置回退：它会把 YOLO 框直接定位并进入 ALIGN 抓取。"""
+        return False
+
+    def set_state(self, new_state: str) -> None:
+        if new_state == pick.STATE_ABORT:
+            # 录入按计划跑完（父级在全部站点扫完后会走到 ABORT）。
+            self.finished = True
+            self.get_logger().info(
+                "[record] 录入完成; stopping recorder")
+            return
+        super().set_state(new_state)
+
+    def tick(self) -> None:
+        super().tick()
+        if self.finished:
+            self.set_twist(0.0, 0.0)
+            self.smooth_commands()
+            self.publish_commands()
 
 
 def parse_orders_arg(text: str) -> list[str]:
@@ -171,6 +427,14 @@ class ContinuousOrderController(IntegratedNavPickPlace):
         self.order_done_at = None
         self.order_aborted = False
         self.abort_reason = None
+        # 记忆矩阵必须在抓取完成事件发生时立即消费，不能等送货并返回。
+        self.memory_consume_callback = None
+        self.memory_consumed = False
+        # 一条矩阵提示只核验对应的“货架+层”。提示层失败后由编排器
+        # 立即选择下一条矩阵证据，不在当前架自动展开七视角全扫描。
+        self.memory_active_hint = None
+        self.memory_failed_hint = None
+        self.memory_failed_hint_levels = set()
         self._abort_handled = False
         self._abort_reason = None
         self._abort_settle_t0 = 0.0
@@ -208,6 +472,28 @@ class ContinuousOrderController(IntegratedNavPickPlace):
             super().tick()   # IntegratedNavPickPlace.tick -> ShelfPickController.tick
         if self.state == pick.STATE_ABORT:
             self._handle_abort()
+
+    def _on_grab_complete(self) -> None:
+        """抓取成功后立刻同步矩阵，再开始送货阶段。"""
+        super()._on_grab_complete()
+        callback = self.memory_consume_callback
+        if callback is None or self.memory_consumed:
+            return
+        try:
+            callback(self)
+        except Exception as exc:  # 矩阵写盘失败不能让已抓货流程中断
+            self.get_logger().warn(
+                f"[memory] immediate consume failed; will retry at order "
+                f"completion: {exc}")
+
+    def _restore_full_scan_after_inventory_hint(self) -> None:
+        """把提示层失败事件交给矩阵导航，避免原地展开全架扫描。"""
+        was_active = self.inventory_scan_hint_active
+        failed_hint = self.memory_active_hint
+        super()._restore_full_scan_after_inventory_hint()
+        if was_active and failed_hint is not None:
+            self.memory_failed_hint = failed_hint
+            self.memory_active_hint = None
 
     def _handle_abort(self) -> None:
         if self._abort_handled:
@@ -762,6 +1048,23 @@ def parse_args() -> argparse.Namespace:
                         default=DROP_RETREAT_DWELL_S)
     parser.add_argument("--max-retries", type=int, default=2,
                         help="retries per order before skipping it")
+    parser.add_argument(
+        "--record-first", action="store_true",
+        help="开始抓取前先按正式行走流程逐架录入，记录记忆矩阵")
+    parser.add_argument(
+        "--record-passes", type=int, default=1,
+        help="行走录入趟数（默认 1）")
+    parser.add_argument(
+        "--record-dwell", type=float, default=1.0,
+        help="录入每扫描位姿驻留秒数（默认 1.0）")
+    parser.add_argument(
+        "--matrix-confirmations", type=int, default=2,
+        help="记忆矩阵每格最少确认帧数（默认 2，另受深度中位数 "
+             "depth_min_samples=4 约束）")
+    parser.add_argument(
+        "--memory-conf-threshold", type=float, default=0.90,
+        help="记忆矩阵常规可靠阈值；近距多帧记录可用较低置信度参与就近"
+             "核验（默认 0.90）")
     args = parser.parse_args()
     if args.orders_count < 1:
         parser.error("--orders-count must be >= 1")
@@ -775,6 +1078,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("drop dwells must be >= 0")
     if args.max_retries < 0:
         parser.error("--max-retries must be >= 0")
+    if args.record_passes < 1:
+        parser.error("--record-passes must be >= 1")
+    if args.record_dwell <= 0.0:
+        parser.error("--record-dwell must be positive")
+    if args.matrix_confirmations < 1:
+        parser.error("--matrix-confirmations must be >= 1")
+    if not 0.0 <= args.memory_conf_threshold <= 1.0:
+        parser.error("--memory-conf-threshold must be in [0, 1]")
     if args.orders:
         try:
             parse_orders_arg(args.orders)
@@ -785,7 +1096,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     from run_log import start_run_log
-    start_run_log("gui_client_continuous")
+    start_run_log("snapshot_pick_client")
     args = parse_args()
     weights = str(pathlib.Path(args.weights).expanduser().resolve())
     if not pathlib.Path(weights).is_file():
@@ -816,38 +1127,103 @@ def main() -> None:
         aruco_node = pick.ArucoDetectNode(
             "head", marker_size=pick.MARKER_SIZE_M, publish_tf=False,
             publish_result_image=True)
-        matrix_tracker = MemoryMatrixTracker(confirmations=3)
+        matrix_tracker = MemoryMatrixTracker(
+            confirmations=args.matrix_confirmations)
         nodes += [yolo_node, aruco_node, matrix_tracker]
         executor.add_node(yolo_node)
         executor.add_node(aruco_node)
         executor.add_node(matrix_tracker)
 
-        def _memory_hint_for(kind: str, exclude_slots=None):
+        def _ensure_spin():
+            nonlocal spin_thread
+            if spin_thread is None:
+                def spin_in_background():
+                    try:
+                        executor.spin()
+                    except ExternalShutdownException:
+                        pass
+
+                spin_thread = threading.Thread(
+                    target=spin_in_background, name="ros2_executor",
+                    daemon=True)
+                spin_thread.start()
+
+        # ── 阶段一：正式行走逐架录入，记录记忆矩阵 ──
+        # 每局开始时矩阵干净起步；订单阶段 tracker 常开，抓取过程中的扫描
+        # 会持续录入（"余光"模式：不专门行走，靠订单扫描逐步填矩阵）。
+        matrix_tracker.reset()
+        if args.record_first:
+            recorder = FormalWalkRecorder(passes=args.record_passes)
+            recorder.configure_local_perception(yolo_node, aruco_node)
+            yolo_node.set_enabled(True)
+            aruco_node.set_enabled(True)
+            original_dwell = pick.SCAN_DWELL_S
+            pick.SCAN_DWELL_S = float(args.record_dwell)
+            executor.add_node(recorder)
+            nodes.append(recorder)
+            recorder.get_logger().info(
+                f"[record] 正式行走录入开始: "
+                f"{len(pick.SCAN_X)} 架 x {args.record_passes} 趟, "
+                f"dwell={args.record_dwell}s (站点 SCAN_Y=2.475)")
+            _ensure_spin()
+            while rclpy.ok() and not recorder.finished:
+                time.sleep(0.005)
+            pick.SCAN_DWELL_S = original_dwell
+            executor.remove_node(recorder)
+            try:
+                nodes.remove(recorder)
+            except ValueError:
+                pass
+            recorder.destroy_node()
+            recorder.get_logger().info(
+                "[record] 行走录入完成，进入订单抓取")
+
+        def _memory_hint_for(
+                kind: str, exclude_slots=None, log_decision: bool = True,
+                exclude_shelves=None, min_last_seen: float | None = None,
+                reliable_only: bool = False,
+                exclude_shelf_levels=None):
             """从记忆矩阵里找同类且未取走、未排除的槽位作为扫描直达提示。
 
             矩阵由 YOLO + 固定货架几何写入（不含 marker），导航直达直接用
-            固定货架/层坐标。返回 (x, z) 或 None。
+            固定货架/层坐标（SHELF_SCAN_X / LEVEL_MARKER_Z）。
+
+            每个物理格可保留多个品类候选，避免一次错分类抹掉真实记录。
+            常规高置信度候选与近距离多帧候选都可参与；在可靠候选中按当前
+            行程最近优先。列只用于排除具体失败槽位，不参与导航目的地。
+
+            返回含 x/z/shelf/level 的选择结果或 None。
             """
-            excluded = set(exclude_slots or ())
-            best = None  # (conf, x, z)
-            for cell in matrix_tracker.matrix.cells.values():
-                if cell.get("kind") != kind or cell.get("consumed"):
-                    continue
-                shelf = str(cell.get("shelf", ""))
-                level = str(cell.get("level", ""))
-                column = str(cell.get("column", ""))
-                if f"{level}|{shelf}|{column}" in excluded:
-                    continue
-                x = SHELF_SCAN_X.get(shelf)
-                z = LEVEL_MARKER_Z.get(level)
-                if x is None or z is None:
-                    continue
-                confidence = float(cell.get("confidence", 0.0))
-                if best is None or confidence > best[0]:
-                    best = (confidence, x, z)
-            if best is None:
+            # 导航与 GUI 读取同一份主证据；被更近/更可靠的
+            # 其他品类覆盖的隐藏历史候选不能单独触发直达。
+            selected = _select_memory_hint(
+                matrix_tracker.matrix.primary_candidates_for(kind),
+                matrix_tracker.base_xy,
+                args.memory_conf_threshold,
+                exclude_slots=exclude_slots,
+                exclude_shelves=exclude_shelves,
+                exclude_shelf_levels=exclude_shelf_levels,
+                min_last_seen=min_last_seen,
+                reliable_only=reliable_only)
+            if selected is None:
                 return None
-            return (best[1], best[2])
+            if selected["reliable"]:
+                if log_decision:
+                    matrix_tracker.get_logger().info(
+                        f"[memory] {kind}: 可靠候选就近导航 "
+                        f"x={selected['x']:.3f} "
+                        f"travel={selected['travel']:.2f}m "
+                        f"observed={selected['observed_distance']:.2f}m "
+                        f"conf={selected['confidence']:.3f} "
+                        f"close_relaxed={int(selected['close_relaxed'])}")
+            elif log_decision:
+                matrix_tracker.get_logger().info(
+                    f"[memory] {kind}: 无可靠候选，置信度兜底 "
+                    f"x={selected['x']:.3f} "
+                    f"conf={selected['confidence']:.3f} "
+                    f"observed={selected['observed_distance']:.2f}m "
+                    f"(threshold={args.memory_conf_threshold})")
+            return selected
 
         def make_controller(
                 kind: str, index: int,
@@ -862,6 +1238,12 @@ def main() -> None:
                 close_recheck=not args.no_close_recheck)
             ctrl.order_index = index
             ctrl.order_count = len(orders)
+            ctrl.memory_rerouted = False
+            ctrl.memory_exhausted_shelves = set()
+            ctrl.memory_last_scan_station_x = None
+            ctrl.memory_consume_callback = (
+                lambda completed: _consume_grabbed_memory(
+                    completed, matrix_tracker))
             # 只有第一单从最近的 E 货架开始扫；之后每单从最西侧 A 货架开始
             ctrl.scan_prefer_west_start = index > 0
             # 重试时排除上次抓取失败的槽位 marker，让扫描去找同类商品的
@@ -879,12 +1261,19 @@ def main() -> None:
             except Exception:  # noqa: BLE001 - 记忆提示失败不影响主流程
                 hint = None
             if hint is not None:
-                _hint_x, _hint_z = hint
+                _hint_x, _hint_z = hint["x"], hint["z"]
                 ctrl.configure_inventory_scan_hint(_hint_x, _hint_z)
+                ctrl.memory_active_hint = (hint["shelf"], hint["level"])
+                ctrl.memory_last_scan_station_x = _hint_x
+                hint_z_text = (
+                    "?" if _hint_z is None else f"{_hint_z:.3f}")
                 ctrl.get_logger().info(
                     f"[memory] order {index + 1} kind={kind}: "
                     f"direct scan hint -> shelf x={_hint_x:.3f} "
-                    f"marker_z={_hint_z:.3f}")
+                    f"marker_z={hint_z_text}")
+            # last_seen 使用 time.time() 的墙钟时间。动态改道只处理
+            # 本单建立后的新观测，避免同一份旧矩阵在途中反复决策。
+            ctrl.memory_reroute_not_before = time.time()
             return ctrl
 
         def start_order(
@@ -930,21 +1319,14 @@ def main() -> None:
             f"[orders] 本批订单({len(orders)}单): " + " -> ".join(orders) +
             f"  seed={args.seed}")
 
-        def spin_in_background():
-            try:
-                executor.spin()
-            except ExternalShutdownException:
-                pass
-
-        spin_thread = threading.Thread(
-            target=spin_in_background, name="ros2_executor", daemon=True)
-        spin_thread.start()
+        _ensure_spin()
 
         results = []          # (kind, status)
         retries = {kind: 0 for kind in orders}
         failed_markers = {kind: set() for kind in orders}
         failed_slots = {kind: set() for kind in orders}
         order_idx = 0
+        last_memory_reroute_check = 0.0
 
         while rclpy.ok():
             if viewer is not None:
@@ -958,14 +1340,123 @@ def main() -> None:
                 time.sleep(0.02)
                 continue
 
+            # 矩阵提示只负责核验它记录的货架+层。该层未找到目标时，
+            # 立即切到剩余矩阵候选；不要先在当前架展开全层扫描，也不要
+            # 落入无矩阵依据的相邻货架。
+            memory_failover_applied = False
+            failed_hint = controller.memory_failed_hint
+            if (failed_hint is not None
+                    and controller.state == pick.STATE_GO_SCAN
+                    and controller.target_marker_id is None):
+                controller.memory_failed_hint = None
+                controller.memory_failed_hint_levels.add(failed_hint)
+                try:
+                    next_hint = _memory_hint_for(
+                        controller.target_kind,
+                        failed_slots[controller.target_kind],
+                        log_decision=False,
+                        exclude_shelves=(
+                            controller.memory_exhausted_shelves),
+                        exclude_shelf_levels=(
+                            controller.memory_failed_hint_levels),
+                        reliable_only=True)
+                    if next_hint is not None:
+                        hint_x, hint_z = next_hint["x"], next_hint["z"]
+                        controller.configure_inventory_scan_hint(
+                            hint_x, hint_z)
+                        controller.memory_active_hint = (
+                            next_hint["shelf"], next_hint["level"])
+                        controller.scan_station_order = None
+                        controller.scan_index = 0
+                        controller.scan_pose_index = 0
+                        controller.scan_camera_ready_since = None
+                        controller.memory_last_scan_station_x = hint_x
+                        memory_failover_applied = True
+                        controller.get_logger().info(
+                            f"[memory] hinted {failed_hint[0]}-"
+                            f"{failed_hint[1]} did not confirm "
+                            f"{controller.target_kind}; immediate matrix "
+                            f"failover -> {next_hint['shelf']}-"
+                            f"{next_hint['level']} x={hint_x:.3f}")
+                    else:
+                        controller.get_logger().info(
+                            f"[memory] hinted {failed_hint[0]}-"
+                            f"{failed_hint[1]} did not confirm "
+                            f"{controller.target_kind}; no reliable matrix "
+                            "candidate remains, resuming fallback scan")
+                except Exception as exc:
+                    matrix_tracker.get_logger().warn(
+                        f"[memory] immediate matrix failover skipped: {exc}")
+
+            # 在动态改道之前先记录完整扫描进度。例如 A 真正扫完后转去 B，
+            # 此时 A 必须立即进入本单禁止回访集合。
+            _update_memory_scan_progress(controller)
+
+            # 去目标货架途中 YOLO 仍持续更新记忆。若新出现的近距可靠记录
+            # 指向一个明显更近的货架，则本单最多改道一次；目标一旦锁定或
+            # 已进入定点扫描便不再干预。这里只改货架+层导航提示。
+            now = time.monotonic()
+            if (not memory_failover_applied
+                    and not controller.memory_rerouted
+                    and controller.state == pick.STATE_GO_SCAN
+                    and controller.target_marker_id is None
+                    and matrix_tracker.base_xy is not None
+                    and now - last_memory_reroute_check >= 0.25):
+                last_memory_reroute_check = now
+                try:
+                    refreshed_hint = _memory_hint_for(
+                        controller.target_kind,
+                        failed_slots[controller.target_kind],
+                        log_decision=False,
+                        exclude_shelves=(
+                            controller.memory_exhausted_shelves),
+                        exclude_shelf_levels=(
+                            controller.memory_failed_hint_levels),
+                        min_last_seen=(
+                            controller.memory_reroute_not_before),
+                        reliable_only=True)
+                    current_x = (
+                        float(controller.scan_preferred_x)
+                        if (controller.scan_station_order is None
+                            and controller.scan_preferred_x is not None)
+                        else controller.current_scan_station_x())
+                    if refreshed_hint is not None:
+                        hint_x = refreshed_hint["x"]
+                        hint_z = refreshed_hint["z"]
+                        current_travel = math.hypot(
+                            matrix_tracker.base_xy[0] - current_x,
+                            matrix_tracker.base_xy[1] - pick.SCAN_Y)
+                        new_travel = math.hypot(
+                            matrix_tracker.base_xy[0] - hint_x,
+                            matrix_tracker.base_xy[1] - pick.SCAN_Y)
+                        if (abs(hint_x - current_x) > 0.40
+                                and new_travel + MEMORY_REROUTE_SAVING_M
+                                < current_travel):
+                            controller.configure_inventory_scan_hint(
+                                hint_x, hint_z)
+                            controller.memory_active_hint = (
+                                refreshed_hint["shelf"],
+                                refreshed_hint["level"])
+                            controller.scan_station_order = None
+                            controller.scan_index = 0
+                            controller.scan_pose_index = 0
+                            controller.scan_camera_ready_since = None
+                            controller.memory_rerouted = True
+                            controller.memory_last_scan_station_x = hint_x
+                            controller.get_logger().info(
+                                f"[memory] dynamic reroute "
+                                f"{current_x:.3f}->{hint_x:.3f}; "
+                                f"travel {current_travel:.2f}->"
+                                f"{new_travel:.2f}m (once per order)")
+                except Exception as exc:  # 记忆改道失败不能影响抓取主流程
+                    matrix_tracker.get_logger().warn(
+                        f"[memory] dynamic reroute skipped: {exc}")
+
             if controller.order_done:
                 kind = controller.target_kind
                 results.append((kind, "done"))
-                slot = controller.target_slot()
-                if slot is not None:
-                    matrix_tracker.consume_slot(*slot)
-                elif controller.target_marker_id is not None:
-                    matrix_tracker.consume(controller.target_marker_id)
+                # 正常路径已在抓取完成事件中消费；这里仅作异常回调兜底。
+                _consume_grabbed_memory(controller, matrix_tracker)
                 controller.get_logger().info(
                     f"[orders] COMPLETE order {controller.order_index + 1}: "
                     f"{kind}")

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""超市分拣 - 连续多单抓取启动 GUI（1111 版，与主目录界面完全一致）。
+"""超市分拣 - 正式行走录入 + 记忆矩阵直达抓取启动 GUI。
 
-一键启动仿真 Server 与连续订单客户端 ``continuous_goods_client.py``：
-客户端先随机生成一批不重复的货物订单（默认 5 单），每单执行「抓货区抓取 →
-终点直接扔货 → 返回抓货区 → 下一单」，界面实时显示 Server / Client 两个
-容器的日志。
+一键启动仿真 Server 与快照优先客户端 ``snapshot_pick_client.py``：
+客户端先按正式行走流程逐架走到货架前标准站点（E→D→C→B→A）录入全部商品，
+写入 3×15 记忆矩阵（logs/memory_matrix.json），之后每单查矩阵直达对应
+货架/层做局部定位抓取，避免整排货架扫描；每单执行「抓货区抓取 → 终点直接
+扔货 → 返回抓货区 → 下一单」，界面实时显示 Server / Client 两个容器的
+日志与记忆矩阵可视化。
 
-与主目录 gui_launcher_continuous.py 完全一致，仅去掉了「镜像组」选择栏，
-固定使用官方 final 镜像（server 镜像自带代码，无需挂载）。
-挂载的是本目录（1111/supermarket-nav-baseline）。
+挂载的是当前仓库目录，固定使用官方 final 镜像。
 
 依赖：宿主机 python3 + tkinter + docker。
 """
@@ -86,7 +86,7 @@ def run_cmd(args, **kwargs):
 class LauncherApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("超市分拣 - 连续多单抓取启动器")
+        self.root.title("超市分拣 - 正式行走录入+记忆直达抓取")
         self.root.geometry("960x700")
         self.root.minsize(800, 560)
 
@@ -117,6 +117,10 @@ class LauncherApp:
         self.record_var = tk.BooleanVar(value=True)
         self.res_var = tk.StringVar(value="640x480")
         self.fps_var = tk.StringVar(value="24")
+        # 默认"余光"模式：不专门行走录入，订单抓取过程自动填记忆矩阵；
+        # 需要完整矩阵时再勾选行走录入。
+        self.snapshot_first_var = tk.BooleanVar(value=False)
+        self.snapshot_passes_var = tk.IntVar(value=1)
 
         row1 = ttk.Frame(top)
         row1.pack(fill="x")
@@ -150,6 +154,13 @@ class LauncherApp:
 
         row2b = ttk.Frame(top)
         row2b.pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(
+            row2b, text="先正式行走录入(记忆矩阵)",
+            variable=self.snapshot_first_var).pack(side="left", padx=(0, 8))
+        ttk.Label(row2b, text="录入趟数:").pack(side="left")
+        ttk.Spinbox(
+            row2b, from_=1, to=5, textvariable=self.snapshot_passes_var,
+            width=4).pack(side="left", padx=(4, 16))
         ttk.Checkbutton(
             row2b, text="自动录像",
             variable=self.record_var).pack(side="left", padx=(0, 16))
@@ -220,9 +231,11 @@ class LauncherApp:
             foreground="#0a6c0a").pack(anchor="w", pady=(6, 0))
         ttk.Label(
             top,
-            text="提示：客户端每单执行「抓货区抓取 → 终点直接扔货 → 返回抓货区」"
-                 "，送完一单后自动返回并继续下一单；订单允许重复，可手动"
-                 "增删改；每次运行自动录像到 logs/（无论正常结束还是停止）。",
+            text="提示：默认不专门扫描，订单抓取过程中 tracker 持续用 YOLO"
+                 "余光录入当前货架（首单可能仍需扫描，多单后矩阵逐步变全，"
+                 "后续订单直达）；勾选行走录入则开局先逐架录一遍完整矩阵；"
+                 "每单执行「抓货区抓取 → 终点直接扔货 → 返回抓货区」；"
+                 "订单可手动增删改；每次运行自动录像到 logs/。",
             foreground="#666666").pack(anchor="w")
 
     def _build_logs(self):
@@ -415,6 +428,11 @@ class LauncherApp:
 
     def _client_args(self) -> list[str]:
         orders = ",".join(self.orders)
+        snapshot_args = ""
+        if self.snapshot_first_var.get():
+            snapshot_args = (
+                " --record-first "
+                f"--record-passes {int(self.snapshot_passes_var.get())}")
         args = [
             "docker", "run", "--rm", "-d",
             "--name", CLIENT_NAME,
@@ -442,11 +460,12 @@ class LauncherApp:
             "cd /workspace/supermarket_sorting_task && "
             "source /opt/ros/humble/setup.bash && "
             "python3 examples/supermarket_sorting/"
-            "continuous_goods_client.py "
+            "snapshot_pick_client.py "
             f"--orders {orders} "
             f"--max-scan-cycles {int(self.cycles_var.get())}"
+            + snapshot_args
             + (" --show" if self.show_yolo_var.get() else "")
-            + " 2>&1 | tee logs/gui_client_continuous_"
+            + " 2>&1 | tee logs/gui_client_snapshot_pick_"
             + f"$(date +%H%M%S).log",
         ]
         return args
@@ -616,6 +635,43 @@ class LauncherApp:
                     text=text,
                     bg=(MATRIX_CONSUMED_COLOR if consumed
                         else KIND_COLORS.get(kind, "#DEE2E6")))
+        # YOLO-only 近似记录铺到网格：无精确记录的格子显示 "≈种类"，
+        # 新版带 approx_cols 时按站点坐标放到具体列。
+        approx = data.get("approx", {})
+        approx_cols = data.get("approx_cols", {})
+        for key, records in approx.items():
+            try:
+                level, shelf = key.split("|")
+            except ValueError:
+                continue
+            if level not in MATRIX_ROWS or shelf not in "ABCDE":
+                continue
+            col_base = MATRIX_COLS.index(f"{shelf}1")
+            kinds = sorted(records)
+            if not kinds:
+                continue
+            cols_map = approx_cols.get(key, {})
+            if cols_map:
+                for kind in kinds:
+                    column = str(cols_map.get(kind, ""))
+                    if column not in ("1", "2", "3"):
+                        continue
+                    label = self.matrix_labels[level][
+                        col_base + int(column) - 1]
+                    if str(label.cget("text")):
+                        continue  # 已有精确记录，不覆盖
+                    label.config(
+                        text="≈" + KIND_SHORT.get(kind, kind),
+                        bg=KIND_COLORS.get(kind, "#DEE2E6"))
+            else:
+                for i in range(3):
+                    label = self.matrix_labels[level][col_base + i]
+                    if str(label.cget("text")):
+                        continue
+                    kind = kinds[i % len(kinds)]
+                    label.config(
+                        text="≈" + KIND_SHORT.get(kind, kind),
+                        bg=KIND_COLORS.get(kind, "#DEE2E6"))
         try:
             updated = float(data.get("updated_at", 0.0))
             stamp = datetime.datetime.fromtimestamp(
@@ -623,7 +679,6 @@ class LauncherApp:
             self.matrix_status.config(text=f"更新于 {stamp}")
         except (TypeError, ValueError, OSError):
             self.matrix_status.config(text="已更新")
-        approx = data.get("approx", {})
         approx_parts = []
         for key, records in sorted(approx.items()):
             try:

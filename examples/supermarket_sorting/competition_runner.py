@@ -10,6 +10,7 @@ individual item fails.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -23,7 +24,7 @@ from geometry_msgs.msg import Twist
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 from competition_task import (
     CompetitionTask,
@@ -32,12 +33,15 @@ from competition_task import (
     associate_detection_marker,
     marker_arguments,
 )
+from memory_matrix import MemoryMatrixTracker
 
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
 DEFAULT_WORKER = HERE / "integrated_nav_pick_place.py"
+DEFAULT_PERCEPTION_WORKER = HERE / "persistent_perception.py"
 DEFAULT_WEIGHTS = HERE / "perception" / "checkpoints" / "best.pt"
+DELIVERY_PLACE_SLOT_COUNT = 5
 
 
 def atomic_write_json(path: Path, document: dict) -> None:
@@ -59,9 +63,17 @@ class CompetitionRunner(Node):
         self.task: CompetitionTask | None = None
         self.task_started_at: float | None = None
         self.worker: subprocess.Popen | None = None
+        self.worker_uses_external_perception = False
+        self.perception_worker: subprocess.Popen | None = None
+        self.perception_restart_after = 0.0
+        self.perception_started_at: float | None = None
+        self.perception_ready_path = Path(
+            f"/tmp/supermarket_perception_{os.getpid()}.ready")
         self.worker_started_at: float | None = None
+        self.worker_started_wall_at: str | None = None
         self.worker_result_path: Path | None = None
         self.current_order = None
+        self.worker_candidate_kinds: set[str] = set()
         self.worker_stop_reason: str | None = None
         self.worker_terminate_at: float | None = None
         self.spawned_workers = 0
@@ -71,6 +83,11 @@ class CompetitionRunner(Node):
         self.last_inventory_pair: tuple[int, int] | None = None
         self.last_inventory_yolo_stamp: int | None = None
         self.inventory: dict[int, dict] = {}
+        self.selected_inventory_entry: dict | None = None
+        self.order_first_started: dict[str, tuple[float, str]] = {}
+        self.order_active_elapsed_s: dict[str, float] = {}
+        self.order_timings: dict[str, dict] = {}
+        self.attempt_timings: list[dict] = []
 
         qos = QoSProfile(
             depth=1,
@@ -84,10 +101,16 @@ class CompetitionRunner(Node):
         self.create_subscription(
             String, "/aruco/head/detections", self._aruco_cb, 10)
         self.stop_publisher = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.perception_control_publisher = self.create_publisher(
+            Bool, "/supermarket_sorting/perception_enable", 10)
         self.create_timer(0.20, self._tick)
+        self.memory_tracker = MemoryMatrixTracker(
+            confirmations=self.args.inventory_confirmations)
         self.get_logger().info(
             "competition runner ready; waiting for transient task on "
             "/supermarket_sorting/task")
+        self._publish_perception_enabled(False)
+        self._ensure_persistent_perception()
 
     def _task_cb(self, message: String) -> None:
         try:
@@ -111,6 +134,13 @@ class CompetitionRunner(Node):
         self.spawned_workers = 0
         self.finished = False
         self.inventory.clear()
+        self.memory_tracker.reset()
+        self.selected_inventory_entry = None
+        self.worker_candidate_kinds.clear()
+        self.order_first_started.clear()
+        self.order_active_elapsed_s.clear()
+        self.order_timings.clear()
+        self.attempt_timings.clear()
         self.latest_yolo = None
         self.latest_aruco = None
         self.last_inventory_pair = None
@@ -122,6 +152,12 @@ class CompetitionRunner(Node):
         self._write_summary("accepted")
 
     def _tick(self) -> None:
+        # Never start a second detector while a local-perception worker is
+        # active.  If an external daemon dies, however, restart it immediately
+        # so the current controller can continue consuming the same topics.
+        perception_ready = False
+        if self.worker is None or self.worker_uses_external_perception:
+            perception_ready = self._ensure_persistent_perception()
         if self.finished:
             self._publish_stop()
             return
@@ -149,6 +185,14 @@ class CompetitionRunner(Node):
         if self.task is None:
             self._publish_stop()
             return
+        if (not self.args.no_persistent_perception
+                and self.perception_worker is not None
+                and not perception_ready):
+            # The model is loading in parallel with task reception.  Do not
+            # start a duplicate local detector; the exact readiness sentinel
+            # normally appears within a few seconds.
+            self._publish_stop()
+            return
         if match_expired:
             self.get_logger().error("match soft deadline reached; stopping safely")
             self._finish_match("match_timeout")
@@ -162,16 +206,30 @@ class CompetitionRunner(Node):
 
     def _start_worker(self, order) -> None:
         assert self.task is not None
+        self._publish_perception_enabled(False)
+        # Slots are consumed only by successful deliveries.  A failed attempt
+        # therefore retries the same slot instead of leaving an empty gap on
+        # the table.
+        place_slot = sum(
+            item.status == "delivered" for item in self.task.orders)
+        if place_slot >= DELIVERY_PLACE_SLOT_COUNT:
+            self.get_logger().error(
+                "delivery placement slots exhausted; refusing to stack "
+                f"another order on slot {DELIVERY_PLACE_SLOT_COUNT - 1}")
+            self._finish_match("placement_slots_exhausted")
+            return
         run_dir = (
             Path(self.args.runtime_dir)
             / safe_component(self.task.run_prefix))
         run_dir.mkdir(parents=True, exist_ok=True)
         result_path = run_dir / (
-            f"order_{order.source_index + 1:02d}_attempt_"
+            f"worker_{self.spawned_workers + 1:02d}_dispatch_"
+            f"{order.source_index + 1:02d}_attempt_"
             f"{order.attempts + 1}.json")
         if result_path.exists():
             result_path.unlink()
 
+        candidate_kinds = self._candidate_kinds_for(order)
         command = [
             sys.executable,
             str(Path(self.args.worker).resolve()),
@@ -179,27 +237,62 @@ class CompetitionRunner(Node):
             "--order-id", order.id,
             "--weights", str(Path(self.args.weights).resolve()),
             "--confidence", str(self.args.confidence),
+            "--max-inference-hz", str(self.args.inference_hz),
             "--max-scan-cycles", str(self.args.max_scan_cycles),
             "--result-file", str(result_path),
             "--formal-mode",
+            "--place-slot", str(place_slot),
         ]
-        command.extend(marker_arguments(self.task.excluded_markers(order.kind)))
+        external_perception = self._ensure_persistent_perception()
+        if external_perception:
+            command.append("--external-perception")
+        for kind in candidate_kinds[1:]:
+            command.extend(["--candidate-kind", kind])
+        excluded_markers = sorted({
+            marker_id
+            for kind in candidate_kinds
+            for marker_id in self.task.excluded_markers(kind)
+        })
+        command.extend(marker_arguments(excluded_markers))
+        scan_hint_x = None
+        scan_marker_z = None
+        if self.selected_inventory_entry is not None:
+            try:
+                position_world = self.selected_inventory_entry["position_world"]
+                scan_hint_x = float(position_world[0])
+                scan_marker_z = float(position_world[2])
+            except (KeyError, TypeError, ValueError, IndexError):
+                scan_hint_x = None
+                scan_marker_z = None
+        if scan_hint_x is not None:
+            command.extend(["--scan-start-x", str(scan_hint_x)])
+            if scan_marker_z is not None:
+                command.extend(["--scan-marker-z", str(scan_marker_z)])
         # 只有本场第一次抓货从 E 货架（最近站点）开始；之后每单从 A 货架开始
-        if self.spawned_workers > 0:
+        if self.spawned_workers > 0 and scan_hint_x is None:
             command.append("--scan-start-west")
         if self.args.show:
             command.append("--show")
 
         self.current_order = order
+        self.worker_uses_external_perception = external_perception
+        self.worker_candidate_kinds = set(candidate_kinds)
         self.spawned_workers += 1
         self.worker_result_path = result_path
         self.worker_started_at = time.monotonic()
+        self.worker_started_wall_at = self._wall_time_now()
         self.worker_stop_reason = None
         self.worker_terminate_at = None
         self.get_logger().info(
             f"starting order id={order.id} kind={order.kind} "
+            f"place_slot={place_slot + 1}/{DELIVERY_PLACE_SLOT_COUNT} "
             f"attempt={order.attempts + 1}/{self.args.max_attempts} "
-            f"excluded_markers={self.task.excluded_markers(order.kind)}")
+            f"start={self.worker_started_wall_at} "
+            f"scan_hint_x={scan_hint_x} "
+            f"scan_marker_z={scan_marker_z} "
+            f"persistent_perception={int(external_perception)} "
+            f"single_item_candidates={candidate_kinds} "
+            f"excluded_markers={excluded_markers}")
         try:
             self.worker = subprocess.Popen(
                 command,
@@ -215,8 +308,13 @@ class CompetitionRunner(Node):
                 error=f"worker_start: {exc}",
                 max_attempts=self.args.max_attempts,
             )
+            self._ensure_order_timing_started(order)
+            self._record_order_timing(order)
             self.current_order = None
+            self.worker_uses_external_perception = False
+            self.worker_candidate_kinds.clear()
             self.worker_started_at = None
+            self.worker_started_wall_at = None
             self.worker_result_path = None
             self._write_summary("worker_start_failed")
             self._publish_stop()
@@ -228,8 +326,79 @@ class CompetitionRunner(Node):
             self.worker_stop_reason = reason
             self.worker_terminate_at = time.monotonic()
             self.get_logger().error(f"stopping worker: {reason}")
+            self._publish_perception_enabled(False)
             self._publish_stop()
             self.worker.terminate()
+
+    def _ensure_persistent_perception(self) -> bool:
+        """Keep one all-class detector alive across sequential item trips."""
+        if self.args.no_persistent_perception:
+            return False
+        now = time.monotonic()
+        if self.perception_worker is not None:
+            return_code = self.perception_worker.poll()
+            if return_code is None:
+                if self.perception_ready_path.exists():
+                    return True
+                if (self.perception_started_at is not None
+                        and now - self.perception_started_at > 30.0):
+                    self.get_logger().error(
+                        "persistent perception did not become ready within "
+                        "30s; terminating it and using local perception for "
+                        "the next worker")
+                    timed_out_worker = self.perception_worker
+                    timed_out_worker.terminate()
+                    try:
+                        timed_out_worker.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        timed_out_worker.kill()
+                        timed_out_worker.wait(timeout=2.0)
+                    self.perception_worker = None
+                    self.perception_started_at = None
+                    self.perception_ready_path.unlink(missing_ok=True)
+                    self.perception_restart_after = now + 5.0
+                return False
+            self.get_logger().error(
+                "persistent perception exited unexpectedly with code="
+                f"{return_code}; scheduling restart")
+            self.perception_worker = None
+            self.perception_started_at = None
+            self.perception_ready_path.unlink(missing_ok=True)
+            self.perception_restart_after = now + 1.0
+        if now < self.perception_restart_after:
+            return False
+        command = [
+            sys.executable,
+            str(Path(self.args.perception_worker).resolve()),
+            "--weights", str(Path(self.args.weights).resolve()),
+            "--confidence", str(self.args.confidence),
+            "--device", self.args.device,
+            "--max-inference-hz", str(self.args.inference_hz),
+            "--ready-file", str(self.perception_ready_path),
+        ]
+        if self.args.show:
+            command.append("--publish-result-images")
+        self.perception_ready_path.unlink(missing_ok=True)
+        try:
+            self.perception_worker = subprocess.Popen(
+                command,
+                cwd=str(REPO_ROOT),
+                env=os.environ.copy(),
+                start_new_session=False,
+            )
+        except OSError as exc:
+            self.get_logger().error(
+                f"cannot start persistent perception: {exc}; workers will "
+                "fall back to local perception")
+            self.perception_worker = None
+            self.perception_started_at = None
+            self.perception_restart_after = now + 5.0
+            return False
+        self.perception_started_at = now
+        self.get_logger().info(
+            "started persistent all-class YOLO/ArUco perception; waiting for "
+            "the model-ready handshake")
+        return False
 
     def _read_worker_result(self) -> dict:
         if self.worker_result_path is None or not self.worker_result_path.exists():
@@ -241,22 +410,120 @@ class CompetitionRunner(Node):
             self.get_logger().error(f"cannot read worker result: {exc}")
             return {}
 
+    @staticmethod
+    def _wall_time_now() -> str:
+        """Return a local, timezone-aware timestamp for human-facing logs."""
+        return datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+    def _ensure_order_timing_started(self, order) -> None:
+        """Attach the active worker interval to the order it actually chose."""
+        started_monotonic = self.worker_started_at or time.monotonic()
+        started_wall = self.worker_started_wall_at or self._wall_time_now()
+        self.order_first_started.setdefault(
+            order.id, (started_monotonic, started_wall))
+
+    def _record_order_timing(
+            self, order, worker_result: dict | None = None) -> None:
+        """Persist one attempt and report a terminal order's total timing."""
+        ended_monotonic = time.monotonic()
+        ended_wall = self._wall_time_now()
+        started_monotonic = (
+            ended_monotonic
+            if self.worker_started_at is None
+            else self.worker_started_at)
+        started_wall = self.worker_started_wall_at or ended_wall
+        attempt_elapsed = max(0.0, ended_monotonic - started_monotonic)
+        total_active = (
+            self.order_active_elapsed_s.get(order.id, 0.0)
+            + attempt_elapsed)
+        self.order_active_elapsed_s[order.id] = total_active
+
+        attempt_record = {
+            "order_id": order.id,
+            "kind": order.kind,
+            "attempt": order.attempts,
+            "started_at": started_wall,
+            "ended_at": ended_wall,
+            "elapsed_s": round(attempt_elapsed, 3),
+            "status_after_attempt": order.status,
+        }
+        if isinstance(worker_result, dict):
+            for key in (
+                    "pick_state_elapsed_s",
+                    "flow_phase_elapsed_s",
+                    "flow_phase_distance_m"):
+                value = worker_result.get(key)
+                if isinstance(value, dict):
+                    attempt_record[key] = dict(value)
+        self.attempt_timings.append(attempt_record)
+
+        first_monotonic, first_wall = self.order_first_started.get(
+            order.id, (started_monotonic, started_wall))
+        wall_elapsed = max(0.0, ended_monotonic - first_monotonic)
+        if order.status in {"delivered", "failed"}:
+            timing = {
+                "order_id": order.id,
+                "kind": order.kind,
+                "started_at": first_wall,
+                "ended_at": ended_wall,
+                "elapsed_s": round(wall_elapsed, 3),
+                "active_elapsed_s": round(total_active, 3),
+                "last_attempt_elapsed_s": round(attempt_elapsed, 3),
+                "attempts": order.attempts,
+                "status": order.status,
+            }
+            self.order_timings[order.id] = timing
+            timing_message = (
+                f"[order-timing] COMPLETE id={order.id} kind={order.kind} "
+                f"status={order.status} start={first_wall} end={ended_wall} "
+                f"elapsed={wall_elapsed:.3f}s "
+                f"active={total_active:.3f}s attempts={order.attempts}")
+            # Keep severity call sites separate: rclpy rejects changing one
+            # cached call site's severity between invocations.
+            if order.status == "delivered":
+                self.get_logger().info(timing_message)
+            else:
+                self.get_logger().error(timing_message)
+        else:
+            self.get_logger().warn(
+                f"[order-timing] ATTEMPT id={order.id} kind={order.kind} "
+                f"attempt={order.attempts} start={started_wall} "
+                f"end={ended_wall} elapsed={attempt_elapsed:.3f}s; "
+                "order remains pending")
+
     def _finish_worker(self, return_code: int) -> None:
+        self._publish_perception_enabled(False)
         result = self._read_worker_result()
-        order = self.current_order
-        delivered = (
+        dispatch_order = self.current_order
+        order, reported_kind_valid = self._resolve_worker_order(result)
+        reported_delivered = (
             return_code == 0
             and result.get("status") == "delivered")
+        delivered = bool(
+            reported_delivered and reported_kind_valid and order is not None)
         marker_id = result.get("marker_id")
         if not isinstance(marker_id, int):
+            marker_id = None
+        if not reported_kind_valid:
+            # A malformed or out-of-scope result must not blacklist a marker
+            # under the dispatch order's (possibly different) product class.
             marker_id = None
         error = (
             self.worker_stop_reason
             or result.get("error")
             or result.get("status")
             or f"worker_exit_{return_code}")
+        if reported_delivered and not reported_kind_valid:
+            error = (
+                "worker reported a delivered kind that is not an eligible "
+                f"pending order: {result.get('kind')!r}")
 
         if self.task is not None and order is not None:
+            if dispatch_order is not None and order.id != dispatch_order.id:
+                self.get_logger().info(
+                    f"single-item worker selected visible pending order "
+                    f"id={order.id} kind={order.kind} instead of dispatch "
+                    f"id={dispatch_order.id} kind={dispatch_order.kind}")
             self.task.finish_attempt(
                 order,
                 delivered=delivered,
@@ -264,20 +531,91 @@ class CompetitionRunner(Node):
                 error=None if delivered else str(error),
                 max_attempts=self.args.max_attempts,
             )
-            level = self.get_logger().info if delivered else self.get_logger().error
-            level(
+            if delivered and marker_id is not None:
+                self.memory_tracker.consume(marker_id)
+            self._ensure_order_timing_started(order)
+            self._record_order_timing(order, result)
+            summary = (
                 f"order id={order.id} kind={order.kind} "
                 f"status={order.status} marker={marker_id} "
                 f"attempts={order.attempts}")
+            # 注意: rclpy 按"调用点"缓存日志严重级别, 同一行不能在不同调用间
+            # 切换 info/error, 否则抛 "Logger severity cannot be changed"。
+            # 拆成两个调用点即可各自独立缓存。
+            if delivered:
+                self.get_logger().info(summary)
+            else:
+                self.get_logger().error(summary)
+            match_elapsed = (
+                0.0 if self.task_started_at is None
+                else max(0.0, time.monotonic() - self.task_started_at))
+            pending_count = sum(
+                item.status == "pending" for item in self.task.orders)
+            remaining_budget = self.args.target_time - match_elapsed
+            allowance = (
+                0.0 if pending_count == 0
+                else remaining_budget / pending_count)
+            self.get_logger().info(
+                f"[time-budget] elapsed={match_elapsed:.3f}s "
+                f"target={self.args.target_time:.1f}s "
+                f"remaining={remaining_budget:.3f}s "
+                f"pending={pending_count} "
+                f"allowance_per_pending={allowance:.3f}s")
             self._write_summary("worker_finished")
 
         self.worker = None
         self.worker_started_at = None
+        self.worker_started_wall_at = None
         self.worker_result_path = None
         self.current_order = None
+        self.worker_uses_external_perception = False
+        self.worker_candidate_kinds.clear()
         self.worker_stop_reason = None
         self.worker_terminate_at = None
         self._publish_stop()
+
+    def _resolve_worker_order(self, result: dict):
+        """Map a worker's committed class to one eligible pending order."""
+        dispatch_order = self.current_order
+        if self.task is None or dispatch_order is None:
+            return dispatch_order, False
+        kind = result.get("kind")
+        if (not isinstance(kind, str)
+                or kind not in self.worker_candidate_kinds):
+            return dispatch_order, False
+        candidates = [
+            order for order in self.task.orders
+            if order.status == "pending"
+            and order.attempts < self.args.max_attempts
+            and order.kind == kind
+        ]
+        if not candidates:
+            return dispatch_order, False
+        if dispatch_order in candidates:
+            return dispatch_order, True
+        return min(
+            candidates,
+            key=lambda order: (order.attempts, order.source_index)), True
+
+    def _candidate_kinds_for(self, dispatch_order) -> list[str]:
+        """Return pending classes in deterministic single-trip priority order."""
+        assert self.task is not None
+        eligible = [
+            order for order in self.task.orders
+            if order.status == "pending"
+            and order.attempts < self.args.max_attempts
+        ]
+        eligible.sort(key=lambda order: (
+            order.id != dispatch_order.id,
+            order.attempts,
+            GRASP_COST.get(order.kind, 10.0),
+            order.source_index,
+        ))
+        kinds = []
+        for order in eligible:
+            if order.kind not in kinds:
+                kinds.append(order.kind)
+        return kinds
 
     def _write_summary(self, reason: str) -> None:
         if self.task is None:
@@ -287,9 +625,18 @@ class CompetitionRunner(Node):
         document["inventory"] = [
             dict(entry) for _, entry in sorted(self.inventory.items())
         ]
+        document["order_timings"] = [
+            dict(record) for record in self.order_timings.values()
+        ]
+        document["attempt_timings"] = [
+            dict(record) for record in self.attempt_timings
+        ]
         if self.task_started_at is not None:
-            document["elapsed_s"] = round(
-                time.monotonic() - self.task_started_at, 3)
+            elapsed = max(0.0, time.monotonic() - self.task_started_at)
+            document["elapsed_s"] = round(elapsed, 3)
+            document["target_time_s"] = self.args.target_time
+            document["remaining_to_target_s"] = round(
+                self.args.target_time - elapsed, 3)
         summary_path = (
             Path(self.args.summary_file)
             if self.args.summary_file else
@@ -300,18 +647,30 @@ class CompetitionRunner(Node):
 
     def _finish_match(self, reason: str) -> None:
         self.finished = True
+        self._publish_perception_enabled(False)
         self._publish_stop()
         self._write_summary(reason)
         summary = self.task.summary() if self.task is not None else {}
+        elapsed = (
+            0.0 if self.task_started_at is None
+            else max(0.0, time.monotonic() - self.task_started_at))
         self.get_logger().info(
             f"match finished reason={reason} "
             f"delivered={summary.get('delivered', 0)}/"
-            f"{summary.get('count', 0)} failed={summary.get('failed', 0)}")
-        rclpy.shutdown()
+            f"{summary.get('count', 0)} failed={summary.get('failed', 0)} "
+            f"elapsed={elapsed:.3f}s target={self.args.target_time:.1f}s "
+            f"within_target={int(elapsed <= self.args.target_time)}")
 
     def _publish_stop(self) -> None:
         try:
             self.stop_publisher.publish(Twist())
+        except Exception:  # noqa: BLE001 - ROS context may already be closed
+            pass
+
+    def _publish_perception_enabled(self, enabled: bool) -> None:
+        try:
+            self.perception_control_publisher.publish(
+                Bool(data=bool(enabled)))
         except Exception:  # noqa: BLE001 - ROS context may already be closed
             pass
 
@@ -399,6 +758,7 @@ class CompetitionRunner(Node):
 
     def _select_order(self):
         assert self.task is not None
+        self.selected_inventory_entry = None
         candidates = [
             order for order in self.task.orders
             if order.status == "pending"
@@ -443,10 +803,13 @@ class CompetitionRunner(Node):
                 (order.attempts, entry is None, distance,
                  GRASP_COST.get(order.kind, 10.0), order.source_index),
                 order, entry))
-        _, order, _entry = min(ranked, key=lambda item: item[0])
+        _, order, entry = min(ranked, key=lambda item: item[0])
+        self.selected_inventory_entry = (
+            None if entry is None else dict(entry))
         return order
 
     def stop(self) -> None:
+        self._publish_perception_enabled(False)
         self._publish_stop()
         if self.worker is not None and self.worker.poll() is None:
             self.worker.terminate()
@@ -455,14 +818,34 @@ class CompetitionRunner(Node):
             except subprocess.TimeoutExpired:
                 self.worker.kill()
                 self.worker.wait(timeout=2.0)
+        if (self.perception_worker is not None
+                and self.perception_worker.poll() is None):
+            self.perception_worker.terminate()
+            try:
+                self.perception_worker.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                self.perception_worker.kill()
+                self.perception_worker.wait(timeout=2.0)
+        self.perception_ready_path.unlink(missing_ok=True)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="formal supermarket multi-order task runner")
     parser.add_argument("--worker", default=str(DEFAULT_WORKER))
+    parser.add_argument(
+        "--perception-worker", default=str(DEFAULT_PERCEPTION_WORKER))
     parser.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
+    parser.add_argument(
+        "--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument(
+        "--no-persistent-perception", action="store_true",
+        help="load YOLO/ArUco inside every order worker instead of reusing one "
+             "runner-owned detector process")
     parser.add_argument("--confidence", type=float, default=0.45)
+    parser.add_argument(
+        "--inference-hz", type=float, default=12.0,
+        help="maximum YOLO source-frame rate during active scan states")
     parser.add_argument("--max-scan-cycles", type=int, default=2)
     parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--inventory-confirmations", type=int, default=3)
@@ -470,16 +853,25 @@ def parse_args() -> argparse.Namespace:
         "--order-timeout", type=float, default=0.0,
         help="per-order timeout in seconds; 0 disables it")
     parser.add_argument("--match-timeout", type=float, default=570.0)
+    parser.add_argument(
+        "--target-time", type=float, default=400.0,
+        help="performance target reported in summaries; does not stop motion")
     parser.add_argument("--runtime-dir", default="/tmp/supermarket_competition")
     parser.add_argument("--summary-file")
     parser.add_argument("--show", action="store_true")
     args = parser.parse_args()
     if not Path(args.worker).is_file():
         parser.error(f"worker not found: {args.worker}")
+    if (not args.no_persistent_perception
+            and not Path(args.perception_worker).is_file()):
+        parser.error(
+            f"perception worker not found: {args.perception_worker}")
     if not Path(args.weights).is_file():
         parser.error(f"weights not found: {args.weights}")
     if not 0.0 <= args.confidence <= 1.0:
         parser.error("--confidence must be in [0, 1]")
+    if not 0.0 < args.inference_hz < float("inf"):
+        parser.error("--inference-hz must be finite and positive")
     if (args.max_scan_cycles < 1 or args.max_attempts < 1
             or args.inventory_confirmations < 1):
         parser.error("scan cycles, attempts, and confirmations must be >= 1")
@@ -487,6 +879,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--order-timeout must be >= 0")
     if args.match_timeout <= 0.0:
         parser.error("--match-timeout must be positive")
+    if args.target_time <= 0.0:
+        parser.error("--target-time must be positive")
     return args
 
 
@@ -497,7 +891,17 @@ def main() -> None:
     rclpy.init()
     node = CompetitionRunner(args)
     try:
-        rclpy.spin(node)
+        # Do not call rclpy.shutdown() from a timer callback.  In the official
+        # Humble image that can wait on the callback currently executing and
+        # leave both the runner and its persistent perception child alive
+        # after all orders are terminal.  Let the callback set ``finished``;
+        # the main thread then leaves spin_once and performs orderly cleanup.
+        while rclpy.ok() and not node.finished:
+            rclpy.spin_once(node, timeout_sec=0.20)
+            if node.memory_tracker is not None:
+                rclpy.spin_once(
+                    node.memory_tracker, timeout_sec=0.01)
+                node.memory_tracker.tick_write()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
