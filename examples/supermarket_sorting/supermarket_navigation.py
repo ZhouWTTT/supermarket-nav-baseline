@@ -36,6 +36,10 @@ START_POSE = (1.92, -3.17, math.pi / 2.0)
 # Staying just north of that keeps the goal reachable by A* while maximising
 # proximity to the table surface.
 DELIVERY_APPROACH = (-1.80, -2.60, -math.pi / 2.0)
+# Canonical endpoints of the reusable obstacle-corridor trunk.  Per-shelf and
+# per-table-slot connectors are intentionally excluded from path memory.
+DELIVERY_TRUNK_ENTRY = (-0.70, 1.45, -math.pi / 2.0)
+DELIVERY_TRUNK_EXIT = (-1.94, -2.40, -math.pi / 2.0)
 
 # Delivery-table geometry copied from ``mjcf/retail_competition.xml``.  The
 # second rectangle is deliberately 3 cm larger on every side so navigation
@@ -1762,7 +1766,11 @@ class SupermarketNavigator:
         self._suppress_path_memory_save = False
         self._cached_path_active = False
         self._cached_path_info = {"enabled": False, "cache_hit": False}
+        self._cached_start_offset_limit = None
         self._cached_goal_offset_limit = None
+        self._goal_use_path_memory = True
+        self._lock_cached_path = False
+        self._cache_restore_attempted = False
         self.path_memory = PathMemory(
             enabled=os.environ.get("SUPERMARKET_PATH_MEMORY", "0") == "1",
             storage_path=os.environ.get(
@@ -1775,7 +1783,9 @@ class SupermarketNavigator:
             "cache_hit": False,
         }
 
-    def set_goal(self, x, y, yaw=None, cached_goal_offset_limit=None):
+    def set_goal(self, x, y, yaw=None, cached_start_offset_limit=None,
+                 cached_goal_offset_limit=None, use_path_memory=True,
+                 lock_cached_path=False):
         self.controller.set_goal(x, y, yaw)
         self._reached = False
         self._goal = (float(x), float(y), None if yaw is None else float(yaw))
@@ -1783,14 +1793,25 @@ class SupermarketNavigator:
         self._goal_path_snapshot = None
         self._suppress_path_memory_save = False
         self._cached_path_active = False
+        self._cached_start_offset_limit = (
+            None if cached_start_offset_limit is None
+            else max(0.0, float(cached_start_offset_limit)))
         self._cached_goal_offset_limit = (
             None if cached_goal_offset_limit is None
             else max(0.0, float(cached_goal_offset_limit)))
+        self._goal_use_path_memory = bool(use_path_memory)
+        self._lock_cached_path = bool(lock_cached_path)
+        self._cache_restore_attempted = False
         self._cached_path_info = {"enabled": self.path_memory.enabled, "cache_hit": False}
 
     def _try_restore_cached_path(self, base_x, base_y, base_yaw, now):
-        if not self.path_memory.enabled or self._goal is None or self.controller.path:
+        if (not self.path_memory.enabled
+                or not self._goal_use_path_memory
+                or self._cache_restore_attempted
+                or self._goal is None
+                or self.controller.path):
             return
+        self._cache_restore_attempted = True
         path, info = self.path_memory.load_path(
             start_x=base_x,
             start_y=base_y,
@@ -1799,6 +1820,15 @@ class SupermarketNavigator:
             goal_y=self._goal[1],
             goal_yaw=self._goal[2],
         )
+        if (path
+                and self._cached_start_offset_limit is not None
+                and info.get("reason") == "nearby_match"
+                and float(info.get("start_delta_m", float("inf")))
+                > self._cached_start_offset_limit):
+            info["cache_hit"] = False
+            info["reason"] = "nearby_start_offset"
+            info["start_offset_limit_m"] = self._cached_start_offset_limit
+            path = None
         if (path
                 and self._cached_goal_offset_limit is not None
                 and info.get("reason") == "nearby_match"
@@ -1812,11 +1842,15 @@ class SupermarketNavigator:
         if path:
             self.controller._install_path(path)
             self.controller._last_replan_time = float(now)
-            self.controller._replan_hold_until = float(now) + 2.0
+            self.controller._replan_hold_until = (
+                float("inf") if self._lock_cached_path
+                else float(now) + 2.0)
             self._cached_path_active = True
 
     def _save_successful_path(self, base_x, base_y, base_yaw):
-        if (not self.path_memory.enabled or self._goal is None
+        if (not self.path_memory.enabled
+                or not self._goal_use_path_memory
+                or self._goal is None
                 or not self.controller.path
                 or self._suppress_path_memory_save):
             return
@@ -1880,12 +1914,8 @@ class SupermarketNavigator:
                     "lateral_escape_replan",
                     "rotation_loop",
                 }):
-            self._cached_path_active = False
-            self._cached_path_info["cached_path_invalidated"] = True
-            self._cached_path_info["invalidation_reason"] = (
-                self.controller.stop_reason)
-            self._suppress_path_memory_save = True
-            self._goal_path_snapshot = None
+            self.invalidate_active_cached_path(
+                self.controller.stop_reason, now=current_now)
 
         if self._goal is not None and self._goal_path_snapshot is None and self.controller.path:
             # Keep the first full path produced for this goal.  Near-goal
@@ -1914,4 +1944,70 @@ class SupermarketNavigator:
         status = self.path_memory.summary()
         status.update(self._cached_path_info)
         status["cached_path_active"] = self._cached_path_active
+        status["goal_uses_path_memory"] = self._goal_use_path_memory
+        status["cached_path_locked"] = bool(
+            self._cached_path_active and self._lock_cached_path)
         return status
+
+    def invalidate_active_cached_path(self, reason, now=None):
+        """Discard the active cached route and its reverse partner.
+
+        This is public so the composite-route supervisor can invalidate a
+        route after a leg-level stall/timeout that the local controller cannot
+        classify on its own.
+        """
+        if not self._cached_path_active:
+            return []
+        matched_key = self._cached_path_info.get(
+            "matched_key", self._cached_path_info.get("key"))
+        removed_keys = self.path_memory.invalidate_path(matched_key, reason)
+        self._cached_path_active = False
+        self._cached_path_info["cached_path_invalidated"] = True
+        self._cached_path_info["invalidation_reason"] = str(reason)
+        self._cached_path_info["invalidated_keys"] = removed_keys
+        self._suppress_path_memory_save = True
+        self._goal_path_snapshot = None
+        # Forced obstacle replanning and all normal replans are legal from
+        # this point onward; only the remembered trunk was protected.
+        current_now = time.monotonic() if now is None else float(now)
+        self.controller._replan_hold_until = current_now
+        return removed_keys
+
+    def remembered_path_available(
+            self, start_pose, goal_pose,
+            start_offset_limit=None, goal_offset_limit=None):
+        """Inspect whether a reusable route exists without changing the goal."""
+        if not self.path_memory.enabled:
+            return False, {"enabled": False, "cache_hit": False}
+        path, info = self.path_memory.load_path(
+            start_x=float(start_pose[0]),
+            start_y=float(start_pose[1]),
+            start_yaw=float(start_pose[2]),
+            goal_x=float(goal_pose[0]),
+            goal_y=float(goal_pose[1]),
+            goal_yaw=float(goal_pose[2]),
+        )
+        if (path and start_offset_limit is not None
+                and info.get("reason") == "nearby_match"
+                and float(info.get("start_delta_m", float("inf")))
+                > float(start_offset_limit)):
+            info["cache_hit"] = False
+            info["reason"] = "nearby_start_offset"
+            path = None
+        if (path and goal_offset_limit is not None
+                and info.get("reason") == "nearby_match"
+                and float(info.get("goal_delta_m", float("inf")))
+                > float(goal_offset_limit)):
+            info["cache_hit"] = False
+            info["reason"] = "nearby_goal_offset"
+            path = None
+        return bool(path), info
+
+    def recovery_exhausted(self):
+        """Whether local translational recovery has spent its full budget."""
+        ctrl = self.controller
+        return bool(
+            ctrl._reverse_recovery_attempts
+            >= ctrl._reverse_recovery_max_attempts
+            and ctrl._lateral_escape_attempts
+            >= ctrl._lateral_escape_max_attempts)

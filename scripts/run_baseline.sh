@@ -13,6 +13,8 @@ set -u
 export PYTHONPATH="${baseline_root}${PYTHONPATH:+:${PYTHONPATH}}"
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-99}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
+export SUPERMARKET_PATH_MEMORY="${SUPERMARKET_PATH_MEMORY:-1}"
+export SUPERMARKET_PATH_MEMORY_FILE="${SUPERMARKET_PATH_MEMORY_FILE:-/root/.cache/supermarket_path_memory.json}"
 
 runner=(
     python3

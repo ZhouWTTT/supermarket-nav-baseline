@@ -58,6 +58,8 @@ from sensor_msgs.msg import LaserScan  # noqa: E402
 from std_msgs.msg import Bool, String  # noqa: E402
 from supermarket_navigation import (  # noqa: E402  (baseline nav, unmodified)
     DELIVERY_APPROACH,
+    DELIVERY_TRUNK_ENTRY,
+    DELIVERY_TRUNK_EXIT,
     DELIVERY_TABLE_COSTMAP_BOUNDS,
     DELIVERY_TABLE_XML_BOUNDS,
     SupermarketNavigator,
@@ -178,6 +180,18 @@ NAV_PRECISE_HANDOFF_MARGIN_M = 0.02
 NAV_LASER_STALE_S = 0.50           # fail safe if the 12 Hz scan stops
 NAV_STATE_STALE_S = 0.50           # odom/joints must also remain live
 NAV_PROGRESS_LOG_S = 3.0
+
+# Reusable delivery trunk.  Shelf-specific and slot-specific motion remains
+# live-planned on either side of the shared navigation anchors.
+DELIVERY_TRUNK_REVERSE_START = (
+    DELIVERY_TRUNK_EXIT[0], DELIVERY_TRUNK_EXIT[1], math.pi / 2.0)
+DELIVERY_TRUNK_REVERSE_GOAL = (
+    DELIVERY_TRUNK_ENTRY[0], DELIVERY_TRUNK_ENTRY[1], math.pi / 2.0)
+DELIVERY_TRUNK_CACHE_START_TOLERANCE_M = 0.18
+DELIVERY_TRUNK_CACHE_GOAL_TOLERANCE_M = 0.12
+ROUTE_LEG_PROGRESS_M = 0.10
+ROUTE_LEG_STALL_TIMEOUT_S = 35.0
+ROUTE_LEG_HARD_TIMEOUT_S = 150.0
 
 # Keep the held product clear of the shelf before delivery navigation starts
 # turning the base.  The arms and product still protrude toward the shelf at
@@ -317,6 +331,17 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._nav_last_log = 0.0
         self._last_nav_reason = None
         self._nav_memory_logged = False
+        self._route_leg_name = None
+        self._route_leg_goal = None
+        self._route_leg_started_at = 0.0
+        self._route_leg_last_progress_at = 0.0
+        self._route_leg_best_distance = float("inf")
+        self.delivery_nav_stage = None
+        self.delivery_direct_fallback_used = False
+        self.scan_trunk_route_stage = None
+        self.scan_trunk_route_done = False
+        self.scan_direct_fallback_used = False
+        self.scan_route_final_goal = None
         self.place_stage = 0
         self.place_t0 = 0.0
         self.place_arm_joints = None
@@ -633,6 +658,208 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
     def _transit_slide_target() -> float:
         return float(TRANSIT_SLIDE_TARGET_M)
 
+    def _start_route_leg(
+            self, name: str, goal, *, use_memory: bool,
+            lock_cached_path: bool = False) -> None:
+        """Start one explicit leg of a composite shelf/delivery route."""
+        goal = tuple(float(value) for value in goal)
+        now = self.now()
+        self._route_leg_name = str(name)
+        self._route_leg_goal = goal
+        self._route_leg_started_at = now
+        self._route_leg_last_progress_at = now
+        self._route_leg_best_distance = float(np.linalg.norm(
+            np.asarray(goal[:2], dtype=float) - self.base_xy))
+        self._nav_last_log = 0.0
+        self._last_nav_reason = None
+        self._nav_memory_logged = False
+        self._nav_goal = None
+        self.nav.set_goal(
+            *goal,
+            cached_start_offset_limit=(
+                DELIVERY_TRUNK_CACHE_START_TOLERANCE_M
+                if use_memory else None),
+            cached_goal_offset_limit=(
+                DELIVERY_TRUNK_CACHE_GOAL_TOLERANCE_M
+                if use_memory else None),
+            use_path_memory=use_memory,
+            lock_cached_path=lock_cached_path)
+        self.get_logger().info(
+            f"[route] start leg={name} goal="
+            f"({goal[0]:.2f},{goal[1]:.2f},"
+            f"{math.degrees(goal[2]):.0f}deg) "
+            f"memory={int(use_memory)} lock={int(lock_cached_path)}")
+
+    def _route_leg_tick(self) -> tuple[bool, str | None]:
+        """Drive the active route leg and report a terminal failure reason."""
+        now = self.now()
+        if self._route_leg_goal is None or self._route_leg_name is None:
+            return False, "route_leg_not_configured"
+        if self._laser_stale(now):
+            self.set_twist(0.0, 0.0)
+            if now - self._laser_warn_log > 1.0:
+                self.get_logger().warn(
+                    f"[route:{self._route_leg_name}] waiting for fresh laser")
+                self._laser_warn_log = now
+            return False, None
+
+        v, w, reached = self.nav.update(
+            self.base_xy[0], self.base_xy[1], self.base_yaw,
+            laser_msg=self.laser_msg, time_now=now)
+        self.set_twist(v, w)
+        if not self._nav_memory_logged:
+            self._nav_memory_logged = True
+            self.get_logger().info(
+                f"[route:{self._route_leg_name}] path_memory="
+                + json.dumps(
+                    self.nav.path_memory_status(), ensure_ascii=False))
+
+        ctrl = self.nav.controller
+        stop_reason = ctrl.stop_reason
+        if (stop_reason is not None
+                and stop_reason != self._last_nav_reason):
+            self._last_nav_reason = stop_reason
+            self.get_logger().info(
+                f"[route:{self._route_leg_name}] stop_reason={stop_reason} "
+                f"lidar={ctrl.lidar_clearance:.2f}m "
+                f"rear={ctrl.rear_clearance:.2f}m")
+
+        distance = float(np.linalg.norm(
+            np.asarray(self._route_leg_goal[:2], dtype=float) - self.base_xy))
+        if distance + ROUTE_LEG_PROGRESS_M < self._route_leg_best_distance:
+            self._route_leg_best_distance = distance
+            self._route_leg_last_progress_at = now
+        elapsed = now - self._route_leg_started_at
+        stalled = now - self._route_leg_last_progress_at
+
+        if now - self._nav_last_log >= NAV_PROGRESS_LOG_S:
+            self._nav_last_log = now
+            self.get_logger().info(
+                f"[route:{self._route_leg_name}] "
+                f"pos=({self.base_xy[0]:.2f},{self.base_xy[1]:.2f}) "
+                f"yaw={math.degrees(self.base_yaw):.0f}deg "
+                f"dist={distance:.2f}m v={v:.2f} w={w:.2f} "
+                f"elapsed={elapsed:.1f}s stalled={stalled:.1f}s "
+                f"reached={reached}")
+
+        if reached:
+            self.set_twist(0.0, 0.0)
+            self.cmd_linear = 0.0
+            self.cmd_angular = 0.0
+            return True, None
+
+        no_path = isinstance(stop_reason, str) and (
+            stop_reason.startswith("no_path")
+            or stop_reason.startswith("stuck_no_path"))
+        recovery_exhausted = self.nav.recovery_exhausted()
+        failure = None
+        if elapsed >= ROUTE_LEG_HARD_TIMEOUT_S:
+            failure = (
+                f"hard_timeout:{elapsed:.1f}s:{stop_reason or 'moving'}")
+        elif (stalled >= ROUTE_LEG_STALL_TIMEOUT_S
+                and (no_path or recovery_exhausted)):
+            failure = (
+                f"stalled:{stalled:.1f}s:{stop_reason or 'no_progress'}:"
+                f"recovery_exhausted={int(recovery_exhausted)}")
+        if failure is not None:
+            self.nav.invalidate_active_cached_path(
+                f"route_leg:{self._route_leg_name}:{failure}", now=now)
+            return False, failure
+        return False, None
+
+    def _is_shelf_scan_transit(self, target: np.ndarray) -> bool:
+        return bool(
+            self.flow_phase == "grab"
+            and self.state == pick.STATE_GO_SCAN
+            and abs(float(target[1]) - pick.SCAN_Y) <= 0.20)
+
+    def _scan_trunk_route_tick(
+            self, target: np.ndarray, final_yaw: float) -> bool:
+        """Use the saved delivery trunk in reverse from table to shelf."""
+        final_goal = (
+            float(target[0]), float(target[1]), float(final_yaw))
+        self.scan_route_final_goal = final_goal
+        if self.scan_trunk_route_done:
+            return True
+
+        if self.scan_trunk_route_stage is None:
+            if float(self.base_xy[1]) >= DELIVERY_TRUNK_ENTRY[1] - 0.20:
+                self.scan_trunk_route_done = True
+                return True
+            reverse_available, reverse_info = (
+                self.nav.remembered_path_available(
+                    DELIVERY_TRUNK_REVERSE_START,
+                    DELIVERY_TRUNK_REVERSE_GOAL,
+                    start_offset_limit=(
+                        DELIVERY_TRUNK_CACHE_START_TOLERANCE_M),
+                    goal_offset_limit=(
+                        DELIVERY_TRUNK_CACHE_GOAL_TOLERANCE_M)))
+            if not reverse_available:
+                self.scan_trunk_route_stage = "direct_to_shelf"
+                self.get_logger().info(
+                    "[route] no reusable reverse delivery trunk; using a "
+                    "live direct route for this shelf transit; lookup="
+                    + json.dumps(reverse_info, ensure_ascii=False))
+                self._start_route_leg(
+                    "scan_direct_to_shelf", final_goal,
+                    use_memory=False)
+            else:
+                self.get_logger().info(
+                    "[route] reusable reverse delivery trunk available; "
+                    "routing through the common exit; lookup="
+                    + json.dumps(reverse_info, ensure_ascii=False))
+                self.scan_trunk_route_stage = "to_trunk_exit"
+                self._start_route_leg(
+                    "scan_to_trunk_exit", DELIVERY_TRUNK_REVERSE_START,
+                    use_memory=False)
+
+        if (self.scan_trunk_route_stage in {
+                "to_shelf", "direct_to_shelf"}
+                and self._route_leg_goal is not None
+                and np.linalg.norm(
+                    np.asarray(self._route_leg_goal[:2]) - target) > 0.05):
+            self._start_route_leg(
+                f"scan_{self.scan_trunk_route_stage}", final_goal,
+                use_memory=False)
+
+        reached, failure = self._route_leg_tick()
+        if failure is not None:
+            if not self.scan_direct_fallback_used:
+                failed_stage = self.scan_trunk_route_stage
+                self.scan_direct_fallback_used = True
+                self.scan_trunk_route_stage = "direct_to_shelf"
+                self.get_logger().warn(
+                    f"[route] reverse trunk stage={failed_stage} failed "
+                    f"({failure}); bypassing anchors with one live direct "
+                    "route to the shelf")
+                self._start_route_leg(
+                    "scan_direct_to_shelf", final_goal,
+                    use_memory=False)
+                return False
+            raise RuntimeError(
+                "reverse delivery-trunk fallback also failed: " + failure)
+        if not reached:
+            return False
+
+        if self.scan_trunk_route_stage == "to_trunk_exit":
+            self.scan_trunk_route_stage = "trunk_reverse"
+            self._start_route_leg(
+                "delivery_trunk_reverse", DELIVERY_TRUNK_REVERSE_GOAL,
+                use_memory=True, lock_cached_path=True)
+            return False
+        if self.scan_trunk_route_stage == "trunk_reverse":
+            self.scan_trunk_route_stage = "to_shelf"
+            self._start_route_leg(
+                "scan_trunk_to_shelf", final_goal, use_memory=False)
+            return False
+        if self.scan_trunk_route_stage in {"to_shelf", "direct_to_shelf"}:
+            self.scan_trunk_route_done = True
+            self._route_leg_name = None
+            self._route_leg_goal = None
+            self._nav_goal = None
+            return True
+        return False
+
     # ------------------------------------------------------------------
     # drive_to override — navigator for transit, parent logic for the last
     # few centimetres where 0.10 m navigator tolerance is not precise enough.
@@ -684,6 +911,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 f"delivery-table startup escape complete; "
                 f"clearance={table_clearance:.3f}m")
 
+        if self._is_shelf_scan_transit(target):
+            if not self._scan_trunk_route_tick(target, final_yaw):
+                return False
+
         if (self.nav_during_scan
                 and distance > max(NAV_TRANSIT_GATE_M,
                                    position_tolerance
@@ -692,7 +923,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             goal = (float(target[0]), float(target[1]), float(final_yaw))
             if self._nav_goal != goal:
                 self._nav_goal = goal
-                self.nav.set_goal(*goal)
+                self.nav.set_goal(
+                    *goal,
+                    use_path_memory=not self._is_shelf_scan_transit(target))
                 self._nav_last_log = 0.0
                 self._nav_memory_logged = False
                 self.get_logger().info(
@@ -847,25 +1080,24 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._nav_goal = None
         self._nav_last_log = 0.0
         self._nav_memory_logged = False
-        # Align the chassis with the assigned table slot before the guarded
-        # southward creep.  This keeps the arm motion predominantly forward
-        # even for the left/right slots and makes the fixed world target much
-        # more likely to have a nearby IK solution.
-        delivery_goal = (
-            float(self.place_world[0]),
-            DELIVERY_APPROACH[1],
-            DELIVERY_APPROACH[2],
-        )
-        # Each table slot has a distinct approach X.  Reuse an exact cached
-        # route for the same slot, but reject a nearby route whose old goal is
-        # laterally displaced enough to steer into a now-blocked corridor.
-        self.nav.set_goal(
-            *delivery_goal, cached_goal_offset_limit=0.08)
+        self.delivery_nav_stage = "to_trunk_entry"
+        self.delivery_direct_fallback_used = False
+        self._start_route_leg(
+            "delivery_to_trunk_entry", DELIVERY_TRUNK_ENTRY,
+            use_memory=False)
         self.get_logger().info(
             f"[nav→delivery] assigned slot="
             f"{None if self.place_slot is None else self.place_slot + 1} "
             f"target={np.round(self.place_world[:2], 3)} "
-            f"approach={np.round(delivery_goal[:2], 3)}")
+            f"trunk_entry={np.round(DELIVERY_TRUNK_ENTRY[:2], 3)} "
+            f"trunk_exit={np.round(DELIVERY_TRUNK_EXIT[:2], 3)}")
+
+    def _delivery_slot_goal(self) -> tuple[float, float, float]:
+        return (
+            float(self.place_world[0]),
+            DELIVERY_APPROACH[1],
+            DELIVERY_APPROACH[2],
+        )
 
     def _backup_tick(self) -> None:
         """Reverse along the grasp heading while holding the current yaw."""
@@ -913,63 +1145,60 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
     def _nav_to_delivery_tick(self) -> None:
         now = self.now()
         self.des_slide = self._transit_slide_target()
-        if self._laser_stale(now):
-            self.set_twist(0.0, 0.0)
-            if now - self._laser_warn_log > 1.0:
-                self.get_logger().warn(
-                    "waiting for fresh laser scan on the way to delivery")
-                self._laser_warn_log = now
-            return
-
-        v, w, reached = self.nav.update(
-            self.base_xy[0], self.base_xy[1], self.base_yaw,
-            laser_msg=self.laser_msg, time_now=now)
-        self.set_twist(v, w)
-        if not self._nav_memory_logged:
-            self._nav_memory_logged = True
-            self.get_logger().info(
-                "[nav→delivery] path_memory_runtime="
-                + json.dumps(self.nav.path_memory_status(), ensure_ascii=False)
-            )
-
-        ctrl = self.nav.controller
-        if (ctrl.stop_reason is not None
-                and ctrl.stop_reason != self._last_nav_reason):
-            self._last_nav_reason = ctrl.stop_reason
-            self.get_logger().info(
-                f"[nav→delivery] stop_reason={ctrl.stop_reason} "
-                f"lidar={ctrl.lidar_clearance:.2f}m "
-                f"rear={ctrl.rear_clearance:.2f}m")
-
-        if now - self._nav_last_log >= NAV_PROGRESS_LOG_S:
-            self._nav_last_log = now
-            self.get_logger().info(
-                f"[nav→delivery] pos=({self.base_xy[0]:.2f},"
-                f"{self.base_xy[1]:.2f}) "
-                f"yaw={math.degrees(self.base_yaw):.0f}° "
-                f"v={v:.2f} w={w:.2f} reached={reached}")
-
-        if reached:
-            # The navigator has completed its own acceleration profile.  Do
-            # not let the parent command filter carry residual translation
-            # into the table-facing yaw refinement or placement phase.
-            self.cmd_linear = 0.0
-            # Navigator yaw tolerance is 0.15 rad; refine to face south.
-            yaw_err = pick.wrap_to_pi(-math.pi / 2.0 - self.base_yaw)
-            if abs(yaw_err) > 0.03:
-                self.set_twist(0.0, 2.0 * yaw_err)
+        if self.delivery_nav_stage != "slot_refine":
+            reached, failure = self._route_leg_tick()
+            if failure is not None:
+                if not self.delivery_direct_fallback_used:
+                    failed_stage = self.delivery_nav_stage
+                    self.delivery_direct_fallback_used = True
+                    self.delivery_nav_stage = "direct_to_slot"
+                    self.get_logger().warn(
+                        f"[route] delivery stage={failed_stage} failed "
+                        f"({failure}); bypassing trunk anchors with one live "
+                        "direct route to the assigned slot")
+                    self._start_route_leg(
+                        "delivery_direct_to_slot",
+                        self._delivery_slot_goal(), use_memory=False)
+                    return
+                raise RuntimeError(
+                    "delivery direct fallback also failed: " + failure)
+            if not reached:
                 return
-            self.set_twist(0.0, 0.0)
-            self.cmd_angular = 0.0
-            self._set_flow_phase("place")
-            self.place_stage = 0
-            self.place_t0 = now
-            self.get_logger().info(
-                f"[flow] arrived at delivery approach "
-                f"pos=({self.base_xy[0]:.2f},{self.base_xy[1]:.2f}) "
-                f"yaw={math.degrees(self.base_yaw):.0f}°; placing with "
-                f"grip_command={self._transport_grip_command} "
-                f"measured_grip={self.selected_gripper_position()}")
+
+            if self.delivery_nav_stage == "to_trunk_entry":
+                self.delivery_nav_stage = "trunk_forward"
+                self._start_route_leg(
+                    "delivery_trunk_forward", DELIVERY_TRUNK_EXIT,
+                    use_memory=True, lock_cached_path=True)
+                return
+            if self.delivery_nav_stage == "trunk_forward":
+                self.delivery_nav_stage = "to_slot"
+                self._start_route_leg(
+                    "delivery_trunk_to_slot", self._delivery_slot_goal(),
+                    use_memory=False)
+                return
+            if self.delivery_nav_stage in {"to_slot", "direct_to_slot"}:
+                self.delivery_nav_stage = "slot_refine"
+
+        # Navigator yaw tolerance is 0.15 rad; refine to face south before the
+        # guarded final creep and loaded-arm motion begin.
+        self.cmd_linear = 0.0
+        yaw_err = pick.wrap_to_pi(-math.pi / 2.0 - self.base_yaw)
+        if abs(yaw_err) > 0.03:
+            self.set_twist(0.0, 2.0 * yaw_err)
+            return
+        self.set_twist(0.0, 0.0)
+        self.cmd_angular = 0.0
+        self._set_flow_phase("place")
+        self.place_stage = 0
+        self.place_t0 = now
+        self.get_logger().info(
+            f"[flow] arrived at delivery approach via="
+            f"{'direct_fallback' if self.delivery_direct_fallback_used else 'reusable_trunk'} "
+            f"pos=({self.base_xy[0]:.2f},{self.base_xy[1]:.2f}) "
+            f"yaw={math.degrees(self.base_yaw):.0f}deg; placing with "
+            f"grip_command={self._transport_grip_command} "
+            f"measured_grip={self.selected_gripper_position()}")
 
     def _set_selected_grip(self, value: float) -> None:
         if self.grasp_arm == "r":
