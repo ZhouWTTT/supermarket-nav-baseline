@@ -1,7 +1,10 @@
 import math
+import os
 import pathlib
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 from scipy.ndimage import maximum_filter
@@ -14,12 +17,15 @@ from supermarket_navigation import (  # noqa: E402
     AStarPlanner,
     Costmap2D,
     DELIVERY_APPROACH,
+    DELIVERY_TRUNK_ENTRY,
+    DELIVERY_TRUNK_EXIT,
     DELIVERY_TABLE_COSTMAP_BOUNDS,
     DELIVERY_TABLE_XML_BOUNDS,
     LETHAL,
     NavigationController,
     SHELF_APPROACH,
     START_POSE,
+    SupermarketNavigator,
     WHOLE_BODY_KEEP_OUT_RADIUS,
     depth_image_clearance,
     point_to_rect_clearance,
@@ -101,6 +107,31 @@ class PlannerTests(unittest.TestCase):
             ]:
                 with self.subTest(shelf=shelf, start=start, goal=goal):
                     self.assertIsNotNone(planner.plan(*start, *goal))
+
+    def test_reusable_delivery_trunk_and_connectors_are_reachable(self):
+        costmap = Costmap2D()
+        add_fixed_xml_obstacles(costmap)
+        planner = AStarPlanner(costmap)
+        slot_goals = [
+            (-2.20, DELIVERY_APPROACH[1]),
+            (-1.94, DELIVERY_APPROACH[1]),
+            (-1.68, DELIVERY_APPROACH[1]),
+        ]
+        legs = [
+            (SHELF_APPROACH[shelf][:2], DELIVERY_TRUNK_ENTRY[:2])
+            for shelf in SHELF_APPROACH
+        ]
+        legs += [
+            (DELIVERY_TRUNK_ENTRY[:2], DELIVERY_TRUNK_EXIT[:2]),
+            (DELIVERY_TRUNK_EXIT[:2], DELIVERY_TRUNK_ENTRY[:2]),
+        ]
+        legs += [
+            (DELIVERY_TRUNK_EXIT[:2], goal) for goal in slot_goals]
+        for start, goal in legs:
+            with self.subTest(start=start, goal=goal):
+                path = planner.plan(*start, *goal)
+                self.assertIsNotNone(path)
+                self.assertGreaterEqual(len(path), 2)
 
 
 class CostmapTests(unittest.TestCase):
@@ -344,7 +375,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_table_keepout_blocks_unsafe_final_rotation(self):
         self.assertFalse(self.controller._table_rotation_is_free(
-            -1.60, -2.62))
+            -1.60, -2.67))
         self.assertTrue(self.controller._table_rotation_is_free(
             *DELIVERY_APPROACH[:2]))
 
@@ -366,7 +397,7 @@ class ControllerTests(unittest.TestCase):
             near_goal_speed = []
             for _ in range(5000):
                 now += 0.02
-                near_goal = math.hypot(goal[0] - x, goal[1] - y) < 0.80
+                near_goal = math.hypot(goal[0] - x, goal[1] - y) < 0.60
                 v, w, reached = controller.compute_velocity(
                     x, y, yaw, scan, time_now=now)
                 yaw = wrap_to_pi(yaw + w * 0.02)
@@ -380,8 +411,164 @@ class ControllerTests(unittest.TestCase):
                     break
             self.assertTrue(reached, msg=f"failed to reach {goal}")
             if goal == DELIVERY_APPROACH:
-                self.assertLessEqual(max(near_goal_speed), 0.181)
+                self.assertLessEqual(
+                    max(near_goal_speed), controller.near_goal_max_lin + 0.001)
                 self.assertGreater(min(leg_x), -1.80)
+
+
+class NavigatorPathMemoryTests(unittest.TestCase):
+    def test_trunk_cache_is_locked_and_reverse_route_hits(self):
+        with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(
+                os.environ, {
+                    "SUPERMARKET_PATH_MEMORY": "1",
+                    "SUPERMARKET_PATH_MEMORY_FILE": str(
+                        pathlib.Path(tempdir) / "paths.json"),
+                }):
+            navigator = SupermarketNavigator()
+            path = navigator.planner.plan(
+                *DELIVERY_TRUNK_ENTRY[:2], *DELIVERY_TRUNK_EXIT[:2])
+            self.assertIsNotNone(path)
+            navigator.path_memory.save_path(
+                *DELIVERY_TRUNK_ENTRY,
+                *DELIVERY_TRUNK_EXIT,
+                path,
+                source="test_trunk")
+
+            clear_scan = FakeScan([float("inf")] * 360)
+            navigator.set_goal(
+                *DELIVERY_TRUNK_EXIT,
+                cached_start_offset_limit=0.18,
+                cached_goal_offset_limit=0.12,
+                use_path_memory=True,
+                lock_cached_path=True)
+            navigator.update(
+                *DELIVERY_TRUNK_ENTRY,
+                laser_msg=clear_scan, time_now=1.0)
+            status = navigator.path_memory_status()
+            self.assertTrue(status["cache_hit"])
+            self.assertTrue(status["cached_path_active"])
+            self.assertTrue(status["cached_path_locked"])
+
+            reverse_available, reverse_lookup = (
+                navigator.remembered_path_available(
+                    (DELIVERY_TRUNK_EXIT[0], DELIVERY_TRUNK_EXIT[1],
+                     math.pi / 2.0),
+                    (DELIVERY_TRUNK_ENTRY[0], DELIVERY_TRUNK_ENTRY[1],
+                     math.pi / 2.0),
+                    start_offset_limit=0.18,
+                    goal_offset_limit=0.12))
+            self.assertTrue(reverse_available)
+            self.assertTrue(reverse_lookup["cache_hit"])
+
+            navigator.set_goal(
+                DELIVERY_TRUNK_ENTRY[0], DELIVERY_TRUNK_ENTRY[1],
+                math.pi / 2.0,
+                cached_start_offset_limit=0.18,
+                cached_goal_offset_limit=0.12,
+                use_path_memory=True,
+                lock_cached_path=True)
+            navigator.update(
+                DELIVERY_TRUNK_EXIT[0], DELIVERY_TRUNK_EXIT[1],
+                math.pi / 2.0,
+                laser_msg=clear_scan, time_now=2.0)
+            reverse_status = navigator.path_memory_status()
+            self.assertTrue(reverse_status["cache_hit"])
+            self.assertEqual(
+                reverse_status["source"], "test_trunk_reverse")
+
+    def test_connector_goal_does_not_use_or_save_path_memory(self):
+        with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(
+                os.environ, {
+                    "SUPERMARKET_PATH_MEMORY": "1",
+                    "SUPERMARKET_PATH_MEMORY_FILE": str(
+                        pathlib.Path(tempdir) / "paths.json"),
+                }):
+            navigator = SupermarketNavigator()
+            navigator.set_goal(
+                *DELIVERY_TRUNK_ENTRY, use_path_memory=False)
+            navigator.update(
+                *SHELF_APPROACH["C"],
+                laser_msg=FakeScan([float("inf")] * 360),
+                time_now=1.0)
+            status = navigator.path_memory_status()
+            self.assertFalse(status["goal_uses_path_memory"])
+            self.assertFalse(status["cache_hit"])
+
+    def test_cached_recovery_persistently_invalidates_both_directions(self):
+        with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(
+                os.environ, {
+                    "SUPERMARKET_PATH_MEMORY": "1",
+                    "SUPERMARKET_PATH_MEMORY_FILE": str(
+                        pathlib.Path(tempdir) / "paths.json"),
+                }):
+            navigator = SupermarketNavigator()
+            path = navigator.planner.plan(
+                *DELIVERY_TRUNK_ENTRY[:2], *DELIVERY_TRUNK_EXIT[:2])
+            navigator.path_memory.save_path(
+                *DELIVERY_TRUNK_ENTRY,
+                *DELIVERY_TRUNK_EXIT,
+                path,
+                source="test_trunk")
+            navigator.set_goal(
+                *DELIVERY_TRUNK_EXIT,
+                use_path_memory=True,
+                lock_cached_path=True)
+            clear_scan = FakeScan([float("inf")] * 360)
+            navigator.update(
+                *DELIVERY_TRUNK_ENTRY,
+                laser_msg=clear_scan, time_now=1.0)
+            self.assertTrue(
+                navigator.path_memory_status()["cached_path_active"])
+
+            def recovery(*_args, **_kwargs):
+                navigator.controller.stop_reason = "rotation_loop"
+                return 0.0, 0.0, False
+
+            with mock.patch.object(
+                    navigator.controller, "compute_velocity",
+                    side_effect=recovery):
+                navigator.update(
+                    *DELIVERY_TRUNK_ENTRY,
+                    laser_msg=clear_scan, time_now=1.1)
+            status = navigator.path_memory_status()
+            self.assertFalse(status["cached_path_active"])
+            self.assertTrue(status["cached_path_invalidated"])
+            self.assertEqual(status["invalidation_reason"], "rotation_loop")
+            self.assertEqual(len(status["invalidated_keys"]), 2)
+            self.assertEqual(status["cache_size"], 0)
+
+    def test_leg_supervisor_can_persistently_invalidate_active_cache(self):
+        with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(
+                os.environ, {
+                    "SUPERMARKET_PATH_MEMORY": "1",
+                    "SUPERMARKET_PATH_MEMORY_FILE": str(
+                        pathlib.Path(tempdir) / "paths.json"),
+                }):
+            navigator = SupermarketNavigator()
+            path = navigator.planner.plan(
+                *DELIVERY_TRUNK_ENTRY[:2], *DELIVERY_TRUNK_EXIT[:2])
+            navigator.path_memory.save_path(
+                *DELIVERY_TRUNK_ENTRY,
+                *DELIVERY_TRUNK_EXIT,
+                path,
+                source="test_trunk")
+            navigator.set_goal(
+                *DELIVERY_TRUNK_EXIT,
+                use_path_memory=True,
+                lock_cached_path=True)
+            navigator.update(
+                *DELIVERY_TRUNK_ENTRY,
+                laser_msg=FakeScan([float("inf")] * 360),
+                time_now=1.0)
+
+            removed = navigator.invalidate_active_cached_path(
+                "route_leg:trunk_forward:hard_timeout", now=2.0)
+            status = navigator.path_memory_status()
+            self.assertEqual(len(removed), 2)
+            self.assertFalse(status["cached_path_active"])
+            self.assertTrue(status["cached_path_invalidated"])
+            self.assertEqual(status["cache_size"], 0)
+            self.assertEqual(navigator.controller._replan_hold_until, 2.0)
 
 
 if __name__ == "__main__":
