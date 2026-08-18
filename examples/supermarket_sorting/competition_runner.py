@@ -232,6 +232,7 @@ class CompetitionRunner(Node):
             "--weights", str(Path(self.args.weights).resolve()),
             "--confidence", str(self.args.confidence),
             "--max-inference-hz", str(self.args.inference_hz),
+            "--device", self.args.device,
             "--max-scan-cycles", str(self.args.max_scan_cycles),
             "--result-file", str(result_path),
             "--formal-mode",
@@ -295,6 +296,7 @@ class CompetitionRunner(Node):
             f"start={self.worker_started_wall_at} "
             f"scan_hint_x={scan_hint_x} "
             f"scan_marker_z={scan_marker_z} "
+            f"memory_hint={self.selected_memory_hint} "
             f"persistent_perception={int(external_perception)} "
             f"single_item_candidates={candidate_kinds} "
             f"excluded_markers={excluded_markers} "
@@ -714,7 +716,10 @@ class CompetitionRunner(Node):
                 self.args.memory_confidence_threshold,
                 exclude_slots=self.failed_memory_slots.get(
                     order.kind, set()),
-                reliable_only=True)
+                # 严格模式保留在这里，若 snapshot 兜底实跑效果不好，
+                # 注释下一行并恢复这一行即可：
+                # reliable_only=True)
+                reliable_only=False)
             travel = (
                 float("inf") if hint is None
                 else float(hint.get("travel", float("inf"))))

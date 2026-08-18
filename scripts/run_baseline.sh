@@ -25,6 +25,7 @@ runner=(
     --memory-confirmations "${SUPERMARKET_MEMORY_CONFIRMATIONS:-${SUPERMARKET_INVENTORY_CONFIRMATIONS:-3}}"
     --memory-confidence-threshold "${SUPERMARKET_MEMORY_CONFIDENCE:-0.90}"
     --inference-hz "${SUPERMARKET_INFERENCE_HZ:-12}"
+    --device "${SUPERMARKET_DEVICE:-cpu}"
     --order-timeout "${SUPERMARKET_ORDER_TIMEOUT:-0}"
     --match-timeout "${SUPERMARKET_MATCH_TIMEOUT:-570}"
     --target-time "${SUPERMARKET_TARGET_TIME:-400}"

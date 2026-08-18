@@ -250,6 +250,31 @@ class MemoryMatrixTests(unittest.TestCase):
         self.assertEqual(
             (failover["shelf"], failover["level"]), ("D", "L2"))
 
+    def test_snapshot_initial_route_falls_back_to_best_weak_candidate(self):
+        candidates = [
+            {
+                "slot_key": "L2|A|2", "shelf": "A", "level": "L2",
+                "confidence": 0.61, "closest_distance": 2.10,
+                "last_seen": 10.0,
+            },
+            {
+                "slot_key": "L3|D|1", "shelf": "D", "level": "L3",
+                "confidence": 0.84, "closest_distance": 1.80,
+                "last_seen": 11.0,
+            },
+        ]
+
+        strict = select_memory_hint(
+            candidates, (0.0, 2.40), 0.90, reliable_only=True)
+        snapshot_fallback = select_memory_hint(
+            candidates, (0.0, 2.40), 0.90, reliable_only=False)
+
+        self.assertIsNone(strict)
+        self.assertEqual(
+            (snapshot_fallback["shelf"], snapshot_fallback["level"]),
+            ("D", "L3"))
+        self.assertFalse(snapshot_fallback["reliable"])
+
     def test_dynamic_route_requires_fresh_evidence(self):
         candidates = [
             {

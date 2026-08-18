@@ -130,7 +130,10 @@ class DeliveryRouteStrategyTests(unittest.TestCase):
         self.assertEqual(controller.scan_trunk_route_stage, "trunk_reverse")
         exit_goal, exit_options = controller.nav.calls[-2]
         self.assertEqual(exit_goal, delivery.DELIVERY_TRUNK_REVERSE_START)
-        self.assertAlmostEqual(exit_goal[2], math.pi / 2.0)
+        self.assertAlmostEqual(exit_goal[2], math.pi / 4.0)
+        self.assertAlmostEqual(
+            delivery.pick.wrap_to_pi(exit_goal[2] - (-math.pi / 2.0)),
+            3.0 * math.pi / 4.0)
         self.assertFalse(exit_options["use_path_memory"])
         trunk_goal, trunk_options = controller.nav.calls[-1]
         self.assertEqual(trunk_goal, delivery.DELIVERY_TRUNK_REVERSE_GOAL)

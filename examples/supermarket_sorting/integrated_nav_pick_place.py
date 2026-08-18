@@ -141,29 +141,43 @@ DELIVERY_PLACE_SLOTS_XY = (
     (-1.81, -3.27),  # 5: outer-right / nearest
 )
 PLACE_SLOT_IK_NUDGE_M = 0.020
-PLACE_SLOT_XY_TOLERANCE_M = 0.060
+PLACE_SLOT_XY_TOLERANCE_M = 0.020
 
-# Product centre heights above their supporting surface.  These are the
-# physical half-heights of the collision geometry in the competition scene.
-# The placement controller targets the product centre at table top + this
-# value + a small clearance, rather than opening the gripper at one fixed TCP
-# height for every product.
+# Product centre heights above their supporting surface (half heights of the
+# collision geometry).  The placement controller targets the product centre
+# at table top + this value + a small clearance, rather than opening the
+# gripper at one fixed TCP height for every product.
+# 数值与 yolo_aruco_shelf_pick.py 保持一致（2026-08-17 合并 wxj v2 值）。
 PRODUCT_HALF_HEIGHT_M = {
     "sanmingzhi": 0.0494,
-    "heweidao": 0.0525,
-    "shupian": 0.1050,
+    "heweidao": 0.00,
+    "shupian": 0.0350,
     "zhijin": 0.0440,
-    "maidong": 0.1050,
-    "kele": 0.0725,
+    "maidong": 0.03550,
+    "kele": 0.0325,
     "kouxiangtang": 0.0400,
     "pingguo": 0.0350,
     "chengzi": 0.0370,
 }
 PLACE_PRODUCT_BOTTOM_CLEARANCE_M = 0.015
 PLACE_APPROACH_CLEARANCE_M = 0.060
-PLACE_RELEASE_HEIGHT_LOWER_TOLERANCE_M = 0.010
-PLACE_RELEASE_HEIGHT_UPPER_TOLERANCE_M = 0.035
-PLACE_DESCENT_SLIDE_STEP_M = 0.0030
+PLACE_DESCENT_SLIDE_STEP_M = 0.0015
+PLACE_BASE_SETTLE_S = 0.35
+PLACE_XY_REFINE_STEP_M = 0.020
+PLACE_XY_REFINE_SETTLE_S = 0.30
+PLACE_XY_REFINE_TIMEOUT_S = 12.0
+PLACE_DESCENT_TIMEOUT_S = 10.0
+PLACE_RELEASE_POSE_SETTLE_S = 0.30
+PLACE_VERTICAL_CLEARANCE_M = 0.070
+PLACE_VERTICAL_CLEAR_TIMEOUT_S = 5.0
+# 下降接触检测（方案 A/B）：长商品/夹持偏低导致商品底部先触桌时，slide 被桌面
+# 顶住、反馈不再跟随命令。检测到"slide 停滞 + 商品底部已在桌面"后停止下压并
+# 就地释放，避免 10 s 硬超时判失败；商品底部未在桌面时的停滞仍按真失败处理。
+PLACE_CONTACT_STALL_S = 0.5            # slide 误差无改善的观察窗口
+PLACE_CONTACT_STALL_IMPROVEMENT_M = 0.002  # 窗口内误差改善 < 2 mm 视为停滞
+PLACE_CONTACT_SLIDE_ERROR_MIN_M = 0.015    # 误差 ≤ 15 mm 不算触桌（接近到位）
+PLACE_CONTACT_BOTTOM_LOW_TOL_M = 0.005     # 商品底部允许低于桌面 5 mm
+PLACE_CONTACT_BOTTOM_HIGH_TOL_M = 0.020    # 商品底部允许高于桌面 20 mm
 PLACE_CLEAR_TABLE_MARGIN_M = 0.060
 PLACE_CLEAR_TABLE_SPEED_MPS = 0.60
 PLACE_CLEAR_TABLE_TIMEOUT_S = 15.0
@@ -184,7 +198,7 @@ NAV_PROGRESS_LOG_S = 3.0
 # Reusable delivery trunk.  Shelf-specific and slot-specific motion remains
 # live-planned on either side of the shared navigation anchors.
 DELIVERY_TRUNK_REVERSE_START = (
-    DELIVERY_TRUNK_EXIT[0], DELIVERY_TRUNK_EXIT[1], math.pi / 2.0)
+    DELIVERY_TRUNK_EXIT[0], DELIVERY_TRUNK_EXIT[1], math.pi / 4.0)
 DELIVERY_TRUNK_REVERSE_GOAL = (
     DELIVERY_TRUNK_ENTRY[0], DELIVERY_TRUNK_ENTRY[1], math.pi / 2.0)
 DELIVERY_TRUNK_CACHE_START_TOLERANCE_M = 0.18
@@ -231,9 +245,6 @@ PLACE_CREEP_MAX_ANGULAR_RPS = 0.30
 PLACE_LOADED_ARM_MAX_STEP_RAD = 0.006
 PLACE_LOADED_ARM_STEP_RAMP_RAD = 0.00025
 PLACE_RELEASE_TABLE_MARGIN_M = 0.04
-PLACE_APPROACH_SOFT_DWELL_S = 2.0
-PLACE_APPROACH_SOFT_ARM_TOLERANCE_RAD = 0.08
-PLACE_APPROACH_SOFT_SLIDE_TOLERANCE_M = 0.05
 PLACE_APPROACH_HARD_TIMEOUT_S = 15.0
 PLACE_APPROACH_PROGRESS_LOG_S = 2.0
 # The table-clear state already verifies the arms and chassis clearance.  One
@@ -345,12 +356,24 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_stage = 0
         self.place_t0 = 0.0
         self.place_arm_joints = None
+        self.place_approach_world = None
         self.place_slide_cmd = None
         self.place_release_world = None
         self.place_release_slide_cmd = None
+        self.place_ik_ref_source = None
+        self.place_ik_reference_joints = None
         self._place_ik_attempted = False
         self._place_arm_target_sent = False
-        self._place_descent_sent = False
+        self._place_base_settle_started_at = None
+        self._place_base_reference_xy = None
+        self._place_base_reference_yaw = None
+        self._place_refine_started_at = None
+        self._place_refine_target_sent = False
+        self._place_refine_stable_since = None
+        self._place_refine_iterations = 0
+        self._place_release_started_at = None
+        self._place_slide_stall_snapshot = None
+        self._place_stall_warn_log = 0.0
         self._place_retreat_sent = False
         self._place_retreat_start_clearance = None
         self._dual_descent_sent = False
@@ -865,7 +888,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
     # few centimetres where 0.10 m navigator tolerance is not precise enough.
     # ------------------------------------------------------------------
     def drive_to(self, target_xy, final_yaw: float,
-                 position_tolerance: float = 0.055) -> bool:
+                 position_tolerance: float = 0.055,
+                 linear_min_mps: float | None = None) -> bool:
         target = np.asarray(target_xy, dtype=float)
         distance = float(np.linalg.norm(target - self.base_xy))
 
@@ -990,7 +1014,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self.cmd_angular = 0.0
 
         arrived = super().drive_to(
-            target_xy, final_yaw, position_tolerance)
+            target_xy, final_yaw, position_tolerance,
+            linear_min_mps=linear_min_mps)
         if arrived:
             self.cmd_linear = 0.0
             self.cmd_angular = 0.0
@@ -1206,6 +1231,53 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         else:
             self.des_left_grip = float(value)
 
+    @staticmethod
+    def _rounded_list(values, decimals: int = 4) -> list[float] | None:
+        """Return a compact JSON-safe vector for placement diagnostics."""
+        if values is None:
+            return None
+        array = np.asarray(values, dtype=float)
+        if not np.all(np.isfinite(array)):
+            return None
+        return np.round(array, decimals).tolist()
+
+    def _place_joint_snapshot(self) -> dict:
+        """Capture measured, streamed and target placement state."""
+        measured = self.selected_arm_positions()
+        commanded = (
+            self.cmd_right_arm if self.grasp_arm == "r"
+            else self.cmd_left_arm)
+        desired = (
+            self.des_right_arm if self.grasp_arm == "r"
+            else self.des_left_arm)
+        tcp = self.selected_tcp_world()
+        measured_slide = self.joints.get("slide_joint")
+        return {
+            "stage": int(self.place_stage),
+            "arm": self.grasp_arm,
+            "ref_source": self.place_ik_ref_source,
+            "measured_joints": self._rounded_list(measured),
+            "commanded_joints": self._rounded_list(commanded),
+            "desired_joints": self._rounded_list(desired),
+            "desired_minus_measured": self._rounded_list(
+                np.asarray(desired, dtype=float) - measured),
+            "max_joint_delta_from_measured": (
+                None if not np.all(np.isfinite(measured))
+                else round(float(np.max(np.abs(
+                    np.asarray(desired, dtype=float) - measured))), 4)),
+            "measured_slide": (
+                None if measured_slide is None
+                else round(float(measured_slide), 4)),
+            "commanded_slide": round(float(self.cmd_slide), 4),
+            "desired_slide": round(float(self.des_slide), 4),
+            "tcp_world": self._rounded_list(tcp),
+            "grip_command": (
+                None if self._transport_grip_command is None
+                else round(float(self._transport_grip_command), 4)),
+            "measured_grip": self.selected_gripper_position(),
+            **self._place_base_diagnostic(),
+        }
+
     def _capture_transport_grip_command(self) -> None:
         """Strengthen and remember the closed command after shelf retreat."""
         if self.use_dual_tissue_grasp:
@@ -1268,7 +1340,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
     def _start_place_retreat(self, now: float) -> None:
         """Begin table retreat without disturbing the release arm pose."""
-        self.place_stage = 4
+        self.place_stage = 5
         self.place_t0 = now
         self._place_retreat_sent = False
         self.commands_ready_since = None
@@ -1280,8 +1352,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             PLACE_RETREAT_RECOVERY_START_FRACTION
             * max(0.0, required - self._place_retreat_start_clearance))
         self.get_logger().info(
-            "[place] gripper released; holding release pose for first half "
-            "of table retreat "
+            "[place] vertical clearance complete; holding the raised pose "
+            "for the first half of table retreat "
             f"(clearance={self._place_retreat_start_clearance:.3f}m, "
             f"arm_recovery_at={recovery_start:.3f}m, "
             f"required={required:.3f}m)")
@@ -1297,6 +1369,26 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             "[place] retreat midpoint reached; restoring both arms and "
             f"slide during second half (clearance={clearance:.3f}m)")
 
+    def _tcp_above_product_center(self) -> float:
+        """TCP height above the held product centre measured at grasp time.
+
+        ``forward_contact_world`` is the measured TCP position when the arm
+        first contacted the product; the dual-arm equivalent is
+        ``dual_contact_tcp_z``.  Long goods and top-shelf picks hold the wrist
+        well above the centre, so this offset keeps the product bottom -- not
+        the wrist -- at the configured table clearance during placement.
+        """
+        if self.target_world is None:
+            return 0.0
+        if (self.use_dual_tissue_grasp
+                and self.dual_contact_tcp_z is not None):
+            return (float(self.dual_contact_tcp_z)
+                    - float(self.target_world[2]))
+        if self.forward_contact_world is not None:
+            return (float(self.forward_contact_world[2])
+                    - float(self.target_world[2]))
+        return 0.0
+
     def _product_release_z(self) -> float:
         """Return TCP height that leaves the product just above the table.
 
@@ -1306,32 +1398,89 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         -- rather than the wrist -- receives the configured table clearance.
         """
         half_height = PRODUCT_HALF_HEIGHT_M[self.target_kind]
-        tcp_above_product_center = 0.0
-        if self.target_world is not None:
-            if (self.use_dual_tissue_grasp
-                    and self.dual_contact_tcp_z is not None):
-                tcp_above_product_center = (
-                    float(self.dual_contact_tcp_z)
-                    - float(self.target_world[2]))
-            elif self.forward_contact_world is not None:
-                tcp_above_product_center = (
-                    float(self.forward_contact_world[2])
-                    - float(self.target_world[2]))
         return (
             DELIVERY_TABLE_TOP_Z_M
             + half_height
             + PLACE_PRODUCT_BOTTOM_CLEARANCE_M
-            + tcp_above_product_center)
+            + self._tcp_above_product_center())
+
+    def _product_bottom_at_table(self, tcp: np.ndarray | None) -> bool:
+        """True when the held product's bottom is at/near the table surface.
+
+        商品底部世界 z = TCP z − 抓取时 TCP 高出商品中心的高度 − 商品半高。
+        判定带 [桌面−5mm, 桌面+20mm] 同时覆盖两条路径：
+        * 正常到位：商品底部悬空 15mm（PLACE_PRODUCT_BOTTOM_CLEARANCE_M）；
+        * 触桌接触：长商品/夹持偏低导致商品底部先碰桌面、slide 被顶住，
+          TCP 高于标称 release_z，但商品底部已在桌面。
+        """
+        if tcp is None or np.asarray(tcp).shape != (3,):
+            return False
+        if not np.all(np.isfinite(tcp)):
+            return False
+        half_height = PRODUCT_HALF_HEIGHT_M[self.target_kind]
+        bottom_z = (
+            float(tcp[2])
+            - self._tcp_above_product_center()
+            - half_height)
+        return (
+            DELIVERY_TABLE_TOP_Z_M - PLACE_CONTACT_BOTTOM_LOW_TOL_M
+            <= bottom_z
+            <= DELIVERY_TABLE_TOP_Z_M + PLACE_CONTACT_BOTTOM_HIGH_TOL_M)
+
+    def _place_slide_stalled(self, now: float) -> bool:
+        """True once slide feedback stops improving for the stall window.
+
+        位置控制下物理阻挡（商品底部触桌顶住 slide）表现为：命令继续朝目标
+        走、反馈停住、误差不再缩小（甚至增大）。窗口内误差改善 < 2 mm 视为
+        停滞；误差已 ≤ 15 mm 时接近到位，不判定触桌。
+        """
+        measured_slide = self.joints.get("slide_joint")
+        if measured_slide is None or not math.isfinite(float(measured_slide)):
+            return False
+        error = abs(float(measured_slide) - self.des_slide)
+        if error <= PLACE_CONTACT_SLIDE_ERROR_MIN_M:
+            self._place_slide_stall_snapshot = None
+            return False
+        if self._place_slide_stall_snapshot is None:
+            self._place_slide_stall_snapshot = (now, error)
+            return False
+        start_time, start_error = self._place_slide_stall_snapshot
+        if start_error - error >= PLACE_CONTACT_STALL_IMPROVEMENT_M:
+            # 仍在下降：刷新快照，继续观察。
+            self._place_slide_stall_snapshot = (now, error)
+            return False
+        if now - start_time >= PLACE_CONTACT_STALL_S:
+            return True
+        return False
+
+    def _place_contact_release(self, now: float, tcp: np.ndarray) -> None:
+        """Stop the descent and release in place once goods touch the table.
+
+        把 des_slide 收回当前反馈值（停止下压，避免继续顶压商品/电机堵转），
+        直接进入 stage 3 的就地释放流程；商品底部已在桌面，松爪即完成放置。
+        """
+        measured_slide = self.joints.get("slide_joint")
+        if measured_slide is not None and math.isfinite(float(measured_slide)):
+            self.des_slide = float(measured_slide)
+        self.commands_ready_since = None
+        self.place_stage = 3
+        self.place_t0 = now
+        self._place_release_started_at = None
+        self._place_slide_stall_snapshot = None
+        self.get_logger().info(
+            f"[place] contact detected: product bottom at table height; "
+            f"stopping descent and releasing in place tcp="
+            f"{np.round(tcp, 3)}")
 
     def _compute_place_arm_joints(self) -> np.ndarray | None:
         """Solve an approach pose with enough slide travel for a low release.
 
-        The numeric IK depends heavily on the reference joints.  At the
-        delivery pose the shelf pregrasp joints are far from any solution, so
-        we also try the compact INIT pose and the measured joints.  Once an
-        approach pose is found, the final vertical descent keeps the arm joints
-        fixed and increases the downward-facing slide joint.  The result
-        (including failure) is cached to avoid per-tick recomputation.
+        The numeric IK depends heavily on the reference joints.  Start from
+        the measured loaded-arm branch, retain pregrasp and compact only as
+        fallbacks, then use feedback-driven XY refinement above the table.
+        The final vertical descent keeps the arm joints fixed and increases
+        the downward-facing slide joint.  The result (including failure) is
+        cached to avoid per-tick recomputation.
         """
         if self._place_ik_attempted:
             return self.place_arm_joints
@@ -1341,9 +1490,15 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         compact = np.asarray(
             PLACE_RETREAT_ARM_R if self.grasp_arm == "r"
             else PLACE_RETREAT_ARM_L, dtype=float)
-        refs = [compact, measured]
+        # The loaded arm must stay on the branch nearest its actual starting
+        # posture.  Compact remains a last-resort fallback, never the first
+        # solution accepted for a held product.
+        refs = [("measured", measured)]
         if self.pregrasp_arm_joints is not None:
-            refs.append(np.asarray(self.pregrasp_arm_joints, dtype=float))
+            refs.append((
+                "pregrasp",
+                np.asarray(self.pregrasp_arm_joints, dtype=float)))
+        refs.append(("compact", compact))
 
         # The formal runner assigns an absolute table slot.  Manual runs use
         # --place-x/--place-y in exactly the same way.  Small bounded nudges
@@ -1381,23 +1536,72 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     if release_slide > pick.SLIDE_MAX + 1e-6:
                         continue
                     world = np.array([x, y, z], dtype=float)
-                    for ref in refs:
+                    for ref_source, ref in refs:
                         joints = self._solve_place_world(world, ref, slide)
                         if joints is None:
                             continue
-                        self.place_world = world
+                        comparison = {}
+                        for other_source, other_ref in refs:
+                            if other_source == ref_source:
+                                other_joints = joints
+                            else:
+                                other_joints = self._solve_place_world(
+                                    world, other_ref, slide)
+                            if other_joints is None:
+                                comparison[other_source] = None
+                                continue
+                            comparison[other_source] = {
+                                "target_joints": self._rounded_list(
+                                    other_joints),
+                                "max_delta_from_measured": round(float(
+                                    np.max(np.abs(other_joints - measured))),
+                                    4),
+                                "delta_from_measured": self._rounded_list(
+                                    other_joints - measured),
+                            }
+                        self.place_approach_world = world.copy()
                         self.place_arm_joints = joints
                         self.place_slide_cmd = slide
                         self.place_release_world = np.array(
-                            [world[0], world[1], release_z], dtype=float)
+                            [target_x, target_y, release_z], dtype=float)
                         self.place_release_slide_cmd = release_slide
+                        self.place_ik_ref_source = ref_source
+                        self.place_ik_reference_joints = ref.copy()
                         self.get_logger().info(
                             f"[place] approach IK={np.round(world, 3)} "
                             f"release={np.round(self.place_release_world, 3)} "
                             f"slide={slide:.3f}->{release_slide:.3f} "
                             f"descent={descent:.3f}m "
                             f"slot={None if self.place_slot is None else self.place_slot + 1} "
-                            f"refs_tried={len(refs)}")
+                            f"ref_source={ref_source}")
+                        self.get_logger().info(
+                            "[place-joints] ik_selection="
+                            + json.dumps({
+                                "world": self._rounded_list(world),
+                                "slide": round(float(slide), 4),
+                                "release_slide": round(
+                                    float(release_slide), 4),
+                                "selected_ref_source": ref_source,
+                                "measured_at_solve": self._rounded_list(
+                                    measured),
+                                "selected_reference": self._rounded_list(
+                                    ref),
+                                "selected_target": self._rounded_list(
+                                    joints),
+                                "selected_delta_from_measured": (
+                                    self._rounded_list(joints - measured)),
+                                "selected_max_delta_from_measured": round(
+                                    float(np.max(np.abs(
+                                        joints - measured))), 4),
+                                "candidate_by_reference": comparison,
+                                "measured_slide_at_solve": self.joints.get(
+                                    "slide_joint"),
+                                "commanded_slide_at_solve": round(
+                                    float(self.cmd_slide), 4),
+                                "grip_command": self._transport_grip_command,
+                                "measured_grip": (
+                                    self.selected_gripper_position()),
+                            }, ensure_ascii=False, separators=(",", ":")))
                         return joints
 
         self.get_logger().error(
@@ -1501,18 +1705,6 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             and x_min + margin <= float(tcp[0]) <= x_max - margin
             and y_min + margin <= float(tcp[1]) <= y_max - margin)
 
-    @staticmethod
-    def _tcp_at_release_height(
-            tcp: np.ndarray | None, target_z: float) -> bool:
-        """Require measured TCP height to be close to the low release pose."""
-        return (
-            tcp is not None
-            and np.asarray(tcp).shape == (3,)
-            and np.all(np.isfinite(tcp))
-            and target_z - PLACE_RELEASE_HEIGHT_LOWER_TOLERANCE_M
-            <= float(tcp[2])
-            <= target_z + PLACE_RELEASE_HEIGHT_UPPER_TOLERANCE_M)
-
     def _tcp_at_assigned_slot(self, tcp: np.ndarray | None) -> bool:
         """Require the measured release XY to remain near its own slot."""
         if tcp is None or np.asarray(tcp).shape != (3,):
@@ -1530,9 +1722,146 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             return None
         return 0.5 * (np.asarray(left) + np.asarray(right))
 
+    def _place_base_settled(self, now: float) -> bool:
+        """Hold the chassis still before any loaded arm motion begins."""
+        self.set_twist(0.0, 0.0)
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
+        if self._place_base_settle_started_at is None:
+            self._place_base_settle_started_at = now
+            self._place_base_reference_xy = self.base_xy.copy()
+            self._place_base_reference_yaw = float(self.base_yaw)
+            self.get_logger().info(
+                f"[place] base locked before overhead positioning; "
+                f"settle={PLACE_BASE_SETTLE_S:.2f}s "
+                f"reference=({self.base_xy[0]:.3f},"
+                f"{self.base_xy[1]:.3f},"
+                f"{math.degrees(self.base_yaw):.1f}deg)")
+            return False
+        return now - self._place_base_settle_started_at >= PLACE_BASE_SETTLE_S
+
+    def _place_base_diagnostic(self) -> dict:
+        """Report odometry displacement while the physical base is held."""
+        delta_xy = None
+        delta_yaw = None
+        if self._place_base_reference_xy is not None:
+            delta_xy = self.base_xy - self._place_base_reference_xy
+        if self._place_base_reference_yaw is not None:
+            delta_yaw = pick.wrap_to_pi(
+                self.base_yaw - self._place_base_reference_yaw)
+        return {
+            "base_xy": self._rounded_list(self.base_xy),
+            "base_delta_xy": self._rounded_list(delta_xy),
+            "base_delta_yaw": (
+                None if delta_yaw is None else round(float(delta_yaw), 4)),
+            "base_command": [
+                round(float(self.cmd_linear), 4),
+                round(float(self.cmd_angular), 4),
+            ],
+        }
+
+    def _send_single_place_refine_step(
+            self, tcp: np.ndarray, error_xy: np.ndarray) -> None:
+        """Send one bounded horizontal correction at the measured height."""
+        measured_slide = self.joints.get("slide_joint")
+        if measured_slide is None:
+            raise RuntimeError("slide feedback unavailable during place refine")
+        error_norm = float(np.linalg.norm(error_xy))
+        step_xy = error_xy.copy()
+        if error_norm > PLACE_XY_REFINE_STEP_M:
+            step_xy *= PLACE_XY_REFINE_STEP_M / error_norm
+        target_world = np.asarray(tcp, dtype=float).copy()
+        target_world[:2] += step_xy
+        measured = self.selected_arm_positions()
+        joints = self._solve_place_world(
+            target_world, measured, float(measured_slide))
+        if joints is None:
+            raise RuntimeError(
+                "horizontal place refinement IK failed; keeping goods clamped "
+                f"tcp={np.round(tcp, 3)} step={np.round(step_xy, 3)}")
+        self.place_arm_joints = joints
+        self.place_ik_ref_source = "measured_refine"
+        self.place_ik_reference_joints = measured.copy()
+        self.set_selected_arm_target(joints)
+        self.des_slide = float(measured_slide)
+        self.commands_ready_since = None
+        self._place_loaded_arm_step_rad = 0.0
+        self._place_refine_target_sent = True
+        self._place_refine_iterations += 1
+        self.get_logger().info(
+            "[place] horizontal refine step "
+            f"iteration={self._place_refine_iterations} "
+            f"error={np.round(error_xy, 4)}m "
+            f"step={np.round(step_xy, 4)}m "
+            f"height={float(tcp[2]):.3f}m")
+
+    def _begin_single_place_descent(
+            self, now: float, tcp: np.ndarray) -> None:
+        """Freeze the arm and lower only the slide to the release height."""
+        measured_slide = self.joints.get("slide_joint")
+        if measured_slide is None or self.place_release_world is None:
+            raise RuntimeError("release geometry unavailable before descent")
+        target_z = float(self.place_release_world[2])
+        target_slide = float(measured_slide) + (float(tcp[2]) - target_z)
+        if not pick.SLIDE_MIN <= target_slide <= pick.SLIDE_MAX:
+            raise RuntimeError(
+                "safe release height is outside slide range: "
+                f"current={float(measured_slide):.3f} "
+                f"target={target_slide:.3f} tcp_z={float(tcp[2]):.3f} "
+                f"release_z={target_z:.3f}")
+        self.place_release_slide_cmd = target_slide
+        self.des_slide = target_slide
+        self.commands_ready_since = None
+        self._place_slide_stall_snapshot = None
+        self.place_stage = 2
+        self.place_t0 = now
+        self.get_logger().info(
+            f"[place] horizontal target settled; descending vertically "
+            f"with arm fixed, tcp={np.round(tcp, 3)} "
+            f"slide={float(measured_slide):.3f}->{target_slide:.3f}")
+
+    def _start_place_vertical_clear(self, now: float) -> None:
+        """Raise vertically after release before arm or chassis retreat."""
+        measured_slide = self.joints.get("slide_joint")
+        if measured_slide is None:
+            raise RuntimeError("slide feedback unavailable after release")
+        target_slide = max(
+            pick.SLIDE_MIN,
+            float(measured_slide) - PLACE_VERTICAL_CLEARANCE_M)
+        self.des_slide = target_slide
+        self.commands_ready_since = None
+        self.place_stage = 4
+        self.place_t0 = now
+        self.get_logger().info(
+            f"[place] goods released; raising vertically before retreat "
+            f"slide={float(measured_slide):.3f}->{target_slide:.3f}")
+
+    def _place_vertical_clear_tick(self, now: float) -> None:
+        """Complete post-release vertical clearance with the base locked."""
+        self.set_twist(0.0, 0.0)
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
+        self.des_left_grip = pick.GRIP_OPEN
+        self.des_right_grip = pick.GRIP_OPEN
+        ready = (
+            self.dual_commands_ready(
+                arm_tolerance=0.05, slide_tolerance=0.020)
+            if self.use_dual_tissue_grasp
+            else self.commands_ready(
+                arm_tolerance=0.05, slide_tolerance=0.020))
+        if ready:
+            self.get_logger().info(
+                "[place] vertical clearance reached; arm/base retreat may begin")
+            self._start_place_retreat(now)
+            return
+        if now - self.place_t0 >= PLACE_VERTICAL_CLEAR_TIMEOUT_S:
+            raise RuntimeError(
+                "post-release vertical clearance did not settle within "
+                f"{PLACE_VERTICAL_CLEAR_TIMEOUT_S:.1f}s")
+
     def _place_tick(self) -> None:
         now = self.now()
-        if self.place_stage == 4:
+        if self.place_stage == 5:
             self._clear_delivery_table_tick(now)
             return
         if self.use_dual_tissue_grasp:
@@ -1540,9 +1869,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             return
 
         if self.place_stage == 0:
-            # 1) perform a guarded final base approach; 2) solve and reach a
-            # high approach pose over the table.
+            # Stop and settle the chassis, then move to a safe overhead pose.
             if not self._advance_place_creep():
+                return
+            if not self._place_base_settled(now):
                 return
             if self.place_arm_joints is None:
                 self.place_arm_joints = self._compute_place_arm_joints()
@@ -1561,6 +1891,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                         "[place] loaded-arm soft start enabled "
                         f"max_step={PLACE_LOADED_ARM_MAX_STEP_RAD:.4f}rad/"
                         "tick")
+                    self.get_logger().info(
+                        "[place-joints] motion_start="
+                        + json.dumps(
+                            self._place_joint_snapshot(),
+                            ensure_ascii=False, separators=(",", ":")))
                 else:
                     raise RuntimeError(
                         "place IK failed; refusing to release goods off-table")
@@ -1574,38 +1909,30 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 else now - self.place_t0)
             converged = self.commands_ready(
                 arm_tolerance=0.05, slide_tolerance=0.05)
-            soft_ready = (
-                self._place_arm_target_sent
-                and approach_elapsed >= PLACE_APPROACH_SOFT_DWELL_S
-                and arm_error <= PLACE_APPROACH_SOFT_ARM_TOLERANCE_RAD
-                and slide_error <= PLACE_APPROACH_SOFT_SLIDE_TOLERANCE_M)
-            if converged or soft_ready:
-                gate = "converged" if converged else "soft"
+            if converged:
                 tcp = self.selected_tcp_world()
                 if not self._tcp_over_delivery_table(tcp):
                     raise RuntimeError(
                         "measured place TCP is outside delivery tabletop: "
                         f"{None if tcp is None else np.round(tcp, 3)}")
-                if not self._tcp_at_assigned_slot(tcp):
-                    raise RuntimeError(
-                        "measured place TCP missed assigned slot: "
-                        f"tcp={None if tcp is None else np.round(tcp, 3)} "
-                        f"slot={np.round(self.place_world[:2], 3)}")
                 self.get_logger().info(
-                    f"[place] arm at approach pose gate={gate} "
+                    f"[place] goods reached safe overhead pose "
                     f"elapsed={approach_elapsed:.2f}s "
                     f"arm_error={arm_error:.4f}rad "
                     f"slide_error={slide_error:.4f}m tcp="
                     f"{None if tcp is None else np.round(tcp, 3)}; "
-                    "starting vertical descent with gripper closed")
+                    "starting fixed-height horizontal refinement")
+                self.get_logger().info(
+                    "[place-joints] approach_reached="
+                    + json.dumps(
+                        self._place_joint_snapshot(),
+                        ensure_ascii=False, separators=(",", ":")))
                 self.place_stage = 1
                 self.place_t0 = now
-                if self.place_release_slide_cmd is None:
-                    raise RuntimeError(
-                        "place release slide target was not computed")
-                self.des_slide = self.place_release_slide_cmd
+                self._place_refine_started_at = now
+                self._place_refine_target_sent = False
+                self._place_refine_stable_since = None
                 self.commands_ready_since = None
-                self._place_descent_sent = True
             elif (self._place_arm_target_sent
                     and now - self._place_stage0_wait_log
                     >= PLACE_APPROACH_PROGRESS_LOG_S):
@@ -1615,21 +1942,78 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     f"elapsed={approach_elapsed:.2f}s "
                     f"arm_error={arm_error:.4f}rad "
                     f"slide_error={slide_error:.4f}m")
+                self.get_logger().info(
+                    "[place-joints] approach_progress="
+                    + json.dumps({
+                        "elapsed": round(float(approach_elapsed), 3),
+                        **self._place_joint_snapshot(),
+                    }, ensure_ascii=False, separators=(",", ":")))
             if (self._place_arm_target_sent
                     and approach_elapsed >= PLACE_APPROACH_HARD_TIMEOUT_S
-                    and not (converged or soft_ready)):
+                    and not converged):
                 raise RuntimeError(
                     "[place] approach pose did not settle within "
                     f"{PLACE_APPROACH_HARD_TIMEOUT_S:.0f}s "
                     f"(arm_error={arm_error:.4f}rad "
                     f"slide_error={slide_error:.4f}m)")
         elif self.place_stage == 1:
-            # Keep the product clamped while the slide lowers the complete arm
-            # vertically.  Opening is forbidden until measured XY and Z both
-            # confirm a near-table release pose.
-            if not self.commands_ready(
-                    arm_tolerance=0.05, slide_tolerance=0.025):
+            # Keep Z and the gripper fixed while correcting XY in small steps.
+            if (self._place_refine_started_at is not None
+                    and now - self._place_refine_started_at
+                    >= PLACE_XY_REFINE_TIMEOUT_S):
+                raise RuntimeError(
+                    "horizontal place refinement timed out; keeping goods "
+                    f"clamped after {PLACE_XY_REFINE_TIMEOUT_S:.1f}s")
+            if self._place_refine_target_sent:
+                if not self.commands_ready(
+                        arm_tolerance=0.05, slide_tolerance=0.020):
+                    return
+                self._place_refine_target_sent = False
+                self.commands_ready_since = None
+            tcp = self.selected_tcp_world()
+            if not self._tcp_over_delivery_table(tcp):
+                raise RuntimeError(
+                    "TCP left delivery tabletop during horizontal refine: "
+                    f"{None if tcp is None else np.round(tcp, 3)}")
+            error_xy = self.place_world[:2] - tcp[:2]
+            if np.linalg.norm(error_xy) <= PLACE_SLOT_XY_TOLERANCE_M:
+                if self._place_refine_stable_since is None:
+                    self._place_refine_stable_since = now
+                if (now - self._place_refine_stable_since
+                        >= PLACE_XY_REFINE_SETTLE_S):
+                    self.get_logger().info(
+                        "[place] horizontal refinement verified "
+                        f"error={np.round(error_xy, 4)}m "
+                        f"settle={PLACE_XY_REFINE_SETTLE_S:.2f}s")
+                    self._begin_single_place_descent(now, tcp)
                 return
+            self._place_refine_stable_since = None
+            self._send_single_place_refine_step(tcp, error_xy)
+        elif self.place_stage == 2:
+            # Arm joints remain fixed; only the slide lowers the goods.
+            if not self.commands_ready(
+                    arm_tolerance=0.05, slide_tolerance=0.010):
+                # 下降未到位：先检查是否商品底部触桌顶住了 slide。若是，
+                # 停止下压并就地释放；若停滞但商品底部未在桌面，按真失败
+                # 处理（继续等 PLACE_DESCENT_TIMEOUT_S）。
+                if self._place_slide_stalled(now):
+                    tcp = self.selected_tcp_world()
+                    if self._product_bottom_at_table(tcp):
+                        self._place_contact_release(now, tcp)
+                        return
+                    if now - self._place_stall_warn_log >= 1.0:
+                        self._place_stall_warn_log = now
+                        self.get_logger().warn(
+                            "[place] slide stalled but product bottom is not "
+                            "at table height "
+                            f"(tcp={None if tcp is None else np.round(tcp, 3)}); "
+                            "treating as a real descent failure")
+                if now - self.place_t0 >= PLACE_DESCENT_TIMEOUT_S:
+                    raise RuntimeError(
+                        "vertical place descent did not settle within "
+                        f"{PLACE_DESCENT_TIMEOUT_S:.1f}s")
+                return
+            self._place_slide_stall_snapshot = None
             tcp = self.selected_tcp_world()
             if not self._tcp_over_delivery_table(tcp):
                 raise RuntimeError(
@@ -1640,24 +2024,51 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     "measured lowered TCP missed assigned slot: "
                     f"tcp={None if tcp is None else np.round(tcp, 3)} "
                     f"slot={np.round(self.place_world[:2], 3)}")
-            target_z = float(self.place_release_world[2])
-            if not self._tcp_at_release_height(tcp, target_z):
+            if not self._product_bottom_at_table(tcp):
                 raise RuntimeError(
-                    "measured TCP did not reach safe release height: "
-                    f"tcp={None if tcp is None else np.round(tcp, 3)} "
-                    f"target_z={target_z:.3f}")
+                    "measured product bottom is not at table height: "
+                    f"tcp={None if tcp is None else np.round(tcp, 3)}")
             self.get_logger().info(
                 f"[place] low pose verified; tcp={np.round(tcp, 3)} "
                 f"product_bottom_clearance="
                 f"{PLACE_PRODUCT_BOTTOM_CLEARANCE_M:.3f}m; releasing")
-            self.place_stage = 2
+            self.get_logger().info(
+                "[place-joints] release_verified="
+                + json.dumps(
+                    self._place_joint_snapshot(),
+                    ensure_ascii=False, separators=(",", ":")))
+            self.place_stage = 3
             self.place_t0 = now
-        elif self.place_stage == 2:
+            self._place_release_started_at = None
+            self._place_slide_stall_snapshot = None
+        elif self.place_stage == 3:
+            # Let the low pose settle before opening.  No arm, slide or base
+            # target changes are permitted while the jaws release the goods.
+            if self._place_release_started_at is None:
+                self._hold_grasp_during_transport()
+                if now - self.place_t0 < PLACE_RELEASE_POSE_SETTLE_S:
+                    return
+                tcp = self.selected_tcp_world()
+                if (not self._tcp_over_delivery_table(tcp)
+                        or not self._tcp_at_assigned_slot(tcp)
+                        or not self._product_bottom_at_table(tcp)):
+                    raise RuntimeError(
+                        "release pose moved outside the verified target while "
+                        f"settling: tcp="
+                        f"{None if tcp is None else np.round(tcp, 3)}")
+                self._place_release_started_at = now
+                self.get_logger().info(
+                    f"[place] release pose stable for "
+                    f"{PLACE_RELEASE_POSE_SETTLE_S:.2f}s; opening gripper")
             self._set_selected_grip(pick.GRIP_OPEN)
-            if now - self.place_t0 >= self.place_release_dwell_s:
-                self._start_place_retreat(now)
+            if (now - self._place_release_started_at
+                    >= self.place_release_dwell_s):
+                self._start_place_vertical_clear(now)
+        elif self.place_stage == 4:
+            self._place_vertical_clear_tick(now)
 
-    def _configure_dual_place_target(self) -> bool:
+    def _configure_dual_place_target(
+            self, max_step_m: float | None = None) -> bool:
         """Translate the clamped tissue centre to the assigned slot."""
         left_tcp = self.arm_tcp_world("left")
         right_tcp = self.arm_tcp_world("right")
@@ -1671,6 +2082,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
         centre = 0.5 * (np.asarray(left_tcp) + np.asarray(right_tcp))
         offset_xy = self.place_world[:2] - centre[:2]
+        offset_norm = float(np.linalg.norm(offset_xy))
+        if (max_step_m is not None and offset_norm > max_step_m):
+            offset_xy *= max_step_m / offset_norm
         left_goal = np.asarray(left_tcp, dtype=float).copy()
         right_goal = np.asarray(right_tcp, dtype=float).copy()
         left_goal[:2] += offset_xy
@@ -1711,6 +2125,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 np.abs(item - arms_reference))))
         self.des_left_arm = best[:6].copy()
         self.des_right_arm = best[6:].copy()
+        self.place_ik_ref_source = "measured_dual"
+        self.place_ik_reference_joints = arms_reference.copy()
         self.commands_ready_since = None
         self._place_loaded_arm_step_rad = 0.0
         self._dual_place_target_sent = True
@@ -1721,83 +2137,204 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             f"centre={np.round(centre, 3)} "
             f"target={np.round(self.place_world[:2], 3)} "
             f"offset={np.round(offset_xy, 3)}")
+        self.get_logger().info(
+            "[place-joints] dual_ik_selection="
+            + json.dumps({
+                "ref_source": self.place_ik_ref_source,
+                "measured_left": self._rounded_list(left_reference),
+                "measured_right": self._rounded_list(right_reference),
+                "target_left": self._rounded_list(best[:6]),
+                "target_right": self._rounded_list(best[6:]),
+                "delta_left": self._rounded_list(
+                    best[:6] - left_reference),
+                "delta_right": self._rounded_list(
+                    best[6:] - right_reference),
+                "max_joint_delta_from_measured": round(float(np.max(
+                    np.abs(best - arms_reference))), 4),
+                "measured_slide": round(float(slide), 4),
+                "grip_command": self._transport_grip_command,
+            }, ensure_ascii=False, separators=(",", ":")))
         return True
 
     def _place_tick_dual(self, now: float) -> None:
-        """Dual-arm tissue place at its slot, then descend vertically."""
+        """Place dual-arm tissue through overhead, XY, descent and release."""
         if self.place_stage == 0:
             self.des_left_grip = pick.DUAL_TISSUE_GRIP_COMMAND
             self.des_right_grip = pick.DUAL_TISSUE_GRIP_COMMAND
             if not self._advance_place_creep():
+                return
+            if not self._place_base_settled(now):
                 return
             if not self._dual_place_target_sent:
                 if not self._configure_dual_place_target():
                     raise RuntimeError(
                         "dual-arm IK failed for assigned delivery slot")
                 return
-            if not self._dual_descent_sent:
-                if not self.dual_commands_ready(
-                        arm_tolerance=0.05, slide_tolerance=0.025):
-                    if now - self.place_t0 >= PLACE_APPROACH_HARD_TIMEOUT_S:
-                        raise RuntimeError(
-                            "dual-arm assigned-slot approach did not settle "
-                            f"within {PLACE_APPROACH_HARD_TIMEOUT_S:.0f}s")
-                    return
-                release_world = self._dual_release_world()
-                if (not self._tcp_over_delivery_table(release_world)
-                        or not self._tcp_at_assigned_slot(release_world)):
+            if not self.dual_commands_ready(
+                    arm_tolerance=0.05, slide_tolerance=0.025):
+                if (now - self._place_stage0_wait_log
+                        >= PLACE_APPROACH_PROGRESS_LOG_S):
+                    self._place_stage0_wait_log = now
+                    self.get_logger().info(
+                        "[place-joints] dual_approach_progress="
+                        + json.dumps({
+                            "elapsed": round(float(now - self.place_t0), 3),
+                            "max_joint_delta_from_measured": round(
+                                float(self.dual_arm_error()), 4),
+                            "measured_slide": self.joints.get("slide_joint"),
+                            "centre_world": self._rounded_list(
+                                self._dual_release_world()),
+                            **self._place_base_diagnostic(),
+                        }, ensure_ascii=False, separators=(",", ":")))
+                if now - self.place_t0 >= PLACE_APPROACH_HARD_TIMEOUT_S:
                     raise RuntimeError(
-                        "dual-arm centre missed assigned delivery slot: "
-                        f"centre={None if release_world is None else np.round(release_world, 3)} "
-                        f"slot={np.round(self.place_world[:2], 3)}")
+                        "dual-arm overhead pose did not settle within "
+                        f"{PLACE_APPROACH_HARD_TIMEOUT_S:.0f}s")
+                return
+            release_world = self._dual_release_world()
+            if not self._tcp_over_delivery_table(release_world):
+                raise RuntimeError(
+                    "dual-arm centre is outside delivery tabletop: "
+                    f"{None if release_world is None else np.round(release_world, 3)}")
+            self.place_stage = 1
+            self.place_t0 = now
+            self._place_refine_started_at = now
+            self._place_refine_target_sent = False
+            self._place_refine_stable_since = None
+            self._dual_place_target_sent = False
+            self.commands_ready_since = None
+            self.get_logger().info(
+                f"[place-dual] tissue reached safe overhead pose; "
+                f"starting horizontal refinement centre="
+                f"{np.round(release_world, 3)}")
+        elif self.place_stage == 1:
+            if (self._place_refine_started_at is not None
+                    and now - self._place_refine_started_at
+                    >= PLACE_XY_REFINE_TIMEOUT_S):
+                raise RuntimeError(
+                    "dual-arm horizontal place refinement timed out; "
+                    "keeping tissue clamped")
+            if self._dual_place_target_sent:
+                if not self.dual_commands_ready(
+                        arm_tolerance=0.05, slide_tolerance=0.020):
+                    return
+                self._dual_place_target_sent = False
+                self.commands_ready_since = None
+            release_world = self._dual_release_world()
+            if not self._tcp_over_delivery_table(release_world):
+                raise RuntimeError(
+                    "dual-arm centre left tabletop during horizontal refine")
+            error_xy = self.place_world[:2] - release_world[:2]
+            if np.linalg.norm(error_xy) <= PLACE_SLOT_XY_TOLERANCE_M:
+                if self._place_refine_stable_since is None:
+                    self._place_refine_stable_since = now
+                if (now - self._place_refine_stable_since
+                        < PLACE_XY_REFINE_SETTLE_S):
+                    return
                 measured_slide = self.joints.get("slide_joint")
                 if measured_slide is None:
                     return
                 target_z = self._product_release_z()
-                # slide axis is world -Z, so adding the measured centre-height
-                # error moves the clamped tissue centre to target_z.
                 target_slide = float(measured_slide) + (
                     float(release_world[2]) - target_z)
                 if not pick.SLIDE_MIN <= target_slide <= pick.SLIDE_MAX:
                     raise RuntimeError(
                         "dual-arm safe release is outside slide range: "
-                        f"current={float(measured_slide):.3f} "
-                        f"target={target_slide:.3f} "
-                        f"tcp_z={float(release_world[2]):.3f} "
-                        f"release_z={target_z:.3f}")
+                        f"target={target_slide:.3f}")
                 self.dual_release_slide_cmd = target_slide
                 self.des_slide = target_slide
                 self.commands_ready_since = None
                 self._dual_descent_sent = True
+                self.place_stage = 2
+                self.place_t0 = now
                 self.get_logger().info(
-                    f"[place-dual] descending with tissue clamped; "
-                    f"centre={np.round(release_world, 3)} "
-                    f"target_z={target_z:.3f} "
+                    f"[place-dual] horizontal target settled; descending "
+                    f"vertically centre={np.round(release_world, 3)} "
                     f"slide={float(measured_slide):.3f}->{target_slide:.3f}")
                 return
+            self._place_refine_stable_since = None
+            if not self._configure_dual_place_target(
+                    max_step_m=PLACE_XY_REFINE_STEP_M):
+                raise RuntimeError(
+                    "dual-arm horizontal refinement IK failed")
+            self._place_refine_iterations += 1
+        elif self.place_stage == 2:
             if not self.dual_commands_ready(
-                    arm_tolerance=0.05, slide_tolerance=0.025):
+                    arm_tolerance=0.05, slide_tolerance=0.010):
+                # 同单臂：商品底部触桌顶住 slide 时，停止下压并就地释放。
+                if self._place_slide_stalled(now):
+                    release_world = self._dual_release_world()
+                    if self._product_bottom_at_table(release_world):
+                        self._place_contact_release(now, release_world)
+                        return
+                    if now - self._place_stall_warn_log >= 1.0:
+                        self._place_stall_warn_log = now
+                        self.get_logger().warn(
+                            "[place-dual] slide stalled but product bottom "
+                            "is not at table height "
+                            f"(centre={None if release_world is None else np.round(release_world, 3)}); "
+                            "treating as a real descent failure")
+                if now - self.place_t0 >= PLACE_DESCENT_TIMEOUT_S:
+                    raise RuntimeError(
+                        "dual-arm vertical descent did not settle within "
+                        f"{PLACE_DESCENT_TIMEOUT_S:.1f}s")
                 return
+            self._place_slide_stall_snapshot = None
             release_world = self._dual_release_world()
-            target_z = self._product_release_z()
             if (not self._tcp_over_delivery_table(release_world)
                     or not self._tcp_at_assigned_slot(release_world)
-                    or not self._tcp_at_release_height(
-                        release_world, target_z)):
+                    or not self._product_bottom_at_table(release_world)):
                 raise RuntimeError(
                     "dual-arm measured release pose is unsafe: "
-                    f"centre={None if release_world is None else np.round(release_world, 3)} "
-                    f"target_z={target_z:.3f}")
-            self.place_stage = 1
+                    f"centre={None if release_world is None else np.round(release_world, 3)}")
+            target_z = self._product_release_z()
+            self.place_stage = 3
             self.place_t0 = now
+            self._place_release_started_at = None
+            self._place_slide_stall_snapshot = None
             self.get_logger().info(
                 f"[place-dual] low pose verified; "
                 f"centre={np.round(release_world, 3)}; releasing")
-        elif self.place_stage == 1:
+            self.get_logger().info(
+                "[place-joints] dual_release_verified="
+                + json.dumps({
+                    "measured_left": self._rounded_list(
+                        self.arm_positions("left")),
+                    "measured_right": self._rounded_list(
+                        self.arm_positions("right")),
+                    "measured_slide": self.joints.get("slide_joint"),
+                    "centre_world": self._rounded_list(release_world),
+                    "target_z": round(float(target_z), 4),
+                    "measured_left_grip": self.joints.get(
+                        "left_arm_eef_gripper_joint"),
+                    "measured_right_grip": self.joints.get(
+                        "right_arm_eef_gripper_joint"),
+                }, ensure_ascii=False, separators=(",", ":")))
+        elif self.place_stage == 3:
+            if self._place_release_started_at is None:
+                self.des_left_grip = pick.DUAL_TISSUE_GRIP_COMMAND
+                self.des_right_grip = pick.DUAL_TISSUE_GRIP_COMMAND
+                if now - self.place_t0 < PLACE_RELEASE_POSE_SETTLE_S:
+                    return
+                release_world = self._dual_release_world()
+                if (not self._tcp_over_delivery_table(release_world)
+                        or not self._tcp_at_assigned_slot(release_world)
+                        or not self._product_bottom_at_table(release_world)):
+                    raise RuntimeError(
+                        "dual-arm release pose moved outside the verified "
+                        f"target while settling: centre="
+                        f"{None if release_world is None else np.round(release_world, 3)}")
+                self._place_release_started_at = now
+                self.get_logger().info(
+                    f"[place-dual] low pose stable for "
+                    f"{PLACE_RELEASE_POSE_SETTLE_S:.2f}s; opening grippers")
             self.des_left_grip = pick.GRIP_OPEN
             self.des_right_grip = pick.GRIP_OPEN
-            if now - self.place_t0 >= self.place_release_dwell_s:
-                self._start_place_retreat(now)
+            if (now - self._place_release_started_at
+                    >= self.place_release_dwell_s):
+                self._start_place_vertical_clear(now)
+        elif self.place_stage == 4:
+            self._place_vertical_clear_tick(now)
 
     def _clear_delivery_table_tick(self, now: float) -> None:
         """Back away after release so the next order can safely turn."""
@@ -1818,9 +2355,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             # arm performed the grasp.  Completion is feedback-gated below.
             self._command_initial_arm_posture()
         else:
-            # The arm and slide targets remain exactly at the verified release
-            # pose during the first half.  Only keep both released grippers
-            # explicitly open while the base moves away from the product.
+            # The arm and slide targets remain at the vertically cleared pose
+            # during the first half.  Keep both released grippers explicitly
+            # open while the base moves away from the product.
             self.des_left_grip = pick.GRIP_OPEN
             self.des_right_grip = pick.GRIP_OPEN
 
@@ -1868,7 +2405,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
         loaded_place_extension = (
             self.flow_phase == "place"
-            and self.place_stage == 0
+            and self.place_stage in {0, 1}
             and (
                 (self.use_dual_tissue_grasp
                  and self._dual_place_target_sent)
@@ -1920,13 +2457,23 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 and full_hold):
             self.cmd_angular = 0.0
 
+        # Once the final creep has stopped, arm positioning, refinement,
+        # descent and release all run against one fixed world-frame base.
+        if (self.flow_phase == "place"
+                and (self.place_stage in {1, 2, 3, 4}
+                     or (self.place_stage == 0 and self.place_creep_done))):
+            self.cmd_linear = 0.0
+            self.cmd_angular = 0.0
+
         single_descent = (
-            not self.use_dual_tissue_grasp and self.place_stage == 1)
+            not self.use_dual_tissue_grasp and self.place_stage == 2)
         dual_descent = (
             self.use_dual_tissue_grasp
-            and self.place_stage == 0
+            and self.place_stage == 2
             and self._dual_descent_sent)
-        if self.flow_phase == "place" and (single_descent or dual_descent):
+        vertical_clear = self.place_stage == 4
+        if (self.flow_phase == "place"
+                and (single_descent or dual_descent or vertical_clear)):
             self.cmd_slide = float(self.slew(
                 previous_slide,
                 self.des_slide,
@@ -1999,11 +2546,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         single_place_hold = (
             self.flow_phase == "place"
             and not self.use_dual_tissue_grasp
-            and self.place_stage in {0, 1})
+            and self.place_stage in {0, 1, 2})
         dual_place_hold = (
             self.flow_phase == "place"
             and self.use_dual_tissue_grasp
-            and self.place_stage == 0)
+            and self.place_stage in {0, 1, 2})
         if (self.flow_phase in {
                 "backup", "restore_height", "nav_to_delivery"}
                 or single_place_hold or dual_place_hold):

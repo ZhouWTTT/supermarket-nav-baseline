@@ -37,9 +37,12 @@ START_POSE = (1.92, -3.17, math.pi / 2.0)
 # proximity to the table surface.
 DELIVERY_APPROACH = (-1.80, -2.60, -math.pi / 2.0)
 # Canonical endpoints of the reusable obstacle-corridor trunk.  Per-shelf and
-# per-table-slot connectors are intentionally excluded from path memory.
+# per-table-slot connectors are intentionally excluded from path memory.  The
+# table-end yaw follows the actual final A* segment (about -134 degrees), so
+# reversing the trunk starts northeast instead of forcing a 180-degree turn
+# from the south-facing delivery pose.
 DELIVERY_TRUNK_ENTRY = (-0.70, 1.45, -math.pi / 2.0)
-DELIVERY_TRUNK_EXIT = (-1.94, -2.40, -math.pi / 2.0)
+DELIVERY_TRUNK_EXIT = (-1.94, -2.40, -3.0 * math.pi / 4.0)
 
 # Delivery-table geometry copied from ``mjcf/retail_competition.xml``.  The
 # second rectangle is deliberately 3 cm larger on every side so navigation
@@ -704,7 +707,9 @@ class NavigationController:
 
         # Velocity limits
         self.max_lin = 0.90
-        self.max_ang = 2.5
+        # 导航行进最大角速度：2026-08-17 从 2.5 降至 2.0 rad/s，
+        # 降低载货转弯时的甩动与商品滑落风险。
+        self.max_ang = 2.0
         # Keep useful speed through the last open-space approach.  Obstacle
         # clearance scaling and all hard-stop checks below still take
         # precedence, so this only raises the cap when the route is clear.

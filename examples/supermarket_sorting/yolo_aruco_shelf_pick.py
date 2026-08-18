@@ -85,7 +85,7 @@ def fixed_layout_by_marker():
 PRODUCT_CENTER_ABOVE_MARKER_M = {
     "sanmingzhi": 0.0434,
     "heweidao": 0.00,
-    "shupian": 0.030,
+    "shupian": 0.040,
     "zhijin": 0.043,
     "maidong": 0.034,
     "kele": 0.0315,
@@ -94,20 +94,23 @@ PRODUCT_CENTER_ABOVE_MARKER_M = {
     "chengzi": 0.036,
 }
 
-# Physical half-heights used to clamp a YOLO-only centre estimate to the
-# selected shelf surface.  This keeps depth noise from lifting the fingers
-# into the shelf above when no ArUco pose is available.
+# Product centre heights above the shelf board surface (half heights of the
+# collision geometry).  Used to bound depth-only fallback estimates: the
+# measured "world Z" can land on the front/top face of a tall product and
+# must never be treated as the product centre above this envelope.
+# 数值来自 wxj continuous-multi-order-v2 分支（2026-08-17 合并）。
 PRODUCT_HALF_HEIGHT_M = {
     "sanmingzhi": 0.0494,
-    "heweidao": 0.0525,
-    "shupian": 0.1050,
+    "heweidao": 0.00,
+    "shupian": 0.0350,
     "zhijin": 0.0440,
-    "maidong": 0.1050,
-    "kele": 0.0725,
+    "maidong": 0.03550,
+    "kele": 0.0325,
     "kouxiangtang": 0.0400,
     "pingguo": 0.0350,
     "chengzi": 0.0370,
 }
+# Allowance above surface + half height when clamping depth-only Z estimates.
 PRODUCT_CENTER_Z_TOLERANCE_M = 0.015
 
 # Physical lateral widths from the scene collision geometry.  Gripper
@@ -175,14 +178,6 @@ def fixed_marker_world_by_id():
         ])
         for marker_id, slot in fixed_layout_by_marker().items()
     }
-
-# 固定布局中所有中间列（C2）的世界 x，用于纸巾"直接探入"动作判定。
-@lru_cache(maxsize=1)
-def middle_tissue_column_x() -> tuple:
-    return tuple(sorted({
-        round(float(slot["world_position"][0]), 3)
-        for slot in fixed_layout_by_marker().values()
-        if slot.get("column") == "C2"}))
 
 
 # East-to-west scan stations, all in the unobstructed shelf approach aisle.
@@ -264,6 +259,9 @@ NAV_X_MAX = 2.05
 # stall the phase.
 NAV_LINEAR_MAX_MPS = 0.90
 NAV_LINEAR_MIN_MPS = 0.10
+# 货架对齐的最后一段使用更低的进给下限：对齐容差只有 2.5cm，高速停车
+# 过冲会偏移抓取位姿。最后 50mm 保持低速，不做加速。
+NAV_ALIGN_LINEAR_MIN_MPS = 0.10
 NAV_ROTATE_GATE_RAD = 0.45
 NAV_ANGULAR_MAX_RADPS = 1.50
 NAV_TRANSLATE_ANGULAR_MAX_RADPS = 1.00
@@ -326,6 +324,9 @@ LOWER_GRASP_TCP_FORWARD_M = 0.035
 # solve both endpoints during configuration; sphere profiles build the second
 # endpoint once from the measured physical-contact pose.
 GENERIC_POST_CONTACT_EXTENSION_M = 0.050
+# 按货物类型覆盖接触后前伸量（米）：薯片罐用 25mm——既让罐子坐进夹爪
+# 更深、夹得更稳，又避免 50mm 长前伸把罐子推倒。
+GENERIC_POST_EXTEND_M_BY_KIND = {"shupian": 0.025}
 # The extended middle/lower endpoint is outside the analytic arm envelope from
 # SCAN_Y once navigation tolerance is included.  Move only those non-spherical
 # profiles closer; sphere alignment and the top profile remain unchanged.
@@ -373,7 +374,7 @@ TOP_GRASP_TCP_FORWARD_M = 0.035
 # implemented and tested separately.
 SPHERE_RADIUS_M = {"pingguo": 0.035, "chengzi": 0.037}
 SPHERE_FINGER_ENGAGEMENT_M = 0.012
-SPHERE_FAST_SPEED_MPS = 0.18
+SPHERE_FAST_SPEED_MPS = 0.12
 SPHERE_TERMINAL_SPEED_MPS = 0.055
 SPHERE_TERMINAL_ZONE_M = 0.045
 SPHERE_OPEN_GRIP_DROP_CONTACT = 0.08
@@ -419,6 +420,9 @@ MIDDLE_SPHERE_DEPLOY_TIMEOUT_S = 7.0
 # endpoints are generated; the controller streams continuously between them.
 FRONT_GRASP_OVERSHOOT_M = 0.03
 ARM_COMMAND_MAX_STEP_RAD = 0.022
+# 收回阶段（STATE_RETREAT）使用更小的关节步长：抓取后带着货物往回撤时
+# 速度放慢约一半，避免快速收臂让货物晃动/刮擦货架。
+RETREAT_ARM_MAX_STEP_RAD = 0.010
 # Every product profile uses the same measured Cartesian terminal slowdown.
 # This is a command-rate limit, not a per-class position correction: outside
 # the final 50 mm the arm keeps its current speed, then smoothly ramps down to
@@ -436,9 +440,9 @@ LIFT_AMOUNT_M = 0.06
 # joint interpolation without measured-TCP correction, convergence gates, or
 # replanning.  Keeping the peak Cartesian-equivalent speed low prevents light
 # goods from being struck while eliminating feedback-induced shaking.
-GENERIC_DIRECT_FORWARD_SPEED_MPS = 0.018
-GENERIC_DIRECT_FORWARD_MIN_DURATION_S = 4.0
-GENERIC_DIRECT_FORWARD_SETTLE_S = 1.0
+GENERIC_DIRECT_FORWARD_SPEED_MPS = 0.036
+GENERIC_DIRECT_FORWARD_MIN_DURATION_S = 2.5
+GENERIC_DIRECT_FORWARD_SETTLE_S = 0.5
 GENERIC_DIRECT_FORWARD_MIN_SETTLE_S = 0.20
 # A single feedback sample can cross the endpoint tolerance while the arm is
 # still ringing.  Early completion therefore requires a short continuous
@@ -449,7 +453,12 @@ MOTION_ENDPOINT_STABILITY_S = 0.12
 GENERIC_DIRECT_DEPLOY_DWELL_S = 2.0
 GENERIC_DEPLOY_SOFT_ARM_TOLERANCE_RAD = 0.12
 GENERIC_DEPLOY_HARD_TIMEOUT_S = 8.0
-GENERIC_TOP_LIFT_M = 0.025
+# 部署期 pregrasp 未收敛时，向前微调基座、回到 ALIGN 重新解算并重试，
+# 而不是直接放弃整单（避免整单重扫 + 重新定位 + 重复核）。达到上限仍
+# 失败才中止。
+GENERIC_DEPLOY_RETRY_MAX = 2
+GENERIC_DEPLOY_RETRY_STEP_M = 0.02
+GENERIC_TOP_LIFT_M = 0.045
 GENERIC_TOP_LIFT_TIMEOUT_S = 5.0
 
 # A tissue box is 172 mm wide, more than twice one gripper's 80 mm opening.
@@ -458,8 +467,6 @@ GENERIC_TOP_LIFT_TIMEOUT_S = 5.0
 # reach around both sides, move inward together, lift with the slide, and
 # retreat together while maintaining the lateral squeeze.
 DUAL_TISSUE_PREGRASP_BACKOFF_M = 0.160
-# Normal (non-post-band) path uses the original insertion depth; the post-band
-# dogleg overrides it with DUAL_TISSUE_POST_INSERT_FORWARD_M below.
 # 探入深度从 +2cm 加大到 +3cm：侧夹/环绕位置更深入纸盒两侧，夹得更稳。
 DUAL_TISSUE_INSERT_FORWARD_M = 0.030
 # Keep the complete gripper bodies clear during insertion, not merely their
@@ -467,50 +474,15 @@ DUAL_TISSUE_INSERT_FORWARD_M = 0.030
 # 86 mm tissue half-width, so the measured ~20 mm lateral vision error does
 # not turn one arm into an early frontal contact.
 DUAL_TISSUE_PREGRASP_HALF_SPAN_M = 0.150
-# 中间列"直接探入"的初始双臂间距：比普通 pregrasp 更宽（16cm 半跨度），
-# 先宽跨度直探到盒侧，到位后再闭合到夹持跨度。
-DUAL_TISSUE_DIRECT_PROBE_SPAN_M = 0.160
+# "直接探入"的初始双臂间距（单侧半跨度，wxj v2 值）：总间距 28cm（单侧
+# 14cm），合拢行程约 5cm，两侧基本同时夹住盒壁，又保留足够的横向视觉
+# 误差余量。全列统一使用。
+DUAL_TISSUE_DIRECT_PROBE_SPAN_M = 0.140
 DUAL_TISSUE_SURROUND_HALF_SPAN_M = 0.140
 # Half-span of the final side clamp.  The closed grippers approach the 172 mm
-# box from the sides; keep the span comfortably wider than the box half-width
-# so the jaws wrap the sides instead of jamming onto the top corners.
-# Normal-path final side clamp half-span (original value); the post-band
-# dogleg overrides it with DUAL_TISSUE_POST_CLAMP_HALF_SPAN_M below.
-DUAL_TISSUE_CLAMP_HALF_SPAN_M = 0.095
-# Post-band (dogleg) overrides, isolated from the normal path.  All tuning
-# done on the wall-side blocked columns lives here; the normal path keeps the
-# original values above.
-DUAL_TISSUE_POST_INSERT_FORWARD_M = -0.034
-DUAL_TISSUE_POST_CLAMP_HALF_SPAN_M = 0.100
-DUAL_TISSUE_POST_LOWER_TCP_CLEARANCE_M = 0.13
-DUAL_TISSUE_POST_ALIGN_X_TOLERANCE_M = 0.010
-DUAL_TISSUE_POST_PREGRASP_HALF_SPAN_M = 0.200
-DUAL_TISSUE_POST_TCP_CLEARANCE_M = 0.130
-DUAL_TISSUE_POST_SQUEEZE_M = 0.005
-# Post-blocked band: the shelf front upright pair (x~1.33-1.40, y~3.15-3.19,
-# full height) sits in the left arm's surround path for targets around x~1.585
-# at every shelf level.  The wide diagonal surround sweeps the trailing closed
-# gripper (~80 mm inward of the wrist) into the post and stalls the left arm
-# ~70 mm short.  Inside this band use a detour: move laterally to the clamp
-# span and raise the wrist well above the box top, advance forward past the
-# post, open the arms wide, then descend to the contact height before the
-# inward contact search.  Other columns keep the wide surround.
-DUAL_TISSUE_POST_BAND_X_MIN_M = 1.45
-DUAL_TISSUE_POST_BAND_X_MAX_M = 1.65
-# Raise the wrist above the box top during the post crossing; 0.10 m keeps the
-# closed grippers clearly above the box even with the measured +/-30-45 mm
-# kinematic-height error between the KDL model and the sim.
-DUAL_TISSUE_POST_CROSS_RAISE_M = 0.10
-# In the post-blocked band, let the tissue sit deeper in the closed gripper so
-# the full jaw face grips the box side instead of only the jaw tips catching
-# its top edge (the "lower-end only" grasp that slipped during the lift).
-DUAL_TISSUE_CONTACT_WRAP_M = 0.06
-# How wide the arms open after crossing the post, before descending around the
-# tissue: 0.140 m half-span leaves ~54 mm per side around the 172 mm box so the
-# closed grippers clear the box during the descent.  0.150 m swept the left
-# arm's trailing gripper within ~4 mm of the shelf front uprights, so keep it
-# at 0.140 to avoid the fence scrape.
-DUAL_TISSUE_POST_OPEN_HALF_SPAN_M = 0.140
+# box (half-width 86 mm) from the sides; 90 mm 半跨度让钳爪在保持阶段真正
+# 压进盒壁（每侧约 4mm 过盈 + 手指接触面），夹持更稳。再小会顶到盒角。
+DUAL_TISSUE_CLAMP_HALF_SPAN_M = 0.090
 # Raise only the tissue TCP by 15 mm to keep both gripper bodies off the shelf.
 # 初始探入高度再降 4cm（+5.5cm -> +1.5cm）：宽跨度直探时夹爪更贴盒壁底部。
 DUAL_TISSUE_TCP_CLEARANCE_M = 0.015
@@ -531,13 +503,9 @@ DUAL_TISSUE_LOWER_TCP_CLEARANCE_M = 0.09
 DUAL_TISSUE_ALIGN_FORWARD_M = 0.040
 # 夹爪完全闭合（0 为最紧），配合侧夹预压增大，避免纸盒从指间滑脱。
 DUAL_TISSUE_GRIP_COMMAND = 0.0
-DUAL_TISSUE_FORWARD_SPEED_MPS = 0.018
-# The post-band dogleg closes the arms to the clamp span as a distinct first
-# step, before raising and before the forward advance.  It runs in free space
-# at the backoff pose, so it can be noticeably faster than the forward motion.
-DUAL_TISSUE_CLOSE_SPEED_MPS = 0.05
+DUAL_TISSUE_FORWARD_SPEED_MPS = 0.036
 DUAL_TISSUE_CONTACT_SEARCH_HALF_SPAN_M = 0.045
-DUAL_TISSUE_CONTACT_SEARCH_SPEED_MPS = 0.008
+DUAL_TISSUE_CONTACT_SEARCH_SPEED_MPS = 0.015
 # Minimum inward travel before a grip/stall contact signal is accepted.  The
 # measured travel to the box side varies widely with the box's lateral offset
 # (18-70 mm observed), so keep the bar low; the measured-centre anchor below
@@ -551,10 +519,10 @@ DUAL_TISSUE_CONTACT_ENDPOINT_TOLERANCE_M = 0.003
 # A closed unloaded gripper tracks 0.08 in prior runs; side contact in the
 # successful-but-unstable run forced both measured joints down near 0.012.
 DUAL_TISSUE_GRIP_CONTACT_MAX = 0.045
-# 侧夹预压拉到 20mm（接近压力上限）：双臂合拢后继续内压，纸盒挡住即由
-# 位置控制器持续加压，扭矩到执行器上限封顶，不会导致物理发散。
-DUAL_TISSUE_SQUEEZE_M = 0.020
-DUAL_TISSUE_SQUEEZE_SPEED_MPS = 0.006
+# 双臂闭合时的单侧预压量（米，wxj v2 值）：从实测接触位置再向内压入的
+# 量。加大后两侧钳爪对纸盒的夹紧力更强，纸盒不易在抬/撤过程中滑动。
+DUAL_TISSUE_SQUEEZE_M = 0.030
+DUAL_TISSUE_SQUEEZE_SPEED_MPS = 0.012
 DUAL_TISSUE_RETREAT_SPEED_MPS = 0.018
 DUAL_TISSUE_MIN_MOTION_DURATION_S = 2.0
 DUAL_TISSUE_MOTION_SETTLE_S = 0.75
@@ -580,14 +548,7 @@ DUAL_ALIGN_Y_MAX_M = 2.58
 # success while the box was only caught on one side.  Gate on the line angle
 # between the two grippers and abort instead of faking a straight hold.
 DUAL_TISSUE_MAX_LINE_ANGLE_DEG = 8.0
-# The east wall sits at x=2.5 and the west wall at x=-2.5.  The east shelf's
-# eastmost column and the west shelf's westmost column leave no lateral room
-# for the dual side clamp (the east column was observed driving the chassis
-# backward / jamming).  These wall-side bands are skipped at the association
-# stage so the scanner keeps looking for another tissue instead of aligning
-# to an ungraspable target and aborting.
-DUAL_TISSUE_MIN_SAFE_X_M = -1.90
-DUAL_TISSUE_MAX_SAFE_X_M = 2.00
+# 墙侧列跳过已废弃（wxj v2 全列统一直接探入，墙侧列也获得足够横向余量）。
 MIDDLE_SHELF_SURFACE_Z_M = 0.851
 
 GRIP_OPEN = 1.0
@@ -622,7 +583,8 @@ GENERIC_CLOSE_STAGE1_DWELL_S = 2.5
 # product by only a few mm when open, and a small lateral estimate error lets
 # one finger catch and push it during the forward sweep.  For these goods,
 # close immediately at the contact point instead of extending first.
-GENERIC_NO_POST_EXTEND_KINDS = {"maidong", "kouxiangtang", "kele"}
+# 脉动、可乐已移除出名单（v2 实测恢复正常 50mm 接触后前伸），口香糖保留。
+GENERIC_NO_POST_EXTEND_KINDS = {"kouxiangtang"}
 # The generic front profiles keep the wrist at the product centre.  For short
 # goods (kouxiangtang is only ~5 mm above the middle board) the finger tips
 # then scrape or jam against the shelf board during the approach, deflecting
@@ -634,8 +596,12 @@ GENERIC_TCP_FINGER_CLEARANCE_M = 0.06
 # 避免指尖落在货架导轨/前缘高度（D 架苹果指尖撞导轨问题），对深度测量
 # 的偏低误差更宽容。对球体（苹果/橙子）与普通货物、各层货架一致生效。
 GRASP_TCP_Z_RAISE_M = 0.010
-# 按货物类型的抓取高度额外偏移（米）：负值降低。可乐调低 1cm。
-GRASP_TCP_Z_OFFSET_BY_KIND = {"kele": -0.010}
+# 按货物类型的抓取高度额外偏移（米）：负值降低。可乐、核桃味刀调低 1cm。
+GRASP_TCP_Z_OFFSET_BY_KIND = {"kele": -0.010, "heweidao": -0.010}
+# KDL/仿真运动学的 X 方向执行偏差（wxj v2 实测）：右臂 TCP 比指令偏东约
+# 1cm、左臂偏西约 0.5cm。反向补偿到指令目标 X，让实际接触点落在真实
+# 目标上。
+GRASP_TCP_X_OFFSET_BY_ARM = {"r": -0.010, "l": 0.005}
 GRIPPER_MAX_OPENING_M = 0.080
 GRIP_PRESHAPE_CLEARANCE_M = 0.012
 GRIP_PRESHAPE_REACHED_TOLERANCE = 0.04
@@ -840,6 +806,7 @@ class ShelfPickController(Node):
         self.inventory_scan_hint_active = False
         self.nav_target = None
         self.ik_retry_forward_m = 0.0
+        self.deploy_retry_count = 0
         # 原地旋转卡死恢复状态
         self._rot_stall_target = None
         self._rot_stall_anchor_yaw = None
@@ -1205,11 +1172,6 @@ class ShelfPickController(Node):
                         or marker_world.shape != (3,)
                         or not np.all(np.isfinite(marker_world))):
                     continue
-                if (kind == "zhijin"
-                        and (marker_world[0] < DUAL_TISSUE_MIN_SAFE_X_M
-                             or marker_world[0]
-                             > DUAL_TISSUE_MAX_SAFE_X_M)):
-                    continue
                 identity = (kind, marker_id)
                 pairs = self.opportunistic_target_pairs.setdefault(
                     identity,
@@ -1389,19 +1351,6 @@ class ShelfPickController(Node):
         self.committed_slot = tuple(slot)
         self._recheck_passed = False
 
-        # Preserve the existing dual-tissue wall clearance even though target
-        # identity no longer comes from a marker.
-        if (self.use_dual_tissue_grasp
-                and (self.target_world[0] < DUAL_TISSUE_MIN_SAFE_X_M
-                     or self.target_world[0] > DUAL_TISSUE_MAX_SAFE_X_M)):
-            self.excluded_slot_keys.add(self.target_slot_key())
-            self.get_logger().warn(
-                f"[yolo-only] tissue slot {slot} is outside safe X band; "
-                "continuing scan")
-            self.target_world = None
-            self.committed_slot = None
-            return
-
         if self.use_dual_tissue_grasp:
             self.grasp_arm = "r"
             desired_base_x = self.target_world[0]
@@ -1417,6 +1366,15 @@ class ShelfPickController(Node):
                 desired_base_x = desired_right_base_x
         self.align_base_x = float(np.clip(
             desired_base_x, NAV_X_MIN, NAV_X_MAX))
+        # X 执行偏差补偿（见 GRASP_TCP_X_OFFSET_BY_ARM）：反向偏移指令
+        # 目标，基座同步跟随，保持横向偏置不变。
+        if (not self.use_dual_tissue_grasp
+                and self.target_kind not in SPHERE_RADIUS_M):
+            x_offset = GRASP_TCP_X_OFFSET_BY_ARM.get(self.grasp_arm, 0.0)
+            if x_offset:
+                self.target_world[0] += x_offset
+                self.align_base_x = float(np.clip(
+                    self.align_base_x + x_offset, NAV_X_MIN, NAV_X_MAX))
         if self.target_world[2] >= TOP_SHELF_Z_M:
             self.shelf_level = "top"
         elif self.target_world[2] >= MIDDLE_SHELF_Z_MIN_M:
@@ -1521,24 +1479,6 @@ class ShelfPickController(Node):
         marker_world = np.asarray(marker["position_world"], dtype=float)
         if marker_id in self.skipped_tissue_markers:
             return
-        if (self.target_kind == "zhijin"
-                and (marker_world[0] < DUAL_TISSUE_MIN_SAFE_X_M
-                     or marker_world[0] > DUAL_TISSUE_MAX_SAFE_X_M)):
-            # The leftmost / rightmost shelf columns leave no lateral room for
-            # the dual side clamp.  The marker's measured X is reliable (the
-            # depth-based product X can drift ~50 mm and slip past the old
-            # position check), so key the skip on the marker.  Force the
-            # detection class to apple so the tissue targeting never binds to
-            # this column, and the scanner keeps looking for other tissue.
-            self.skipped_tissue_markers.add(marker_id)
-            detection["class"] = "pingguo"
-            self.get_logger().info(
-                f"[association] tissue on the wall-side column "
-                f"(marker x={marker_world[0]:.3f} outside "
-                f"[{DUAL_TISSUE_MIN_SAFE_X_M:.2f}, "
-                f"{DUAL_TISSUE_MAX_SAFE_X_M:.2f}]); reclassifying as "
-                "pingguo and continuing to scan for other tissue")
-            return
         physical_marker_id = None
         fixed_slot = None
         if self.tcp_diagnostic_ground_truth:
@@ -1637,10 +1577,22 @@ class ShelfPickController(Node):
                     # 普通盒子：前表面低于中心，marker 模型与深度前表面平均。
                     marker_z = marker_median[2] + self.product_height
                     z_target = 0.5 * (depth_median[2] + marker_z)
+                elif self.target_kind in SPHERE_RADIUS_M:
+                    # 球体（苹果/橙子，wxj v2）：中心高度 = 货架板面 + 半径，
+                    # 由物理几何决定。marker 实测 Z 可偏差 3cm 以上，深度前
+                    # 表面采样带也可能落在球体下半部，两者都不如板面模型
+                    # 可靠；深度测量只用于 X/Y。
+                    model_z = marker_median[2] + self.product_height
+                    sphere_level = (
+                        "top" if model_z >= TOP_SHELF_Z_M
+                        else ("middle" if model_z >= MIDDLE_SHELF_Z_MIN_M
+                              else "lower"))
+                    z_target = (
+                        SHELF_SURFACE_Z_M[sphere_level]
+                        + SPHERE_RADIUS_M[self.target_kind])
                 else:
-                    # 球体（苹果/橙子）：深度前表面 Z 就是球心高度（球的最前
-                    # 点位于中心平面），不再与 marker 混合，避免补拍时码的
-                    # 深度噪声把 Z 拉低导致指尖撞导轨。
+                    # 非球体且深度横向偏差较大：不做 marker 混合（避免错配），
+                    # 直接用深度前表面 Z，维持原有行为。
                     z_target = depth_median[2]
                 depth_target = np.array([
                     depth_median[0],
@@ -1651,9 +1603,23 @@ class ShelfPickController(Node):
             measured_target = depth_target
             target_source = "depth"
         else:
-            measured_target = marker_median + np.array([
-                0.0, PRODUCT_BEHIND_MARKER_M, self.product_height,
-            ])
+            if self.target_kind in SPHERE_RADIUS_M:
+                # 球体：中心高度 = 板面 + 半径，规避 marker 实测 Z 噪声。
+                model_z = marker_median[2] + self.product_height
+                sphere_level = (
+                    "top" if model_z >= TOP_SHELF_Z_M
+                    else ("middle" if model_z >= MIDDLE_SHELF_Z_MIN_M
+                          else "lower"))
+                measured_target = np.array([
+                    marker_median[0],
+                    marker_median[1] + PRODUCT_BEHIND_MARKER_M,
+                    SHELF_SURFACE_Z_M[sphere_level]
+                    + SPHERE_RADIUS_M[self.target_kind],
+                ])
+            else:
+                measured_target = marker_median + np.array([
+                    0.0, PRODUCT_BEHIND_MARKER_M, self.product_height,
+                ])
             target_source = "marker"
         if self.tcp_diagnostic_ground_truth:
             physical_marker_id, fixed_slot, slot_distance = (
@@ -1682,23 +1648,6 @@ class ShelfPickController(Node):
         else:
             self.target_world = measured_target
         if self.use_dual_tissue_grasp:
-            if (self.target_world[0] < DUAL_TISSUE_MIN_SAFE_X_M
-                    or self.target_world[0] > DUAL_TISSUE_MAX_SAFE_X_M):
-                self.skipped_tissue_markers.add(marker_id)
-                self.get_logger().warn(
-                    f"[association] tissue at x="
-                    f"{self.target_world[0]:.3f} is in the wall-side skip "
-                    f"band [{DUAL_TISSUE_MIN_SAFE_X_M:.2f}, "
-                    f"{DUAL_TISSUE_MAX_SAFE_X_M:.2f}]; ignoring this column "
-                    "and continuing to scan for another tissue")
-                self.target_marker_id = None
-                self.target_physical_marker_id = None
-                self.association_candidate_id = None
-                self.association_confirmation_count = 0
-                self.marker_positions.clear()
-                self.depth_target_samples.clear()
-                return
-        if self.use_dual_tissue_grasp:
             # Centre the chassis between both arms instead of biasing it for a
             # single selected arm.
             self.grasp_arm = "r"
@@ -1719,6 +1668,15 @@ class ShelfPickController(Node):
                 desired_base_x = desired_right_base_x
         self.align_base_x = float(np.clip(
             desired_base_x, NAV_X_MIN, NAV_X_MAX))
+        # X 执行偏差补偿（见 GRASP_TCP_X_OFFSET_BY_ARM）：反向偏移指令
+        # 目标，基座同步跟随，保持横向偏置不变。
+        if (not self.use_dual_tissue_grasp
+                and self.target_kind not in SPHERE_RADIUS_M):
+            x_offset = GRASP_TCP_X_OFFSET_BY_ARM.get(self.grasp_arm, 0.0)
+            if x_offset:
+                self.target_world[0] += x_offset
+                self.align_base_x = float(np.clip(
+                    self.align_base_x + x_offset, NAV_X_MIN, NAV_X_MAX))
         if self.target_world[2] >= TOP_SHELF_Z_M:
             self.shelf_level = "top"
         elif self.target_world[2] >= MIDDLE_SHELF_Z_MIN_M:
@@ -2060,6 +2018,29 @@ class ShelfPickController(Node):
             f"yaw={self.manip_base_hold_yaw:.4f}; "
             f"linear_limit={MANIP_BASE_HOLD_LINEAR_MAX_MPS:.3f}m/s "
             f"yaw_limit={MANIP_BASE_HOLD_YAW_MAX_RADPS:.3f}rad/s")
+
+    def _deploy_base_nudge_retry(self, reason: str) -> bool:
+        """部署期 pregrasp 未收敛：向前微调基座并回到 ALIGN 重新解算重试。
+
+        返回 True 表示已触发重试；达到上限或基座已到最前时返回 False，
+        调用方应继续走原有的中止路径。
+        """
+        if (self.deploy_retry_count >= GENERIC_DEPLOY_RETRY_MAX
+                or self.align_base_y >= GENERIC_ALIGN_Y_MAX_M - 1e-6):
+            return False
+        self.deploy_retry_count += 1
+        nudge = min(
+            GENERIC_DEPLOY_RETRY_STEP_M,
+            GENERIC_ALIGN_Y_MAX_M - self.align_base_y)
+        self.align_base_y = float(np.clip(
+            self.align_base_y + nudge,
+            DUAL_ALIGN_Y_MIN_M, GENERIC_ALIGN_Y_MAX_M))
+        self.get_logger().warn(
+            f"[{reason}] pregrasp did not converge; base-nudge retry "
+            f"{self.deploy_retry_count}/{GENERIC_DEPLOY_RETRY_MAX} -> "
+            f"align_y={self.align_base_y:.3f}")
+        self.set_state(STATE_ALIGN)
+        return True
 
     def apply_manip_base_hold(self) -> None:
         """Softly oppose top/middle/lower reaction forces; never block the arm."""
@@ -2502,7 +2483,8 @@ class ShelfPickController(Node):
         return self.state != STATE_ABORT
 
     def drive_to(self, target_xy, final_yaw: float,
-                 position_tolerance: float = 0.055) -> bool:
+                 position_tolerance: float = 0.055,
+                 linear_min_mps: float | None = None) -> bool:
         delta = np.asarray(target_xy, dtype=float) - self.base_xy
         distance = float(np.linalg.norm(delta))
         if distance > position_tolerance:
@@ -2516,7 +2498,9 @@ class ShelfPickController(Node):
                     NAV_ANGULAR_MAX_RADPS)))
             else:
                 linear = float(np.clip(
-                    1.2 * distance, NAV_LINEAR_MIN_MPS,
+                    1.2 * distance,
+                    NAV_LINEAR_MIN_MPS if linear_min_mps is None
+                    else linear_min_mps,
                     NAV_LINEAR_MAX_MPS))
                 self.set_twist(linear, float(np.clip(
                     1.8 * yaw_error, -NAV_TRANSLATE_ANGULAR_MAX_RADPS,
@@ -2740,56 +2724,25 @@ class ShelfPickController(Node):
         return best[:6].copy(), best[6:].copy()
 
     def configure_dual_tissue_grasp(self) -> bool:
-        """Prepare a symmetric side clamp for the tissue box at any level."""
-        if (self.target_world[0] > DUAL_TISSUE_MAX_SAFE_X_M
-                or self.target_world[0] < DUAL_TISSUE_MIN_SAFE_X_M):
-            self.get_logger().error(
-                f"[dual-tissue] target x={self.target_world[0]:.3f} is in "
-                f"the wall-side skip band "
-                f"[{DUAL_TISSUE_MIN_SAFE_X_M:.2f}, "
-                f"{DUAL_TISSUE_MAX_SAFE_X_M:.2f}]; the side clamp lacks "
-                "lateral room - skipping tissue grasp")
-            return False
+        """Prepare a symmetric side clamp for the tissue box at any level.
+
+        全部列统一使用"直接探入"动作（wxj v2 策略）：张开双臂宽跨度前探 →
+        到位后合拢到夹持跨度压紧纸盒两侧 → 保持夹持收回。直线前探不横向
+        扫掠，天然避开货架前立柱，无需再绕柱，也不再跳过墙侧列。
+        """
         surface_z = SHELF_SURFACE_Z_M[self.shelf_level]
-        use_post_dogleg = bool(
-            DUAL_TISSUE_POST_BAND_X_MIN_M <= self.target_world[0]
-            <= DUAL_TISSUE_POST_BAND_X_MAX_M)
-        self.dual_clamp_half_span = (
-            DUAL_TISSUE_POST_CLAMP_HALF_SPAN_M
-            if use_post_dogleg else DUAL_TISSUE_CLAMP_HALF_SPAN_M)
-        self.dual_insert_forward_m = (
-            DUAL_TISSUE_POST_INSERT_FORWARD_M
-            if use_post_dogleg else DUAL_TISSUE_INSERT_FORWARD_M)
-        # 中间列纸巾用"直接探入"：不绕、不用宽 pregrasp，双臂以夹持跨度
-        # 直接前探到盒侧再压紧。
-        self.dual_direct_probe = (
-            not use_post_dogleg
-            and any(abs(self.target_world[0] - column_x) <= 0.12
-                    for column_x in middle_tissue_column_x()))
-        self.dual_pregrasp_half_span = (
-            DUAL_TISSUE_POST_PREGRASP_HALF_SPAN_M
-            if use_post_dogleg
-            else (DUAL_TISSUE_DIRECT_PROBE_SPAN_M
-                  if self.dual_direct_probe
-                  else DUAL_TISSUE_PREGRASP_HALF_SPAN_M))
-        self.dual_squeeze_m = (
-            DUAL_TISSUE_POST_SQUEEZE_M
-            if use_post_dogleg else DUAL_TISSUE_SQUEEZE_M)
+        self.dual_clamp_half_span = DUAL_TISSUE_CLAMP_HALF_SPAN_M
+        self.dual_insert_forward_m = DUAL_TISSUE_INSERT_FORWARD_M
+        self.dual_direct_probe = True
+        self.dual_pregrasp_half_span = DUAL_TISSUE_DIRECT_PROBE_SPAN_M
+        self.dual_squeeze_m = DUAL_TISSUE_SQUEEZE_M
         tcp_clearance = (
-            (DUAL_TISSUE_POST_LOWER_TCP_CLEARANCE_M
-             if use_post_dogleg else DUAL_TISSUE_LOWER_TCP_CLEARANCE_M)
+            DUAL_TISSUE_LOWER_TCP_CLEARANCE_M
             if self.shelf_level == "lower"
-            else (DUAL_TISSUE_POST_TCP_CLEARANCE_M
-                  if use_post_dogleg else DUAL_TISSUE_TCP_CLEARANCE_M))
+            else DUAL_TISSUE_TCP_CLEARANCE_M)
         tcp_z = max(
             float(self.target_world[2] + GRASP_TCP_Z_RAISE_M),
             surface_z + tcp_clearance)
-        if use_post_dogleg:
-            # Let the tissue sit deeper in the closed gripper so the full jaw
-            # face grips the box side rather than only the jaw tips.
-            tcp_z = max(
-                surface_z + 0.04,
-                tcp_z - DUAL_TISSUE_CONTACT_WRAP_M)
         self.dual_contact_tcp_z = float(tcp_z)
         insert_y = (
             self.target_world[1] + self.dual_insert_forward_m)
@@ -2801,18 +2754,11 @@ class ShelfPickController(Node):
                 self.target_world[0] + half_span, y, tcp_z], dtype=float)
             return left, right
 
-        def pair_z(half_span: float, y: float, z: float):
-            left = np.array([
-                self.target_world[0] - half_span, y, z], dtype=float)
-            right = np.array([
-                self.target_world[0] + half_span, y, z], dtype=float)
-            return left, right
-
         pre_left, pre_right = pair(
             self.dual_pregrasp_half_span,
             self.target_world[1] - DUAL_TISSUE_PREGRASP_BACKOFF_M)
         surround_left, surround_right = pair(
-            DUAL_TISSUE_SURROUND_HALF_SPAN_M, insert_y)
+            self.dual_pregrasp_half_span, insert_y)
         clamp_left, clamp_right = pair(
             self.dual_clamp_half_span, insert_y)
         retreat_left, retreat_right = pair(
@@ -2823,70 +2769,22 @@ class ShelfPickController(Node):
         try:
             pre_left_joints, pre_right_joints = self.solve_kdl_both_world(
                 pre_left, pre_right, left_reference, right_reference)
-            if use_post_dogleg:
-                raised_z = tcp_z + DUAL_TISSUE_POST_CROSS_RAISE_M
-                pass_left, pass_right = pair_z(
-                    self.dual_clamp_half_span,
-                    self.target_world[1] - DUAL_TISSUE_PREGRASP_BACKOFF_M,
-                    raised_z)
-                forward_left, forward_right = pair_z(
-                    self.dual_clamp_half_span, insert_y, raised_z)
-                # After crossing the post, open the arms wide so the closed
-                # grippers clear the tissue during the descent, then let the
-                # inward contact search close them onto the box sides.
-                return_span = DUAL_TISSUE_POST_OPEN_HALF_SPAN_M
-                return_left, return_right = pair_z(
-                    return_span, insert_y, tcp_z)
-                # Close the arms to the clamp span first (at the contact
-                # height and the backoff Y), then raise, so the narrowing is
-                # finished before the forward advance.
-                closed_left, closed_right = pair_z(
-                    self.dual_clamp_half_span,
-                    self.target_world[1] - DUAL_TISSUE_PREGRASP_BACKOFF_M,
-                    tcp_z)
-                closed_left_joints, closed_right_joints = (
-                    self.solve_kdl_both_world(
-                        closed_left, closed_right,
-                        pre_left_joints, pre_right_joints))
-                pass_left_joints, pass_right_joints = (
-                    self.solve_kdl_both_world(
-                        pass_left, pass_right,
-                        closed_left_joints, closed_right_joints))
-                forward_left_joints, forward_right_joints = (
-                    self.solve_kdl_both_world(
-                        forward_left, forward_right,
-                        pass_left_joints, pass_right_joints))
-                return_left_joints, return_right_joints = (
-                    self.solve_kdl_both_world(
-                        return_left, return_right,
-                        forward_left_joints, forward_right_joints))
-                surround_left_joints, surround_right_joints = (
-                    return_left_joints, return_right_joints)
-                clamp_left_joints, clamp_right_joints = (
-                    self.solve_kdl_both_world(
-                        clamp_left, clamp_right,
-                        surround_left_joints, surround_right_joints))
-            else:
-                if self.dual_direct_probe:
-                    # 直接探入：先以宽跨度直探到 insert_y，再闭合到夹持跨度。
-                    surround_left, surround_right = pair(
-                        self.dual_pregrasp_half_span, insert_y)
-                surround_left_joints, surround_right_joints = (
-                    self.solve_kdl_both_world(
-                        surround_left, surround_right,
-                        pre_left_joints, pre_right_joints))
-                if self.dual_direct_probe:
-                    close_left, close_right = pair(
-                        self.dual_clamp_half_span, insert_y)
-                    self.dual_surround_close_left_joints, (
-                        self.dual_surround_close_right_joints) = (
-                        self.solve_kdl_both_world(
-                            close_left, close_right,
-                            surround_left_joints, surround_right_joints))
-                clamp_left_joints, clamp_right_joints = (
-                    self.solve_kdl_both_world(
-                        clamp_left, clamp_right,
-                        surround_left_joints, surround_right_joints))
+            # 直接探入：先以宽跨度直探到 insert_y，再闭合到夹持跨度。
+            surround_left_joints, surround_right_joints = (
+                self.solve_kdl_both_world(
+                    surround_left, surround_right,
+                    pre_left_joints, pre_right_joints))
+            close_left, close_right = pair(
+                self.dual_clamp_half_span, insert_y)
+            self.dual_surround_close_left_joints, (
+                self.dual_surround_close_right_joints) = (
+                self.solve_kdl_both_world(
+                    close_left, close_right,
+                    surround_left_joints, surround_right_joints))
+            clamp_left_joints, clamp_right_joints = (
+                self.solve_kdl_both_world(
+                    clamp_left, clamp_right,
+                    surround_left_joints, surround_right_joints))
             retreat_left_joints, retreat_right_joints = (
                 self.solve_kdl_both_world(
                     retreat_left, retreat_right,
@@ -2910,28 +2808,16 @@ class ShelfPickController(Node):
 
         self.dual_pregrasp_left_joints = pre_left_joints
         self.dual_pregrasp_right_joints = pre_right_joints
-        self.dual_surround_close_left_joints = (
-            closed_left_joints if use_post_dogleg
-            else (self.dual_surround_close_left_joints
-                  if self.dual_direct_probe else None))
-        self.dual_surround_close_right_joints = (
-            closed_right_joints if use_post_dogleg
-            else (self.dual_surround_close_right_joints
-                  if self.dual_direct_probe else None))
         self.dual_surround_left_joints = surround_left_joints
         self.dual_surround_right_joints = surround_right_joints
-        self.dual_surround_pass_left_joints = (
-            pass_left_joints if use_post_dogleg else None)
-        self.dual_surround_pass_right_joints = (
-            pass_right_joints if use_post_dogleg else None)
-        self.dual_surround_forward_left_joints = (
-            forward_left_joints if use_post_dogleg else None)
-        self.dual_surround_forward_right_joints = (
-            forward_right_joints if use_post_dogleg else None)
-        self.dual_surround_return_left_joints = (
-            return_left_joints if use_post_dogleg else None)
-        self.dual_surround_return_right_joints = (
-            return_right_joints if use_post_dogleg else None)
+        # 绕柱段已废弃（v2 全列直接探入）：pass/forward/return 关节始终
+        # 为 None，状态机只走前探→合拢→压紧→收回流程。
+        self.dual_surround_pass_left_joints = None
+        self.dual_surround_pass_right_joints = None
+        self.dual_surround_forward_left_joints = None
+        self.dual_surround_forward_right_joints = None
+        self.dual_surround_return_left_joints = None
+        self.dual_surround_return_right_joints = None
         self.dual_surround_stage = 0
         self.dual_clamp_left_joints = clamp_left_joints
         self.dual_clamp_right_joints = clamp_right_joints
@@ -3037,7 +2923,9 @@ class ShelfPickController(Node):
             0.0 if self.tcp_diagnostic_ground_truth else grasp_overshoot)
         nominal_contact_world[2] = pregrasp_world[2]
         extended_contact_world = nominal_contact_world.copy()
-        extended_contact_world[1] += GENERIC_POST_CONTACT_EXTENSION_M
+        extended_contact_world[1] += (
+            GENERIC_POST_EXTEND_M_BY_KIND.get(
+                self.target_kind, GENERIC_POST_CONTACT_EXTENSION_M))
 
         reference = (self.cmd_right_arm.copy() if self.grasp_arm == "r"
                      else self.cmd_left_arm.copy())
@@ -3139,7 +3027,9 @@ class ShelfPickController(Node):
         post_extension_enabled = self.object_geometry != "sphere"
         extended_contact_world = nominal_contact_world.copy()
         if post_extension_enabled:
-            extended_contact_world[1] += GENERIC_POST_CONTACT_EXTENSION_M
+            extended_contact_world[1] += (
+                GENERIC_POST_EXTEND_M_BY_KIND.get(
+                    self.target_kind, GENERIC_POST_CONTACT_EXTENSION_M))
 
         reference = (self.cmd_right_arm.copy() if self.grasp_arm == "r"
                      else self.cmd_left_arm.copy())
@@ -3517,25 +3407,11 @@ class ShelfPickController(Node):
         self.state_t0 = self.now()
 
     def start_dual_tissue_surround(self) -> None:
-        """Move both closed grippers forward around the tissue sides."""
+        """Move both open grippers straight forward around the tissue sides.
+
+        全列统一直接探入（v2 策略）：宽跨度直线前探，无狗腿/合拢中间段。
+        """
         self.forward_start_base_xy = self.base_xy.copy()
-        if self.dual_surround_pass_left_joints is not None:
-            # Post-band dogleg: close the arms to the clamp span first, then
-            # raise above the box top, then advance forward.  Keeps the
-            # trailing closed gripper east of the shelf front uprights and
-            # finishes the narrowing before the forward advance.
-            self.dual_surround_stage = 0
-            lateral = (
-                self.dual_pregrasp_half_span
-                - self.dual_clamp_half_span)
-            self.start_dual_tissue_motion(
-                "close",
-                self.dual_surround_close_left_joints,
-                self.dual_surround_close_right_joints,
-                lateral,
-                DUAL_TISSUE_CLOSE_SPEED_MPS,
-                STATE_ARM_FORWARD)
-            return
         forward = (
             DUAL_TISSUE_PREGRASP_BACKOFF_M
             + self.dual_insert_forward_m)
@@ -4543,11 +4419,15 @@ class ShelfPickController(Node):
             self.cmd_right_arm = combined[6:]
         else:
             forward_step = self.forward_arm_step_limit()
+            selected_step = (
+                RETREAT_ARM_MAX_STEP_RAD
+                if self.state == STATE_RETREAT
+                else forward_step)
             left_step = (
-                forward_step if self.grasp_arm == "l"
+                selected_step if self.grasp_arm == "l"
                 else ARM_COMMAND_MAX_STEP_RAD)
             right_step = (
-                forward_step if self.grasp_arm == "r"
+                selected_step if self.grasp_arm == "r"
                 else ARM_COMMAND_MAX_STEP_RAD)
             self.cmd_left_arm = self.synchronized_slew(
                 self.cmd_left_arm, self.des_left_arm, left_step)
@@ -4674,16 +4554,11 @@ class ShelfPickController(Node):
                 self.scan_camera_ready_since = None
 
         elif self.state == STATE_ALIGN:
-            align_x_tolerance = (
-                DUAL_TISSUE_POST_ALIGN_X_TOLERANCE_M
-                if (self.use_dual_tissue_grasp
-                    and DUAL_TISSUE_POST_BAND_X_MIN_M
-                    <= self.target_world[0]
-                    <= DUAL_TISSUE_POST_BAND_X_MAX_M)
-                else 0.025)
+            align_x_tolerance = 0.025
             if self.drive_to(
                     [self.align_base_x, self.align_base_y],
-                    YAW_NORTH, align_x_tolerance):
+                    YAW_NORTH, align_x_tolerance,
+                    linear_min_mps=NAV_ALIGN_LINEAR_MIN_MPS):
                 if self.close_recheck and not self._recheck_passed:
                     self.set_state(STATE_RECHECK)
                     self._start_close_recheck()
@@ -4830,6 +4705,8 @@ class ShelfPickController(Node):
                         "starting forward motion")
                     self.start_arm_forward()
                 elif deploy_elapsed >= GENERIC_DEPLOY_HARD_TIMEOUT_S:
+                    if self._deploy_base_nudge_retry("generic-direct"):
+                        return
                     diag_measured = np.round(self.selected_arm_positions(), 4)
                     diag_desired = np.round(
                         self.des_left_arm if self.grasp_arm == "l"
@@ -4871,6 +4748,8 @@ class ShelfPickController(Node):
                   and deploy_elapsed >= (
                     MIDDLE_SPHERE_DEPLOY_TIMEOUT_S
                     if middle_sphere else DEPLOY_TIMEOUT_S)):
+                if self._deploy_base_nudge_retry("sphere"):
+                    return
                 self.get_logger().error(
                     f"pregrasp did not converge in time; "
                     f"actual_tcp={None if actual_tcp is None else np.round(actual_tcp, 4)} "
@@ -4886,59 +4765,18 @@ class ShelfPickController(Node):
             # no intermediate targets at which the arm can stop and shake.
             if self.use_dual_tissue_grasp:
                 if self.advance_dual_tissue_motion() == "reached":
-                    if (self.dual_surround_pass_left_joints is not None
-                            and self.dual_surround_stage == 0):
-                        # Post-band dogleg: lateral+raise complete, now the
-                        # forward segment at the clamp span and raised height.
+                    if self.dual_surround_stage == 0:
+                        # 直接探入（全列统一）：宽跨度前探完成。改用双臂
+                        # 独立接触搜索：每只手臂向内推进到"自己"碰到盒壁
+                        # 即停（stall 检测），另一只继续跟进，避免固定合拢
+                        # 行程下左右臂先后撞盒、夹持不对称。两侧都接触后
+                        # 再用实测中点对称压紧。
                         self.dual_surround_stage = 1
-                        forward = (
-                            DUAL_TISSUE_PREGRASP_BACKOFF_M
-                            + self.dual_insert_forward_m)
-                        self.start_dual_tissue_motion(
-                            "surround",
-                            self.dual_surround_forward_left_joints,
-                            self.dual_surround_forward_right_joints,
-                            forward,
-                            DUAL_TISSUE_FORWARD_SPEED_MPS,
-                            STATE_ARM_FORWARD)
-                    elif (self.dual_surround_pass_left_joints is not None
-                            and self.dual_surround_stage == 1):
-                        # Forward complete: open wide and descend to the
-                        # contact-height pose before the inward contact search.
-                        self.dual_surround_stage = 2
-                        return_path = math.hypot(
-                            DUAL_TISSUE_POST_OPEN_HALF_SPAN_M
-                            - self.dual_clamp_half_span,
-                            DUAL_TISSUE_POST_CROSS_RAISE_M)
-                        self.start_dual_tissue_motion(
-                            "return",
-                            self.dual_surround_return_left_joints,
-                            self.dual_surround_return_right_joints,
-                            return_path,
-                            DUAL_TISSUE_FORWARD_SPEED_MPS,
-                            STATE_ARM_FORWARD)
-                    elif (self.dual_direct_probe
-                            and self.dual_surround_stage == 0):
-                        # 直接探入：宽跨度前探完成，闭合到夹持跨度抓纸盒
-                        self.dual_surround_stage = 1
-                        lateral = (
-                            self.dual_pregrasp_half_span
-                            - self.dual_clamp_half_span)
-                        self.start_dual_tissue_motion(
-                            "close",
-                            self.dual_surround_close_left_joints,
-                            self.dual_surround_close_right_joints,
-                            lateral,
-                            DUAL_TISSUE_CLOSE_SPEED_MPS,
-                            STATE_ARM_FORWARD)
+                        self.start_dual_tissue_contact_search()
                     else:
-                        if self.dual_direct_probe:
-                            # 直接探入：双臂已以夹持跨度到达盒侧，跳过内侧
-                            # 接触搜索，直接压紧。
-                            if not self.start_dual_tissue_squeeze():
-                                self.set_state(STATE_ABORT)
-                        else:
-                            self.start_dual_tissue_contact_search()
+                        # 双臂均已接触盒壁，按实测中点对称压紧。
+                        if not self.start_dual_tissue_squeeze():
+                            self.set_state(STATE_ABORT)
             elif self.use_sphere_grasp:
                 sphere_status, _ = self.advance_sphere_forward()
                 if sphere_status == "reached":
@@ -5175,19 +5013,31 @@ class ShelfPickController(Node):
                 stable, spread, span = self.sphere_grip_is_stable(
                     self.sphere_trial_grip_samples, gripper)
                 if stable:
-                    self.get_logger().info(
-                        f"[sphere-trial-lift] {SPHERE_TRIAL_LIFT_M:.3f}m "
-                        f"test passed; grip={gripper:.3f} "
-                        f"range={spread:.3f} over {span:.2f}s; "
-                        "continuing full lift")
                     if self.shelf_level == "top":
+                        self.get_logger().info(
+                            f"[sphere-trial-lift] "
+                            f"{SPHERE_TRIAL_LIFT_M:.3f}m test passed; "
+                            f"grip={gripper:.3f} range={spread:.3f} over "
+                            f"{span:.2f}s; top shelf has no overhead board, "
+                            "continuing full lift")
                         self.set_selected_arm_target(
                             self.sphere_lift_arm_joints)
+                        self.set_state(STATE_LIFT)
                     else:
-                        # Middle-layer geometry remains fixed in the arm while
-                        # the layer motion raises the slide.
-                        self.des_slide = self.sphere_lift_slide
-                    self.set_state(STATE_LIFT)
+                        # Keep only the 10 mm capture test (wxj v2)。中层
+                        # 上方有货架板，完整抬升会把球顶进上层板；在试抬
+                        # 高度直接水平收回，运输高度恢复留给外层流程在
+                        # TCP 离开货架后进行。
+                        self.des_slide = self.sphere_trial_slide
+                        self.set_selected_arm_target(
+                            self.sphere_retreat_arm_joints)
+                        self.get_logger().info(
+                            f"[sphere-trial-lift] "
+                            f"{SPHERE_TRIAL_LIFT_M:.3f}m capture test passed; "
+                            f"grip={gripper:.3f} range={spread:.3f} over "
+                            f"{span:.2f}s; retracting before full height "
+                            "restoration")
+                        self.set_state(STATE_RETREAT)
             if (self.state == STATE_TRIAL_LIFT
                     and trial_elapsed >= SPHERE_TRIAL_LIFT_TIMEOUT_S):
                 self.get_logger().error(

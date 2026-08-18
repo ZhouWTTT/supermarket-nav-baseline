@@ -210,6 +210,7 @@ class YoloBackend:
             from ultralytics import YOLO
 
             device = self._select_device(torch, device)
+            self.device = device
             # Patch torch.load for pre-2.6 checkpoints
             _orig = torch.load
             def _compat(*a, **kw):
@@ -277,7 +278,7 @@ class YoloBackend:
         # only after prediction made values below Ultralytics' default 0.25
         # impossible to recover when searching for small top-shelf goods.
         results = self.model(
-            rgb, verbose=False, conf=self.conf_thresh)[0]
+            rgb, verbose=False, conf=self.conf_thresh, device=self.device)[0]
         detections = []
         for box in results.boxes:
             conf = float(box.conf.item())

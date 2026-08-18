@@ -452,7 +452,7 @@ class NavigatorPathMemoryTests(unittest.TestCase):
             reverse_available, reverse_lookup = (
                 navigator.remembered_path_available(
                     (DELIVERY_TRUNK_EXIT[0], DELIVERY_TRUNK_EXIT[1],
-                     math.pi / 2.0),
+                     math.pi / 4.0),
                     (DELIVERY_TRUNK_ENTRY[0], DELIVERY_TRUNK_ENTRY[1],
                      math.pi / 2.0),
                     start_offset_limit=0.18,
@@ -469,7 +469,7 @@ class NavigatorPathMemoryTests(unittest.TestCase):
                 lock_cached_path=True)
             navigator.update(
                 DELIVERY_TRUNK_EXIT[0], DELIVERY_TRUNK_EXIT[1],
-                math.pi / 2.0,
+                math.pi / 4.0,
                 laser_msg=clear_scan, time_now=2.0)
             reverse_status = navigator.path_memory_status()
             self.assertTrue(reverse_status["cache_hit"])
