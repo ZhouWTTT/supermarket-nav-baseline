@@ -740,6 +740,20 @@ class NavigationController:
         self.pos_tol = 0.10
         self.yaw_tol = 0.15
 
+        # Optional terminal-heading approach.  It is disabled by default so
+        # every existing caller retains the original point-goal behaviour.
+        # When enabled, global plans join a short collision-checked line that
+        # ends at the requested goal along ``goal_yaw``.  This lets the base
+        # acquire its final scan-facing heading while it is still translating
+        # instead of arriving sideways and paying for a separate turn.
+        self.terminal_heading_distance_m = 0.0
+        self.terminal_heading_merge_ahead_m = 0.30
+        self.terminal_heading_release_margin_m = 0.12
+        self._terminal_heading_plan_status = {
+            "enabled": False,
+            "mode": "disabled",
+        }
+
         # Obstacle safety.  The laser is 9 cm ahead of base_link and the base
         # front is about 21 cm ahead, so 0.32 m still leaves braking margin.
         self._blocked_timer = 0.0
@@ -828,6 +842,51 @@ class NavigationController:
         self._last_plan_lidar_count = 0
         self._last_plan_vision_count = 0
 
+
+    def configure_terminal_heading_approach(
+            self, distance_m=0.0, merge_ahead_m=0.30,
+            release_margin_m=0.12):
+        """Configure an opt-in heading-constrained final path segment.
+
+        ``distance_m`` is the length of the terminal line ending at the goal.
+        A value of zero restores the original planner exactly.  After the base
+        passes the initial anchor, replans merge onto a point ahead of the base
+        instead of sending it backwards to the anchor.
+        """
+        values = (distance_m, merge_ahead_m, release_margin_m)
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("terminal-heading settings must be finite")
+        distance_m = float(distance_m)
+        merge_ahead_m = float(merge_ahead_m)
+        release_margin_m = float(release_margin_m)
+        if not 0.0 <= distance_m <= 2.0:
+            raise ValueError("terminal heading distance must be in [0, 2] m")
+        if merge_ahead_m <= 0.0:
+            raise ValueError("terminal heading merge-ahead must be positive")
+        if release_margin_m <= 0.0:
+            raise ValueError("terminal heading release margin must be positive")
+        if distance_m > 0.0:
+            if merge_ahead_m >= distance_m:
+                raise ValueError(
+                    "terminal heading merge-ahead must be shorter than distance")
+            if release_margin_m >= distance_m:
+                raise ValueError(
+                    "terminal heading release margin must be shorter than distance")
+        self.terminal_heading_distance_m = distance_m
+        self.terminal_heading_merge_ahead_m = merge_ahead_m
+        self.terminal_heading_release_margin_m = release_margin_m
+        self._terminal_heading_plan_status = {
+            "enabled": distance_m > 0.0,
+            "mode": "configured" if distance_m > 0.0 else "disabled",
+            "distance_m": distance_m,
+            "merge_ahead_m": merge_ahead_m,
+            "release_margin_m": release_margin_m,
+        }
+
+    def terminal_heading_status(self):
+        """Return diagnostics for the most recent terminal-route plan."""
+        return dict(self._terminal_heading_plan_status)
+
     def set_goal(self, x, y, yaw=None):
         """Set a new navigation goal.  Clears the current path."""
         self.goal_x = float(x)
@@ -873,6 +932,14 @@ class NavigationController:
         self._last_plan_vision_count = 0
         self.cur_lin = 0.0
         self.cur_ang = 0.0
+        self._terminal_heading_plan_status = {
+            "enabled": self.terminal_heading_distance_m > 0.0,
+            "mode": (
+                "awaiting_plan"
+                if self.terminal_heading_distance_m > 0.0 and yaw is not None
+                else "disabled"),
+            "distance_m": self.terminal_heading_distance_m,
+        }
 
     def compute_velocity(self, base_x, base_y, base_yaw,
                          laser_msg=None, depth_clearance=None, time_now=None):
@@ -1132,6 +1199,90 @@ class NavigationController:
         return v, w, False
 
     # ---- helpers ----
+    def _plan_requested_route(self, bx, by, gx, gy):
+        """Plan to the goal, optionally through a final heading-aligned line.
+
+        Any blocked/unreachable terminal join falls back to the original direct
+        A* request.  The lidar/depth controller and all existing collision
+        checks therefore remain authoritative.
+        """
+        distance = float(self.terminal_heading_distance_m)
+        if distance <= 0.0 or self.goal_yaw is None:
+            self._terminal_heading_plan_status = {
+                "enabled": False,
+                "mode": "disabled",
+            }
+            return self.planner.plan(bx, by, gx, gy)
+        # Recovery planners also use _try_plan_with_fallback for temporary
+        # waypoints.  Only the controller's actual final goal owns goal_yaw.
+        if (self.goal_x is None or self.goal_y is None
+                or math.hypot(gx - self.goal_x, gy - self.goal_y) > 1e-6):
+            return self.planner.plan(bx, by, gx, gy)
+
+        ux = math.cos(float(self.goal_yaw))
+        uy = math.sin(float(self.goal_yaw))
+        anchor_x = gx - distance * ux
+        anchor_y = gy - distance * uy
+        rel_x = bx - anchor_x
+        rel_y = by - anchor_y
+        progress = rel_x * ux + rel_y * uy
+        remaining = math.hypot(gx - bx, gy - by)
+        release = self.terminal_heading_release_margin_m
+
+        # Very near the requested pose the normal goal/yaw tolerances should
+        # finish the manoeuvre.  Requiring an intermediate point here could
+        # make a noisy replan command a short reverse motion.
+        if progress >= distance - release or remaining <= release:
+            self._terminal_heading_plan_status = {
+                "enabled": True,
+                "mode": "released_near_goal",
+                "anchor": [anchor_x, anchor_y],
+            }
+            return self.planner.plan(bx, by, gx, gy)
+
+        join_progress = 0.0
+        if progress > 0.0:
+            join_progress = min(
+                distance - release,
+                progress + self.terminal_heading_merge_ahead_m)
+        join_x = anchor_x + join_progress * ux
+        join_y = anchor_y + join_progress * uy
+
+        fallback_reason = None
+        if not self.cm.is_free_world(join_x, join_y):
+            fallback_reason = "join_blocked"
+        elif not self.cm.line_is_free(join_x, join_y, gx, gy):
+            fallback_reason = "terminal_segment_blocked"
+
+        if fallback_reason is None:
+            path = self.planner.plan(bx, by, join_x, join_y)
+            if path:
+                if math.hypot(path[-1][0] - gx, path[-1][1] - gy) > 1e-9:
+                    path.append((float(gx), float(gy)))
+                self.planner.failure_reason = None
+                self._terminal_heading_plan_status = {
+                    "enabled": True,
+                    "mode": "active",
+                    "anchor": [anchor_x, anchor_y],
+                    "join": [join_x, join_y],
+                    "join_progress_m": join_progress,
+                }
+                return path
+            fallback_reason = "join_unreachable"
+
+        # A randomized obstacle may occupy the desired terminal corridor.  Do
+        # not weaken inflation or stop distances to force the experiment: use
+        # the unchanged direct planner for this transaction instead.
+        path = self.planner.plan(bx, by, gx, gy)
+        self._terminal_heading_plan_status = {
+            "enabled": True,
+            "mode": "fallback_direct",
+            "reason": fallback_reason,
+            "anchor": [anchor_x, anchor_y],
+            "join": [join_x, join_y],
+        }
+        return path
+
     def _try_plan_with_fallback(self, bx, by, gx, gy):
         """Plan with full costmap; fall back to lidar-only on failure.
 
@@ -1148,7 +1299,7 @@ class NavigationController:
         self._last_plan_vision_count = vis_cnt
 
         # ── full map: static + lidar + vision ──
-        path = self.planner.plan(bx, by, gx, gy)
+        path = self._plan_requested_route(bx, by, gx, gy)
         failure = self.planner.failure_reason
         self._last_plan_full_failure = failure
 
@@ -1162,7 +1313,7 @@ class NavigationController:
             try:
                 self.cm.vision_raw.fill(FREE)
                 self.cm._rebuild_dynamic()
-                path2 = self.planner.plan(bx, by, gx, gy)
+                path2 = self._plan_requested_route(bx, by, gx, gy)
                 failure2 = self.planner.failure_reason
                 self._last_plan_fallback_failure = failure2
             finally:
@@ -1815,6 +1966,14 @@ class SupermarketNavigator:
                 or self._cache_restore_attempted
                 or self._goal is None
                 or self.controller.path):
+            return
+        if self.controller.terminal_heading_distance_m > 0.0:
+            self._cache_restore_attempted = True
+            self._cached_path_info = {
+                "enabled": True,
+                "cache_hit": False,
+                "reason": "terminal_heading_active",
+            }
             return
         self._cache_restore_attempted = True
         path, info = self.path_memory.load_path(
