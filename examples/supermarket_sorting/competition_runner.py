@@ -55,6 +55,46 @@ def safe_component(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)[:96] or "run"
 
 
+def detector_process_env(device: str) -> dict[str, str]:
+    """Build a detector environment consistent with the requested device.
+
+    The Ultralytics release in the official client calls
+    ``torch.cuda.synchronize()`` from its profiler whenever CUDA is visible,
+    even when inference was explicitly placed on CPU.  The simulator nearly
+    fills the 4 GiB GPU, so that unrelated profiler call can OOM a CPU-only
+    detector.  Hide CUDA at process start for CPU mode; auto/cuda retain the
+    caller's normal device visibility.
+    """
+    env = os.environ.copy()
+    if str(device).lower() == "cpu":
+        env["CUDA_VISIBLE_DEVICES"] = ""
+    return env
+
+
+def clear_path_memory_file() -> None:
+    """Remove the shared path-memory file (best effort).
+
+    The arena places five random corridor boxes per run, so a route saved
+    under one layout can guide the next match into a stale obstacle and stall
+    a leg (observed: 216 s detour + 150 s trunk timeout on run_abac6b642eca).
+    The runner therefore clears the file when the client process exits and
+    again at startup, so a crash-killed process cannot leak stale routes into
+    the next match.  Path resolution mirrors supermarket_navigation.py.
+    """
+    path_text = os.environ.get(
+        "SUPERMARKET_PATH_MEMORY_FILE",
+        "/root/.cache/supermarket_path_memory.json")
+    path = Path(path_text)
+    try:
+        if path.exists():
+            path.unlink()
+            print(
+                f"[runner] cleared path memory {path} for a fresh match")
+    except OSError as exc:
+        # Best effort: a stale cache only costs a replan, never safety.
+        print(f"[runner] cannot clear path memory {path}: {exc}")
+
+
 class CompetitionRunner(Node):
     def __init__(self, args: argparse.Namespace):
         super().__init__("supermarket_competition_runner")
@@ -76,8 +116,14 @@ class CompetitionRunner(Node):
         self.worker_stop_reason: str | None = None
         self.worker_terminate_at: float | None = None
         self.spawned_workers = 0
+        # Match wxj snapshot semantics: retries of the first logical order
+        # still use the normal E-side start.  Only after a different order is
+        # dispatched does no-hint full scanning switch permanently to A->E.
+        self.first_dispatched_order_id: str | None = None
+        self.after_first_order_started = False
         self.finished = False
         self.selected_memory_hint: dict | None = None
+        self.immediate_retry_order_id: str | None = None
         self.failed_memory_slots: dict[str, set[str]] = {}
         self.memory_path = Path(self.args.runtime_dir) / (
             f"memory_matrix_waiting_{os.getpid()}.json")
@@ -126,6 +172,8 @@ class CompetitionRunner(Node):
         self.task = incoming
         self.task_started_at = time.monotonic()
         self.spawned_workers = 0
+        self.first_dispatched_order_id = None
+        self.after_first_order_started = False
         self.finished = False
         run_dir = (
             Path(self.args.runtime_dir)
@@ -133,6 +181,7 @@ class CompetitionRunner(Node):
         self.memory_path = run_dir / "memory_matrix.json"
         self.memory_tracker.start_run(self.memory_path)
         self.selected_memory_hint = None
+        self.immediate_retry_order_id = None
         self.failed_memory_slots.clear()
         self.worker_candidate_kinds.clear()
         self.order_first_started.clear()
@@ -223,7 +272,12 @@ class CompetitionRunner(Node):
         if result_path.exists():
             result_path.unlink()
 
-        candidate_kinds = self._candidate_kinds_for(order)
+        same_order_drop_retry = (
+            self.immediate_retry_order_id == order.id)
+        candidate_kinds = (
+            [order.kind] if same_order_drop_retry
+            else self._candidate_kinds_for(order))
+        self.immediate_retry_order_id = None
         command = [
             sys.executable,
             str(Path(self.args.worker).resolve()),
@@ -261,6 +315,12 @@ class CompetitionRunner(Node):
             "--memory-confidence-threshold",
             str(self.args.memory_confidence_threshold),
         ])
+        # The first physically delivered item always occupies slot zero.
+        # Keep that worker alive after placement so it returns to shelf A and
+        # records a stationary inventory sweep before the next order starts.
+        return_west_after_place = place_slot == 0
+        if return_west_after_place:
+            command.append("--return-west-after-place")
         scan_hint_x = None
         scan_marker_z = None
         if self.selected_memory_hint is not None:
@@ -274,8 +334,17 @@ class CompetitionRunner(Node):
             command.extend(["--scan-start-x", str(scan_hint_x)])
             if scan_marker_z is not None:
                 command.extend(["--scan-marker-z", str(scan_marker_z)])
-        # 只有本场第一次抓货从 E 货架（最近站点）开始；之后每单从 A 货架开始
-        if self.spawned_workers > 0 and scan_hint_x is None:
+        # wxj snapshot semantics: the first logical order starts from E,
+        # including all of its retries.  Once a different order starts, every
+        # later no-hint full scan starts from the westmost shelf A.  A memory
+        # hint still takes precedence and routes directly to its shelf/level.
+        if self.first_dispatched_order_id is None:
+            self.first_dispatched_order_id = order.id
+        elif order.id != self.first_dispatched_order_id:
+            self.after_first_order_started = True
+        scan_start_west = (
+            self.after_first_order_started and scan_hint_x is None)
+        if scan_start_west:
             command.append("--scan-start-west")
         if self.args.show:
             command.append("--show")
@@ -296,6 +365,10 @@ class CompetitionRunner(Node):
             f"start={self.worker_started_wall_at} "
             f"scan_hint_x={scan_hint_x} "
             f"scan_marker_z={scan_marker_z} "
+            f"scan_start_west={int(scan_start_west)} "
+            f"return_west_after_place="
+            f"{int(return_west_after_place)} "
+            f"same_order_drop_retry={int(same_order_drop_retry)} "
             f"memory_hint={self.selected_memory_hint} "
             f"persistent_perception={int(external_perception)} "
             f"single_item_candidates={candidate_kinds} "
@@ -305,7 +378,7 @@ class CompetitionRunner(Node):
             self.worker = subprocess.Popen(
                 command,
                 cwd=str(REPO_ROOT),
-                env=os.environ.copy(),
+                env=detector_process_env(self.args.device),
                 start_new_session=False,
             )
         except OSError as exc:
@@ -391,7 +464,7 @@ class CompetitionRunner(Node):
             self.perception_worker = subprocess.Popen(
                 command,
                 cwd=str(REPO_ROOT),
-                env=os.environ.copy(),
+                env=detector_process_env(self.args.device),
                 start_new_session=False,
             )
         except OSError as exc:
@@ -405,7 +478,9 @@ class CompetitionRunner(Node):
         self.perception_started_at = now
         self.get_logger().info(
             "started persistent all-class YOLO/ArUco perception; waiting for "
-            "the model-ready handshake")
+            "the model-ready handshake; detector_device="
+            f"{self.args.device} cuda_visible="
+            f"{'hidden' if self.args.device == 'cpu' else 'inherited'}")
         return False
 
     def _read_worker_result(self) -> dict:
@@ -463,6 +538,11 @@ class CompetitionRunner(Node):
                 value = worker_result.get(key)
                 if isinstance(value, dict):
                     attempt_record[key] = dict(value)
+            drop_event = worker_result.get("drop_event")
+            if isinstance(drop_event, dict):
+                attempt_record["drop_event"] = dict(drop_event)
+                attempt_record["delivery_completed_by_drop"] = bool(
+                    worker_result.get("delivery_completed_by_drop"))
         self.attempt_timings.append(attempt_record)
 
         first_monotonic, first_wall = self.order_first_started.get(
@@ -502,6 +582,12 @@ class CompetitionRunner(Node):
     def _finish_worker(self, return_code: int) -> None:
         self._publish_perception_enabled(False)
         result = self._read_worker_result()
+        drop_event = result.get("drop_event")
+        if isinstance(drop_event, dict):
+            self.get_logger().info(
+                "[drop-monitor] worker result="
+                + json.dumps(
+                    drop_event, ensure_ascii=False, separators=(",", ":")))
         dispatch_order = self.current_order
         order, reported_kind_valid = self._resolve_worker_order(result)
         reported_delivered = (
@@ -544,6 +630,16 @@ class CompetitionRunner(Node):
                 error=None if delivered else str(error),
                 max_attempts=self.args.max_attempts,
             )
+            if (not delivered
+                    and isinstance(drop_event, dict)
+                    and drop_event.get("outcome") == "retry"
+                    and order.status == "pending"
+                    and order.attempts < self.args.max_attempts):
+                self.immediate_retry_order_id = order.id
+                self.get_logger().info(
+                    "[drop-monitor] scheduling immediate same-order worker "
+                    f"restart id={order.id} kind={order.kind} "
+                    f"next_attempt={order.attempts + 1}")
             if result_slot is not None:
                 shelf, level, column = result_slot
                 if delivered:
@@ -704,7 +800,18 @@ class CompetitionRunner(Node):
             and order.attempts < self.args.max_attempts
         ]
         if not candidates:
+            self.immediate_retry_order_id = None
             return None
+
+        if self.immediate_retry_order_id is not None:
+            retry = next(
+                (order for order in candidates
+                 if order.id == self.immediate_retry_order_id),
+                None)
+            if retry is not None:
+                candidates = [retry]
+            else:
+                self.immediate_retry_order_id = None
 
         ranked = []
         for order in candidates:
@@ -821,6 +928,10 @@ def main() -> None:
     from run_log import start_run_log
     start_run_log("competition_runner")
     args = parse_args()
+    # A previous client process may have been killed before its cleanup ran.
+    # Start every match with an empty path memory so stale obstacle layouts
+    # from an earlier run cannot misroute this one.
+    clear_path_memory_file()
     rclpy.init()
     node = CompetitionRunner(args)
     executor = MultiThreadedExecutor(num_threads=2)
@@ -845,6 +956,9 @@ def main() -> None:
         node.memory_tracker.tick_write()
         node.memory_tracker.destroy_node()
         node.destroy_node()
+        # Each client process owns one match; drop the shared path memory so
+        # the next match replans against its own obstacle layout.
+        clear_path_memory_file()
         if rclpy.ok():
             rclpy.shutdown()
 

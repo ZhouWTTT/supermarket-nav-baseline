@@ -29,6 +29,9 @@ class FakeLogger:
     def warn(self, message):
         self.messages.append(("warn", message))
 
+    def error(self, message):
+        self.messages.append(("error", message))
+
 
 class FakeNavigator:
     def __init__(self):
@@ -162,6 +165,97 @@ class DeliveryRouteStrategyTests(unittest.TestCase):
         goal, options = controller.nav.calls[-1]
         self.assertEqual(goal[:2], tuple(target))
         self.assertFalse(options["use_path_memory"])
+
+    def test_drop_signatures_follow_each_grasp_feedback_model(self):
+        controller = self._controller()
+        controller.target_kind = "pingguo"
+        controller.use_dual_tissue_grasp = False
+        controller.use_sphere_grasp = True
+        controller.sphere_capture_minimum = lambda: 0.50
+        controller.selected_gripper_position = lambda: 0.49
+        lost, details = controller._transport_drop_signature()
+        self.assertTrue(lost)
+        self.assertEqual(details["mode"], "sphere")
+
+        controller.target_kind = "maidong"
+        controller.use_sphere_grasp = False
+        controller.selected_gripper_position = lambda: 0.01
+        lost, details = controller._transport_drop_signature()
+        self.assertTrue(lost)
+        self.assertEqual(details["mode"], "generic")
+
+        controller.target_kind = "zhijin"
+        controller.use_dual_tissue_grasp = True
+        controller.joints = {
+            "left_arm_eef_gripper_joint": 0.06,
+            "right_arm_eef_gripper_joint": 0.07,
+        }
+        lost, details = controller._transport_drop_signature()
+        self.assertTrue(lost)
+        self.assertEqual(details["mode"], "dual")
+        controller.joints["left_arm_eef_gripper_joint"] = 0.02
+        self.assertFalse(controller._transport_drop_signature()[0])
+
+    def test_transport_loss_is_debounced_then_requests_retry(self):
+        controller = self._controller()
+        controller.flow_phase = "nav_to_delivery"
+        controller.place_stage = 0
+        controller._drop_monitor_armed_at = 0.0
+        controller._drop_signature_since = None
+        controller._drop_candidate_reference_world = None
+        controller._transport_drop_signature = lambda: (
+            True, {"mode": "sphere", "measured_grip": 0.1})
+        controller._held_product_reference_world = lambda: np.asarray(
+            [0.0, 0.0, 1.0])
+        events = []
+        controller._start_transport_drop_recovery = (
+            lambda now, **kwargs: events.append((now, kwargs)))
+
+        controller.set_twist = lambda *_args: None
+        controller.cmd_linear = 0.0
+        controller.cmd_angular = 0.0
+        self.assertTrue(controller._monitor_held_product(10.0))
+        self.assertTrue(controller._monitor_held_product(10.2))
+        self.assertTrue(controller._monitor_held_product(10.31))
+        self.assertFalse(events[0][1]["over_table"])
+
+    def test_loss_above_table_is_classified_as_delivery(self):
+        controller = self._controller()
+        controller.flow_phase = "place"
+        controller.place_stage = 1
+        controller._drop_monitor_armed_at = 0.0
+        controller._drop_signature_since = 9.0
+        controller._drop_candidate_reference_world = None
+        controller._transport_drop_signature = lambda: (
+            True, {"mode": "generic", "measured_grip": 0.0})
+        x_min, y_min, x_max, y_max = delivery.DELIVERY_TABLE_XML_BOUNDS
+        controller._held_product_reference_world = lambda: np.asarray([
+            0.5 * (x_min + x_max),
+            0.5 * (y_min + y_max),
+            1.5,
+        ])
+        controller._drop_candidate_reference_world = (
+            controller._held_product_reference_world().copy())
+        events = []
+        controller._start_transport_drop_recovery = (
+            lambda now, **kwargs: events.append((now, kwargs)))
+        controller.set_twist = lambda *_args: None
+        controller.cmd_linear = 0.0
+        controller.cmd_angular = 0.0
+
+        self.assertTrue(controller._monitor_held_product(10.0))
+        self.assertTrue(events[0][1]["over_table"])
+
+    def test_intentional_release_stage_is_not_monitored(self):
+        controller = self._controller()
+        controller.flow_phase = "place"
+        controller.place_stage = 3
+        controller._drop_monitor_armed_at = 0.0
+        controller._drop_signature_since = 9.0
+        controller._drop_candidate_reference_world = None
+        controller._transport_drop_signature = lambda: (True, {})
+        self.assertFalse(controller._monitor_held_product(10.0))
+        self.assertIsNone(controller._drop_signature_since)
 
 
 if __name__ == "__main__":

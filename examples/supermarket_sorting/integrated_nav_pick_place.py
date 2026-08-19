@@ -205,7 +205,11 @@ DELIVERY_TRUNK_CACHE_START_TOLERANCE_M = 0.18
 DELIVERY_TRUNK_CACHE_GOAL_TOLERANCE_M = 0.12
 ROUTE_LEG_PROGRESS_M = 0.10
 ROUTE_LEG_STALL_TIMEOUT_S = 35.0
-ROUTE_LEG_HARD_TIMEOUT_S = 150.0
+# A leg stuck behind a dynamic box now fails via the widened stall check
+# below (any persistent stop reason).  This hard timeout is only the final
+# ceiling for slow-but-progressing legs; 60 s at the observed slowest real
+# sim rate (~0.12 m/s) still covers every route leg in this arena.
+ROUTE_LEG_HARD_TIMEOUT_S = 60.0
 
 # Keep the held product clear of the shelf before delivery navigation starts
 # turning the base.  The arms and product still protrude toward the shelf at
@@ -222,6 +226,13 @@ TRANSIT_SLIDE_TIMEOUT_S = 8.0
 # explicit 0.06 target below to avoid excessive squeeze.
 TRANSPORT_GRIP_PRELOAD_COMMAND = 0.04
 SPHERE_TRANSPORT_GRIP_COMMAND = 0.06
+# The measured gripper is the only feedback that remains available after the
+# shelf cameras no longer see the carried product.  Require a sustained empty
+# signature before acting so one noisy JointState frame cannot fail an order.
+TRANSPORT_DROP_MONITOR_GRACE_S = 0.50
+TRANSPORT_DROP_CONFIRM_S = 0.30
+TRANSPORT_DROP_RECOVERY_TIMEOUT_S = 4.0
+TRANSPORT_DROP_FAILURE_SETTLE_S = 0.15
 
 # A* stops outside the table's inflated costmap.  From that safe pose, make a
 # short, yaw-controlled final approach before extending the arm.  Keep the
@@ -252,6 +263,25 @@ PLACE_APPROACH_PROGRESS_LOG_S = 2.0
 # unconditional 3 s dwell accumulated once per order without adding safety.
 FLOW_DONE_SETTLE_S = 0.25
 
+# After the first delivered item, the runner may ask this worker to return to
+# shelf A and record a complete stationary inventory view before it exits.
+# Use every normal shelf view, but finish at the high overview posture so the
+# next worker does not inherit a lowered camera assembly for long transit.
+RETURN_WEST_SCAN_POSES = (
+    pick.SCAN_CAMERA_POSES[1:] + pick.SCAN_CAMERA_POSES[:1])
+RETURN_WEST_GOAL = (pick.SCAN_X[-1], pick.SCAN_Y, pick.YAW_NORTH)
+RETURN_WEST_SCAN_POSE_TIMEOUT_S = 4.0
+RETURN_WEST_RECOVERY_TIMEOUT_S = 4.0
+
+# Neutral-posture recovery ceilings.  Every terminal path — successful
+# placement, transport drop, grasp abort, fatal placement error — restores
+# both arms, both grippers, slide and head to the initial pose before the
+# worker exits.  The simulator resets only the base pose between workers, so
+# without this a failed predecessor leaves the next worker with a closed
+# gripper / deployed arm inherited through the joint feedback.
+ABORT_RECOVERY_TIMEOUT_S = 8.0
+FATAL_RECOVERY_TIMEOUT_S = 8.0
+
 # Fixed initial whole-body manipulation posture.  Both arms and the head return
 # here after every release; restoring only the selected arm or leaving the
 # previous shelf-view pitch can leak a stale pose into the next order.
@@ -273,6 +303,12 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
       "restore_height"  — restore the lift to its startup height.
       "nav_to_delivery" — navigator to DELIVERY_APPROACH with goods held.
       "place"           — extend, descend near the table, release, retreat.
+      "return_to_west"  — after the first delivery, navigate back to shelf A.
+      "return_west_scan" — hold at A and record all shelf camera views.
+      "return_west_recover" — restore the neutral transit posture.
+      "drop_success_recover" — product fell above table; recover and clear it.
+      "drop_failed_recover" — product fell in transit; recover before retry.
+      "drop_failed"     — terminal failed attempt awaiting worker shutdown.
       "done"            — flow finished.
     """
 
@@ -288,7 +324,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             nav_during_scan: bool = True,
             backup_after_grab_m: float = 0.20,
             place_creep_m: float = PLACE_CREEP_DISTANCE_M,
-            close_recheck: bool = True):
+            close_recheck: bool = True,
+            return_west_after_place: bool = False):
         super().__init__(
             target_kind, max_scan_cycles,
             tcp_diagnostic_ground_truth, scan_skip_lower,
@@ -313,6 +350,15 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_min_approach_z = float(place_z)
         self.place_release_dwell_s = place_release_dwell_s
         self.place_retreat_dwell_s = place_retreat_dwell_s
+        self.return_west_after_place = bool(return_west_after_place)
+        self.placement_completed = False
+        self.post_delivery_warnings: list[str] = []
+        self.delivery_completed_by_drop = False
+        self.drop_event = None
+        self.terminal_error = None
+        self._fatal_error = None
+        self._fatal_recovery_started_at = 0.0
+        self._startup_posture_recovered = False
 
         # ── laser for the navigator ──
         self.laser_msg = None
@@ -390,10 +436,18 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._height_restore_t0 = 0.0
         self._height_restore_timeout_logged = False
         self._transport_grip_command = None
+        self._drop_monitor_armed_at = None
+        self._drop_signature_since = None
+        self._drop_candidate_reference_world = None
+        self._drop_recovery_started_at = 0.0
         self._flow_done_logged = False
         self._table_escape_logged = False
         self._laser_warn_log = 0.0
         self._state_warn_log = 0.0
+        self.return_scan_pose_index = 0
+        self.return_scan_pose_started_at = 0.0
+        self.return_scan_camera_ready_since = None
+        self.return_recovery_started_at = 0.0
 
         # Runner-owned matrix routing is optional for standalone workers.  In
         # formal mode the runner passes one atomic JSON file shared across
@@ -420,7 +474,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             f"backup_after_grab={self.backup_after_grab_m:.2f}m "
             f"place_creep={self.place_creep_m:.2f}m "
             f"release_dwell={place_release_dwell_s}s "
-            f"retreat_dwell={place_retreat_dwell_s}s")
+            f"retreat_dwell={place_retreat_dwell_s}s "
+            f"return_west_after_place="
+            f"{int(self.return_west_after_place)}")
 
     def set_state(self, new_state: str) -> None:
         """Accumulate parent pick-state wall time without altering its FSM."""
@@ -775,12 +831,19 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             stop_reason.startswith("no_path")
             or stop_reason.startswith("stuck_no_path"))
         recovery_exhausted = self.nav.recovery_exhausted()
+        # A leg can stall behind a dynamic box with stop_reason
+        # lidar_stop/arc_blocked/rotation_loop while the planner still finds
+        # a path (so no_path is False and recovery may not be exhausted).
+        # Treat any persistent stop reason the same as no_path: after
+        # ROUTE_LEG_STALL_TIMEOUT_S without 0.10 m of progress the leg fails
+        # and the caller can fall back instead of waiting out a 150 s ceiling.
+        persistent_stop = (
+            no_path or recovery_exhausted or stop_reason is not None)
         failure = None
         if elapsed >= ROUTE_LEG_HARD_TIMEOUT_S:
             failure = (
                 f"hard_timeout:{elapsed:.1f}s:{stop_reason or 'moving'}")
-        elif (stalled >= ROUTE_LEG_STALL_TIMEOUT_S
-                and (no_path or recovery_exhausted)):
+        elif (stalled >= ROUTE_LEG_STALL_TIMEOUT_S and persistent_stop):
             failure = (
                 f"stalled:{stalled:.1f}s:{stop_reason or 'no_progress'}:"
                 f"recovery_exhausted={int(recovery_exhausted)}")
@@ -798,7 +861,16 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
     def _scan_trunk_route_tick(
             self, target: np.ndarray, final_yaw: float) -> bool:
-        """Use the saved delivery trunk in reverse from table to shelf."""
+        """Drive directly to a shelf station in one live-planned leg.
+
+        The multi-stage delivery-trunk routing (table -> trunk exit ->
+        trunk entry -> shelf) is removed: with five random corridor boxes per
+        match, trunk anchors and cached routes routinely forced detours and
+        stalls near the delivery table (216 s first-scan detour, 150 s trunk
+        timeout, post-delivery 135-degree turn beside the table).  One direct
+        A* leg to the requested station replaces all trunk stages for GO_SCAN
+        transits and for the post-delivery return to shelf A.
+        """
         final_goal = (
             float(target[0]), float(target[1]), float(final_yaw))
         self.scan_route_final_goal = final_goal
@@ -806,81 +878,36 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             return True
 
         if self.scan_trunk_route_stage is None:
-            if float(self.base_xy[1]) >= DELIVERY_TRUNK_ENTRY[1] - 0.20:
-                self.scan_trunk_route_done = True
-                return True
-            reverse_available, reverse_info = (
-                self.nav.remembered_path_available(
-                    DELIVERY_TRUNK_REVERSE_START,
-                    DELIVERY_TRUNK_REVERSE_GOAL,
-                    start_offset_limit=(
-                        DELIVERY_TRUNK_CACHE_START_TOLERANCE_M),
-                    goal_offset_limit=(
-                        DELIVERY_TRUNK_CACHE_GOAL_TOLERANCE_M)))
-            if not reverse_available:
-                self.scan_trunk_route_stage = "direct_to_shelf"
-                self.get_logger().info(
-                    "[route] no reusable reverse delivery trunk; using a "
-                    "live direct route for this shelf transit; lookup="
-                    + json.dumps(reverse_info, ensure_ascii=False))
-                self._start_route_leg(
-                    "scan_direct_to_shelf", final_goal,
-                    use_memory=False)
-            else:
-                self.get_logger().info(
-                    "[route] reusable reverse delivery trunk available; "
-                    "routing through the common exit; lookup="
-                    + json.dumps(reverse_info, ensure_ascii=False))
-                self.scan_trunk_route_stage = "to_trunk_exit"
-                self._start_route_leg(
-                    "scan_to_trunk_exit", DELIVERY_TRUNK_REVERSE_START,
-                    use_memory=False)
+            self.scan_trunk_route_stage = "direct_to_shelf"
+            self.get_logger().info(
+                "[route] single direct leg to shelf station goal="
+                f"({final_goal[0]:.2f},{final_goal[1]:.2f},"
+                f"{math.degrees(final_goal[2]):.0f}deg)")
+            self._start_route_leg(
+                "scan_direct_to_shelf", final_goal,
+                use_memory=False)
+            return False
 
-        if (self.scan_trunk_route_stage in {
-                "to_shelf", "direct_to_shelf"}
+        if (self.scan_trunk_route_stage == "direct_to_shelf"
                 and self._route_leg_goal is not None
                 and np.linalg.norm(
                     np.asarray(self._route_leg_goal[:2]) - target) > 0.05):
             self._start_route_leg(
-                f"scan_{self.scan_trunk_route_stage}", final_goal,
+                "scan_direct_to_shelf", final_goal,
                 use_memory=False)
 
         reached, failure = self._route_leg_tick()
         if failure is not None:
-            if not self.scan_direct_fallback_used:
-                failed_stage = self.scan_trunk_route_stage
-                self.scan_direct_fallback_used = True
-                self.scan_trunk_route_stage = "direct_to_shelf"
-                self.get_logger().warn(
-                    f"[route] reverse trunk stage={failed_stage} failed "
-                    f"({failure}); bypassing anchors with one live direct "
-                    "route to the shelf")
-                self._start_route_leg(
-                    "scan_direct_to_shelf", final_goal,
-                    use_memory=False)
-                return False
             raise RuntimeError(
-                "reverse delivery-trunk fallback also failed: " + failure)
+                "shelf transit direct leg failed: " + failure)
         if not reached:
             return False
 
-        if self.scan_trunk_route_stage == "to_trunk_exit":
-            self.scan_trunk_route_stage = "trunk_reverse"
-            self._start_route_leg(
-                "delivery_trunk_reverse", DELIVERY_TRUNK_REVERSE_GOAL,
-                use_memory=True, lock_cached_path=True)
-            return False
-        if self.scan_trunk_route_stage == "trunk_reverse":
-            self.scan_trunk_route_stage = "to_shelf"
-            self._start_route_leg(
-                "scan_trunk_to_shelf", final_goal, use_memory=False)
-            return False
-        if self.scan_trunk_route_stage in {"to_shelf", "direct_to_shelf"}:
-            self.scan_trunk_route_done = True
-            self._route_leg_name = None
-            self._route_leg_goal = None
-            self._nav_goal = None
-            return True
+        self.scan_trunk_route_done = True
+        self._route_leg_name = None
+        self._route_leg_goal = None
+        self._nav_goal = None
+        return True
         return False
 
     # ------------------------------------------------------------------
@@ -1046,6 +1073,16 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     f"[memory] immediate post-grasp consume "
                     f"kind={self.target_kind} slot={slot}")
         self._capture_transport_grip_command()
+        self._drop_monitor_armed_at = (
+            self.now() + TRANSPORT_DROP_MONITOR_GRACE_S)
+        self._drop_signature_since = None
+        self._drop_candidate_reference_world = None
+        initial_empty, initial_feedback = self._transport_drop_signature()
+        self.get_logger().info(
+            "[drop-monitor] armed after post-grasp grace "
+            f"grace={TRANSPORT_DROP_MONITOR_GRACE_S:.2f}s "
+            f"initial_empty={int(initial_empty)} "
+            f"feedback={initial_feedback}")
         self.des_slide = self._transit_slide_target()
         self.get_logger().info(
             f"[flow] goods grabbed (marker={self.target_marker_id}, "
@@ -1105,17 +1142,19 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._nav_goal = None
         self._nav_last_log = 0.0
         self._nav_memory_logged = False
-        self.delivery_nav_stage = "to_trunk_entry"
-        self.delivery_direct_fallback_used = False
+        # Single direct leg to the assigned slot; the delivery-trunk stages
+        # (trunk entry -> trunk forward -> slot) are removed because trunk
+        # anchors and cached routes routinely stalled beside the delivery
+        # table under random box layouts (see _scan_trunk_route_tick note).
+        self.delivery_nav_stage = "direct_to_slot"
         self._start_route_leg(
-            "delivery_to_trunk_entry", DELIVERY_TRUNK_ENTRY,
+            "delivery_direct_to_slot", self._delivery_slot_goal(),
             use_memory=False)
         self.get_logger().info(
             f"[nav→delivery] assigned slot="
             f"{None if self.place_slot is None else self.place_slot + 1} "
             f"target={np.round(self.place_world[:2], 3)} "
-            f"trunk_entry={np.round(DELIVERY_TRUNK_ENTRY[:2], 3)} "
-            f"trunk_exit={np.round(DELIVERY_TRUNK_EXIT[:2], 3)}")
+            f"direct_single_leg=True")
 
     def _delivery_slot_goal(self) -> tuple[float, float, float]:
         return (
@@ -1173,37 +1212,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         if self.delivery_nav_stage != "slot_refine":
             reached, failure = self._route_leg_tick()
             if failure is not None:
-                if not self.delivery_direct_fallback_used:
-                    failed_stage = self.delivery_nav_stage
-                    self.delivery_direct_fallback_used = True
-                    self.delivery_nav_stage = "direct_to_slot"
-                    self.get_logger().warn(
-                        f"[route] delivery stage={failed_stage} failed "
-                        f"({failure}); bypassing trunk anchors with one live "
-                        "direct route to the assigned slot")
-                    self._start_route_leg(
-                        "delivery_direct_to_slot",
-                        self._delivery_slot_goal(), use_memory=False)
-                    return
                 raise RuntimeError(
-                    "delivery direct fallback also failed: " + failure)
+                    "delivery direct navigation failed: " + failure)
             if not reached:
                 return
-
-            if self.delivery_nav_stage == "to_trunk_entry":
-                self.delivery_nav_stage = "trunk_forward"
-                self._start_route_leg(
-                    "delivery_trunk_forward", DELIVERY_TRUNK_EXIT,
-                    use_memory=True, lock_cached_path=True)
-                return
-            if self.delivery_nav_stage == "trunk_forward":
-                self.delivery_nav_stage = "to_slot"
-                self._start_route_leg(
-                    "delivery_trunk_to_slot", self._delivery_slot_goal(),
-                    use_memory=False)
-                return
-            if self.delivery_nav_stage in {"to_slot", "direct_to_slot"}:
-                self.delivery_nav_stage = "slot_refine"
+            self.delivery_nav_stage = "slot_refine"
 
         # Navigator yaw tolerance is 0.15 rad; refine to face south before the
         # guarded final creep and loaded-arm motion begin.
@@ -1218,8 +1231,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_stage = 0
         self.place_t0 = now
         self.get_logger().info(
-            f"[flow] arrived at delivery approach via="
-            f"{'direct_fallback' if self.delivery_direct_fallback_used else 'reusable_trunk'} "
+            f"[flow] arrived at delivery approach via=direct "
             f"pos=({self.base_xy[0]:.2f},{self.base_xy[1]:.2f}) "
             f"yaw={math.degrees(self.base_yaw):.0f}deg; placing with "
             f"grip_command={self._transport_grip_command} "
@@ -1315,6 +1327,209 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         else:
             self._set_selected_grip(self._transport_grip_command)
 
+    def _held_product_reference_world(self) -> np.ndarray | None:
+        """Return the best measured proxy for the carried product centre."""
+        if self.use_dual_tissue_grasp:
+            return self._dual_release_world()
+        return self.selected_tcp_world()
+
+    def _transport_drop_signature(self) -> tuple[bool, dict]:
+        """Infer an empty grasp from measured gripper positions.
+
+        The three grasp families have deliberately different feedback
+        semantics, so sharing one numeric threshold would be unsafe:
+        spheres remain visibly open around the fruit, generic fingers close
+        almost to their command after losing the item, and an unloaded dual
+        tissue clamp springs both measured joints above its contact range.
+        """
+        if self.use_dual_tissue_grasp:
+            left = self.joints.get("left_arm_eef_gripper_joint")
+            right = self.joints.get("right_arm_eef_gripper_joint")
+            if left is None or right is None:
+                return False, {"mode": "dual", "feedback": "missing"}
+            left = float(left)
+            right = float(right)
+            if not math.isfinite(left) or not math.isfinite(right):
+                return False, {"mode": "dual", "feedback": "invalid"}
+            threshold = float(pick.DUAL_TISSUE_GRIP_CONTACT_MAX)
+            return (
+                left > threshold and right > threshold,
+                {
+                    "mode": "dual",
+                    "left_grip": round(left, 4),
+                    "right_grip": round(right, 4),
+                    "empty_threshold": round(threshold, 4),
+                })
+
+        measured = self.selected_gripper_position()
+        if measured is None:
+            return False, {"mode": "single", "feedback": "missing"}
+        if self.use_sphere_grasp:
+            threshold = float(self.sphere_capture_minimum())
+            return (
+                measured <= threshold,
+                {
+                    "mode": "sphere",
+                    "measured_grip": round(measured, 4),
+                    "held_minimum": round(threshold, 4),
+                })
+
+        close_command = float(pick.GRIP_CLOSE_BY_CLASS.get(
+            self.target_kind, pick.GENERIC_GRIP_CLOSE))
+        threshold = close_command + float(pick.GENERIC_EMPTY_GRIP_MARGIN)
+        return (
+            measured <= threshold,
+            {
+                "mode": "generic",
+                "measured_grip": round(measured, 4),
+                "empty_maximum": round(threshold, 4),
+                "close_command": round(close_command, 4),
+            })
+
+    def _start_transport_drop_recovery(
+            self, now: float, *, over_table: bool, details: dict,
+            reference: np.ndarray | None = None) -> None:
+        """Stop motion and recover posture after a confirmed product loss."""
+        if reference is None:
+            reference = self._held_product_reference_world()
+        reference_list = self._rounded_list(reference)
+        self.drop_event = {
+            "outcome": "delivered_above_table" if over_table else "retry",
+            "phase": self.flow_phase,
+            "place_stage": int(self.place_stage),
+            "product_reference_world": reference_list,
+            "over_delivery_table": bool(over_table),
+            "feedback": details,
+        }
+        self.set_twist(0.0, 0.0)
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
+        self._command_initial_arm_posture()
+        self.commands_ready_since = None
+        self._drop_recovery_started_at = now
+        self._drop_signature_since = None
+        self._drop_candidate_reference_world = None
+
+        event_json = json.dumps(
+            self.drop_event, ensure_ascii=False, separators=(",", ":"))
+        if over_table:
+            # Delivery is irreversible at this point.  Mark it immediately so
+            # a later posture/return-scan fault cannot schedule a duplicate.
+            self.delivery_completed_by_drop = True
+            self.placement_completed = True
+            self.get_logger().info(
+                "[drop-monitor] product released above delivery table; "
+                "counting order as delivered and skipping remaining loaded "
+                f"placement stages event={event_json}")
+            self._set_flow_phase("drop_success_recover")
+            return
+
+        self.terminal_error = (
+            "product dropped during transport; retry this order "
+            f"event={event_json}")
+        self.get_logger().error(
+            "[drop-monitor] product lost outside delivery table; stopping "
+            f"worker for same-order retry event={event_json}")
+        self._set_flow_phase("drop_failed_recover")
+
+    def _monitor_held_product(self, now: float) -> bool:
+        """Debounce gripper feedback and handle a confirmed product loss."""
+        active = (
+            self.flow_phase in {
+                "backup", "restore_height", "nav_to_delivery"}
+            or (self.flow_phase == "place" and self.place_stage in {0, 1, 2}))
+        if not active:
+            self._drop_signature_since = None
+            self._drop_candidate_reference_world = None
+            return False
+        if (self._drop_monitor_armed_at is None
+                or now < self._drop_monitor_armed_at):
+            return False
+
+        lost, details = self._transport_drop_signature()
+        if not lost:
+            self._drop_signature_since = None
+            self._drop_candidate_reference_world = None
+            return False
+        if self._drop_signature_since is None:
+            self._drop_signature_since = now
+            reference = self._held_product_reference_world()
+            self._drop_candidate_reference_world = (
+                None if reference is None
+                else np.asarray(reference, dtype=float).copy())
+            self.get_logger().warn(
+                "[drop-monitor] possible product loss; waiting for "
+                f"{TRANSPORT_DROP_CONFIRM_S:.2f}s confirmation "
+                f"feedback={details} reference="
+                f"{self._rounded_list(self._drop_candidate_reference_world)}")
+        elif self._drop_candidate_reference_world is None:
+            reference = self._held_product_reference_world()
+            self._drop_candidate_reference_world = (
+                None if reference is None
+                else np.asarray(reference, dtype=float).copy())
+        # Stop immediately on the first empty-grasp signature.  Confirmation
+        # still debounces the order decision, but the base/arm no longer move
+        # the reference point across the table boundary in that interval.
+        self.set_twist(0.0, 0.0)
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
+        if now - self._drop_signature_since < TRANSPORT_DROP_CONFIRM_S:
+            return True
+
+        reference = self._drop_candidate_reference_world
+        over_table = self._tcp_over_delivery_table(reference)
+        self._start_transport_drop_recovery(
+            now, over_table=over_table, details=details,
+            reference=reference)
+        return True
+
+    def _drop_recovery_tick(self, now: float, *, delivered: bool) -> None:
+        """Recover a neutral footprint, then finish or fail the worker."""
+        self.set_twist(0.0, 0.0)
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
+        self._command_initial_arm_posture()
+        ready = (
+            self.dual_commands_ready(
+                arm_tolerance=0.08, slide_tolerance=0.05)
+            and self._initial_head_posture_ready())
+        timed_out = (
+            now - self._drop_recovery_started_at
+            >= TRANSPORT_DROP_RECOVERY_TIMEOUT_S)
+        if not ready and not timed_out:
+            return
+        if timed_out:
+            message = (
+                "neutral posture recovery timed out after confirmed "
+                "product loss")
+            if delivered:
+                self._post_delivery_warning(message)
+            else:
+                self.terminal_error = f"{self.terminal_error}; {message}"
+
+        if not delivered:
+            self.place_t0 = now
+            self._set_flow_phase("drop_failed")
+            self.get_logger().error(
+                "[drop-monitor] failed transport attempt finished; "
+                "shutting down for runner retry")
+            return
+
+        # Reuse the existing obstacle-aware table clearance and first-order
+        # return-to-A path.  The product is already gone, so begin with both
+        # arms neutral instead of replaying descent/release/vertical-clear.
+        clearance = point_to_rect_clearance(
+            float(self.base_xy[0]), float(self.base_xy[1]),
+            DELIVERY_TABLE_COSTMAP_BOUNDS)
+        self.place_stage = 5
+        self.place_t0 = now
+        self._place_retreat_start_clearance = clearance
+        self._place_retreat_sent = True
+        self._set_flow_phase("place")
+        self.get_logger().info(
+            "[drop-monitor] neutral posture recovered; entering table "
+            f"clearance only (clearance={clearance:.3f}m)")
+
     def _command_initial_arm_posture(self) -> None:
         """Return the manipulators and camera assembly to the initial pose."""
         self.des_left_arm = np.asarray(PLACE_RETREAT_ARM_L, dtype=float)
@@ -1324,6 +1539,73 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.des_slide = pick.SLIDE_REFERENCE_COMMAND
         self.des_head = np.asarray(
             PLACE_RETREAT_HEAD_YAW_PITCH, dtype=float)
+
+    def _neutral_posture_ready(self) -> bool:
+        """Whether both arms, slide and head reached the initial pose."""
+        return bool(
+            self.dual_commands_ready(
+                arm_tolerance=0.08, slide_tolerance=0.05)
+            and self._initial_head_posture_ready())
+
+    def _abort_recovery_ready(self) -> bool:
+        """Restore the neutral posture before an abort shuts the worker down.
+
+        Every grasp-failure path (STATE_ABORT) first streams both arms, both
+        grippers, slide and head back to the initial pose; the worker exits
+        only after the posture settles or the recovery ceiling is reached.
+        """
+        self._command_initial_arm_posture()
+        if self._neutral_posture_ready():
+            self.get_logger().info(
+                "[abort] neutral posture recovered before exit")
+            return True
+        if self.now() - self.state_t0 >= ABORT_RECOVERY_TIMEOUT_S:
+            self.get_logger().warn(
+                "[abort] neutral posture recovery timed out after "
+                f"{ABORT_RECOVERY_TIMEOUT_S:.1f}s; shutting down anyway")
+            return True
+        return False
+
+    def _enter_fatal_recovery(self, exc: Exception) -> None:
+        """Freeze the base and restore the neutral posture after a fatal tick.
+
+        rclpy swallows timer-callback exceptions, so without this a placement
+        RuntimeError would leave the worker parked mid-motion until the runner
+        kills it on timeout.  Catch it here, restore the posture and shut the
+        worker down cleanly with the error reported to the runner.
+        """
+        if self._fatal_error is None:
+            self._fatal_error = f"{type(exc).__name__}: {exc}"
+            self._fatal_recovery_started_at = self.now()
+            self.get_logger().error(
+                f"[fatal] phase={self.flow_phase} state={self.state} "
+                f"place_stage={self.place_stage}: {self._fatal_error}; "
+                "restoring neutral posture before exit")
+            self._command_initial_arm_posture()
+            self.set_twist(0.0, 0.0)
+            self.cmd_linear = 0.0
+            self.cmd_angular = 0.0
+        self.flow_phase = "fatal_recover"
+
+    def _fatal_recovery_tick(self, now: float) -> bool:
+        """Hold the neutral posture; return True when the worker may exit."""
+        self.set_twist(0.0, 0.0)
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
+        self._command_initial_arm_posture()
+        if self._neutral_posture_ready():
+            self.get_logger().error(
+                f"[fatal] posture recovered; worker finished after "
+                f"{self._fatal_error}")
+            return True
+        if now - self._fatal_recovery_started_at >= FATAL_RECOVERY_TIMEOUT_S:
+            self.get_logger().warn(
+                "[fatal] posture recovery timed out after "
+                f"{FATAL_RECOVERY_TIMEOUT_S:.1f}s; exiting anyway")
+            self.get_logger().error(
+                f"[fatal] worker finished after {self._fatal_error}")
+            return True
+        return False
 
     def _initial_head_posture_ready(self) -> bool:
         """Whether measured head joints have reached the neutral transit pose."""
@@ -2371,12 +2653,16 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                         slide_tolerance=0.05)
                     or not self._initial_head_posture_ready()):
                 return
-            self._set_flow_phase("done")
+            self.placement_completed = True
             self.place_t0 = now
             self.get_logger().info(
                 f"[flow] PLACE COMPLETE — {self.target_kind} delivered; "
                 f"table cleared (clearance={clearance:.3f}m); "
                 f"base=({self.base_xy[0]:.2f},{self.base_xy[1]:.2f})")
+            if self.return_west_after_place:
+                self._start_return_to_west(now)
+            else:
+                self._set_flow_phase("done")
             return
 
         elapsed = now - self.place_t0
@@ -2395,6 +2681,140 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.set_twist(
             -PLACE_CLEAR_TABLE_SPEED_MPS,
             float(np.clip(2.0 * yaw_error, -0.25, 0.25)))
+
+    def _post_delivery_warning(self, message: str) -> None:
+        """Record a non-fatal failure after the product is already delivered."""
+        message = str(message)
+        self.post_delivery_warnings.append(message)
+        self.get_logger().warn(f"[post-delivery] {message}")
+
+    def _finish_after_return_scan(self, now: float) -> None:
+        self.set_twist(0.0, 0.0)
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
+        self._set_flow_phase("done")
+        self.place_t0 = now
+
+    def _start_return_to_west(self, now: float) -> None:
+        """Start the first-delivery return from the table to shelf A."""
+        self._set_flow_phase("return_to_west")
+        # The first shelf trip may already have completed this route state.
+        # Reset it so the delivery trunk is genuinely traversed in reverse.
+        self.scan_trunk_route_stage = None
+        self.scan_trunk_route_done = False
+        self.scan_direct_fallback_used = False
+        self.scan_route_final_goal = None
+        self._route_leg_name = None
+        self._route_leg_goal = None
+        self._nav_goal = None
+        self._nav_last_log = 0.0
+        self._last_nav_reason = None
+        self._nav_memory_logged = False
+        self.return_scan_pose_index = 0
+        self.return_scan_pose_started_at = now
+        self.return_scan_camera_ready_since = None
+        self.get_logger().info(
+            "[return-west] first delivery complete; returning to shelf A "
+            f"goal=({RETURN_WEST_GOAL[0]:.3f},"
+            f"{RETURN_WEST_GOAL[1]:.3f},north)")
+
+    def _return_to_west_tick(self, now: float) -> None:
+        target = np.asarray(RETURN_WEST_GOAL[:2], dtype=float)
+        try:
+            trunk_ready = self._scan_trunk_route_tick(
+                target, RETURN_WEST_GOAL[2])
+        except RuntimeError as exc:
+            self._post_delivery_warning(
+                f"return to shelf A failed: {exc}")
+            self._finish_after_return_scan(now)
+            return
+        if not trunk_ready:
+            return
+
+        # The route navigator has a deliberately broad arrival tolerance.
+        # Refine position and north-facing yaw before recording shelf A.
+        arrived = pick.ShelfPickController.drive_to(
+            self, target, RETURN_WEST_GOAL[2], 0.08)
+        if not arrived:
+            return
+        self.set_twist(0.0, 0.0)
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
+        self._set_flow_phase("return_west_scan")
+        self.return_scan_pose_index = 0
+        self.return_scan_pose_started_at = now
+        self.return_scan_camera_ready_since = None
+        self.get_logger().info(
+            "[return-west] stopped at shelf A; starting stationary full-view "
+            f"inventory scan ({len(RETURN_WEST_SCAN_POSES)} poses)")
+
+    def _advance_return_scan_pose(self, now: float) -> None:
+        completed_name = RETURN_WEST_SCAN_POSES[
+            self.return_scan_pose_index][0]
+        self.get_logger().info(
+            f"[return-west-scan] completed pose={completed_name} "
+            f"{self.return_scan_pose_index + 1}/"
+            f"{len(RETURN_WEST_SCAN_POSES)}")
+        self.return_scan_pose_index += 1
+        self.return_scan_pose_started_at = now
+        self.return_scan_camera_ready_since = None
+        if self.return_scan_pose_index < len(RETURN_WEST_SCAN_POSES):
+            return
+        self._set_flow_phase("return_west_recover")
+        self.return_recovery_started_at = now
+        self._command_initial_arm_posture()
+        self.get_logger().info(
+            "[return-west-scan] shelf A inventory dwell complete; "
+            "restoring neutral transit posture")
+
+    def _return_west_scan_tick(self, now: float) -> None:
+        self.set_twist(0.0, 0.0)
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
+        pose = RETURN_WEST_SCAN_POSES[self.return_scan_pose_index]
+        pose_name, slide_target, yaw_target, pitch_target = pose
+        self.des_slide = slide_target
+        self.des_head[:] = [yaw_target, pitch_target]
+
+        if not self.scan_camera_ready(pose):
+            self.return_scan_camera_ready_since = None
+            if (now - self.return_scan_pose_started_at
+                    >= RETURN_WEST_SCAN_POSE_TIMEOUT_S):
+                self._post_delivery_warning(
+                    f"shelf A scan pose {pose_name} did not settle within "
+                    f"{RETURN_WEST_SCAN_POSE_TIMEOUT_S:.1f}s; continuing")
+                self._advance_return_scan_pose(now)
+            return
+        if self.return_scan_camera_ready_since is None:
+            self.return_scan_camera_ready_since = now
+            return
+        required = (
+            pick.SCAN_CAMERA_STABLE_S
+            + pick.SCAN_SETTLE_S
+            + pick.SCAN_DWELL_S)
+        if now - self.return_scan_camera_ready_since < required:
+            return
+        self._advance_return_scan_pose(now)
+
+    def _return_west_recover_tick(self, now: float) -> None:
+        self.set_twist(0.0, 0.0)
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
+        self._command_initial_arm_posture()
+        ready = (
+            self.dual_commands_ready(
+                arm_tolerance=0.08, slide_tolerance=0.05)
+            and self._initial_head_posture_ready())
+        if ready:
+            self.get_logger().info(
+                "[return-west] shelf A scan complete; posture recovered")
+            self._finish_after_return_scan(now)
+            return
+        if (now - self.return_recovery_started_at
+                >= RETURN_WEST_RECOVERY_TIMEOUT_S):
+            self._post_delivery_warning(
+                "neutral posture recovery timed out after shelf A scan")
+            self._finish_after_return_scan(now)
 
     def smooth_commands(self) -> None:
         """Limit loaded placement arm motion and the final slide descent."""
@@ -2439,7 +2859,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         # motion is cancelled only for reasons that require the complete base
         # to hold; obstacle stops may still rotate in place to find a route.
         nav_reason = self.nav.controller.stop_reason
-        if (self.flow_phase in {"grab", "nav_to_delivery"}
+        if (self.flow_phase in {
+                "grab", "nav_to_delivery", "return_to_west"}
                 and abs(self.des_linear) <= 1e-9
                 and nav_reason is not None):
             self.cmd_linear = 0.0
@@ -2452,7 +2873,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             or (isinstance(nav_reason, str)
                 and (nav_reason.startswith("no_path")
                      or nav_reason.startswith("stuck_no_path"))))
-        if (self.flow_phase in {"grab", "nav_to_delivery"}
+        if (self.flow_phase in {
+                "grab", "nav_to_delivery", "return_to_west"}
                 and abs(self.des_angular) <= 1e-9
                 and full_hold):
             self.cmd_angular = 0.0
@@ -2504,10 +2926,15 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             or (self.state in {pick.STATE_REVISIT, pick.STATE_RECHECK}
                 and self.scan_camera_ready_since is not None)
             or memory_corridor_transit)
+        stable_return_scan = (
+            self.flow_phase == "return_west_scan"
+            and self.return_scan_camera_ready_since is not None
+            and now - self.return_scan_camera_ready_since
+            >= pick.SCAN_CAMERA_STABLE_S)
         perception_needed = (
             not (odom_stale or joints_stale or laser_stale)
-            and self.flow_phase == "grab"
-            and stable_perception_state)
+            and ((self.flow_phase == "grab" and stable_perception_state)
+                 or stable_return_scan))
         self._publish_perception_request(perception_needed)
         if odom_stale or joints_stale or laser_stale:
             # The direct zero command below bypasses normal smoothing.  Keep
@@ -2527,14 +2954,30 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         if not self.initialized:
             self.initialize_commands()
 
-        if self.flow_phase == "grab":
-            self._memory_route_tick()
-            prev_state = self.state
-            super().tick()
-            if (prev_state != pick.STATE_DONE
-                    and self.state == pick.STATE_DONE):
-                self._on_grab_complete()
-            return
+        # The simulator resets only the base pose between workers, so a failed
+        # predecessor can leave a closed gripper / deployed arm behind through
+        # the joint feedback.  Restore the neutral posture once at startup,
+        # before any shelf motion begins.
+        if (not self._startup_posture_recovered
+                and self.state == pick.STATE_GO_SCAN
+                and self.flow_phase == "grab"):
+            self._command_initial_arm_posture()
+            if self._neutral_posture_ready():
+                self._startup_posture_recovered = True
+                self.get_logger().info(
+                    "[startup] neutral manipulation posture verified")
+
+        try:
+            if self.flow_phase == "grab":
+                self._memory_route_tick()
+                prev_state = self.state
+                super().tick()
+                if (prev_state != pick.STATE_DONE
+                        and self.state == pick.STATE_DONE):
+                    self._on_grab_complete()
+                return
+        except Exception as exc:  # noqa: BLE001 - report, recover, exit
+            self._enter_fatal_recovery(exc)
 
         # Post-grab phases: same command pipeline tail as the parent tick.
         self.set_twist(0.0, 0.0)
@@ -2555,24 +2998,79 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 "backup", "restore_height", "nav_to_delivery"}
                 or single_place_hold or dual_place_hold):
             self._hold_grasp_during_transport()
-        if self.flow_phase == "backup":
-            self._backup_tick()
-        elif self.flow_phase == "restore_height":
-            self._restore_height_tick()
-        elif self.flow_phase == "nav_to_delivery":
-            self._nav_to_delivery_tick()
-        elif self.flow_phase == "place":
-            self._place_tick()
-        elif not self._flow_done_logged:
-            self._flow_done_logged = True
-            self.get_logger().info(
-                f"[flow] done — final base=({self.base_xy[0]:.2f},"
-                f"{self.base_xy[1]:.2f})")
+        drop_paused = self._monitor_held_product(now)
+        drop_candidate_hold = (
+            drop_paused
+            and (self.flow_phase in {
+                "backup", "restore_height", "nav_to_delivery"}
+                 or (self.flow_phase == "place"
+                     and self.place_stage in {0, 1, 2})))
+        if self.flow_phase == "fatal_recover":
+            # A phase tick raised (e.g. place IK/timeout RuntimeError).  rclpy
+            # swallows callback exceptions, so without this branch the worker
+            # would stay parked mid-motion until the runner kills it.  Restore
+            # the neutral posture, then shut down with the error recorded.
+            if self._fatal_recovery_tick(now):
+                import rclpy
+                rclpy.shutdown()
+                return
+        else:
+            try:
+                if drop_paused:
+                    # The first empty-grasp signature already locks the base;
+                    # after debounce the monitor may also have selected a
+                    # recovery phase.  In either case, do not run one more
+                    # tick of the old phase.
+                    pass
+                elif self.flow_phase == "backup":
+                    self._backup_tick()
+                elif self.flow_phase == "restore_height":
+                    self._restore_height_tick()
+                elif self.flow_phase == "nav_to_delivery":
+                    self._nav_to_delivery_tick()
+                elif self.flow_phase == "place":
+                    self._place_tick()
+                elif self.flow_phase == "return_to_west":
+                    self._return_to_west_tick(now)
+                elif self.flow_phase == "return_west_scan":
+                    self._return_west_scan_tick(now)
+                elif self.flow_phase == "return_west_recover":
+                    self._return_west_recover_tick(now)
+                elif self.flow_phase == "drop_success_recover":
+                    self._drop_recovery_tick(now, delivered=True)
+                elif self.flow_phase == "drop_failed_recover":
+                    self._drop_recovery_tick(now, delivered=False)
+                elif not self._flow_done_logged:
+                    self._flow_done_logged = True
+                    self.get_logger().info(
+                        f"[flow] done — final base=({self.base_xy[0]:.2f},"
+                        f"{self.base_xy[1]:.2f})")
+            except Exception as exc:  # noqa: BLE001 - report, recover, exit
+                self._enter_fatal_recovery(exc)
         if (self.flow_phase == "done"
                 and self.now() - self.place_t0 > FLOW_DONE_SETTLE_S):
             self.get_logger().info("[flow] flow finished; shutting down")
             import rclpy
             rclpy.shutdown()
+            return
+        if (self.flow_phase == "drop_failed"
+                and self.now() - self.place_t0
+                > TRANSPORT_DROP_FAILURE_SETTLE_S):
+            self.get_logger().error(
+                "[drop-monitor] transport-drop worker finished; requesting "
+                "runner restart")
+            import rclpy
+            rclpy.shutdown()
+            return
+
+        if drop_candidate_hold:
+            # Keep the last arm/slide command frozen during the short
+            # confirmation window.  Calling smooth_commands here would keep
+            # advancing a previously requested loaded placement trajectory
+            # even though the base has already stopped.
+            self.cmd_linear = 0.0
+            self.cmd_angular = 0.0
+            self.publish_commands()
             return
 
         self.apply_manip_base_hold()
@@ -2679,6 +3177,10 @@ def parse_args() -> argparse.Namespace:
         help="scan from the westmost shelf (A) first; used for orders after "
              "the first in a match")
     parser.add_argument(
+        "--return-west-after-place", action="store_true",
+        help="after a successful placement, return to shelf A and perform "
+             "one stationary full-view inventory scan before exiting")
+    parser.add_argument(
         "--scan-start-x", type=float,
         help="measured product world X from cross-order inventory; chooses "
              "the nearest first scan station without bypassing perception")
@@ -2780,7 +3282,8 @@ def main() -> int:
             nav_during_scan=not args.no_nav_during_scan,
             backup_after_grab_m=args.backup_after_grab,
             place_creep_m=args.place_creep_distance,
-            close_recheck=not args.no_close_recheck)
+            close_recheck=not args.no_close_recheck,
+            return_west_after_place=args.return_west_after_place)
         controller.configure_external_perception(args.external_perception)
         controller.configure_opportunistic_targets(args.candidate_kind)
         controller.scan_prefer_west_start = args.scan_start_west
@@ -2857,18 +3360,28 @@ def main() -> int:
         pass
     except Exception as exc:  # noqa: BLE001 - worker must report the failure
         caught_error = f"{type(exc).__name__}: {exc}"
-        raise
+        if controller is not None and controller.placement_completed:
+            # Placement is irreversible.  A navigation/camera failure during
+            # the optional return scan must not schedule the same product for
+            # another grasp attempt.
+            controller._post_delivery_warning(caught_error)
+            controller._finish_after_return_scan(controller.now())
+        else:
+            raise
     finally:
         delivered = bool(
             controller is not None
-            and controller.flow_phase == "done")
+            and controller.placement_completed)
         state = None if controller is None else controller.state
         phase = None if controller is None else controller.flow_phase
         marker_id = (
             None if controller is None else controller.target_marker_id)
         slot = None if controller is None else controller.target_slot()
         error = None if delivered else (
-            caught_error or f"worker stopped in phase={phase} state={state}")
+            caught_error
+            or (None if controller is None else controller._fatal_error)
+            or (None if controller is None else controller.terminal_error)
+            or f"worker stopped in phase={phase} state={state}")
         result_document = {
             "schema_version": 1,
             "order_id": args.order_id,
@@ -2889,6 +3402,16 @@ def main() -> int:
             "formal_mode": bool(args.formal_mode),
             "place_slot": args.place_slot,
             "place_xy": [place_x, place_y],
+            "return_west_after_place": bool(
+                args.return_west_after_place),
+            "post_delivery_warnings": (
+                [] if controller is None
+                else list(controller.post_delivery_warnings)),
+            "delivery_completed_by_drop": bool(
+                controller is not None
+                and controller.delivery_completed_by_drop),
+            "drop_event": (
+                None if controller is None else controller.drop_event),
         }
         if controller is not None:
             result_document.update(controller.timing_snapshot())

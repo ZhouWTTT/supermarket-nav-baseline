@@ -206,6 +206,15 @@ class YoloBackend:
             print(f"[YoloBackend] checkpoint not found: {ckpt_path} — returning empty detections")
             return
         try:
+            # The official client currently ships an Ultralytics profiler
+            # that synchronizes CUDA whenever a GPU is visible, even when the
+            # model and prediction request both use CPU.  With the simulator
+            # occupying almost all VRAM, that profiler-only synchronization
+            # can raise CUDA OOM and kill CPU inference.  Make explicit CPU
+            # mode genuinely CUDA-free.  competition_runner also sets this
+            # before process start; this guard covers standalone clients.
+            if str(device).lower() == "cpu":
+                os.environ["CUDA_VISIBLE_DEVICES"] = ""
             import torch
             from ultralytics import YOLO
 

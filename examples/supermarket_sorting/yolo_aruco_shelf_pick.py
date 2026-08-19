@@ -1964,6 +1964,21 @@ class ShelfPickController(Node):
                 STATE_DONE, STATE_ABORT):
             self.log_manipulation_snapshot(new_state)
 
+    def _abort_recovery_ready(self) -> bool:
+        """True when the abort posture has settled enough to shut down.
+
+        The base implementation keeps the original settle gate (0.5 s of
+        converged commands or the fixed abort timeout).  Subclasses with a
+        known neutral manipulation posture (e.g. IntegratedNavPickPlace)
+        override this to restore arms, grippers, slide and head to the
+        initial pose before the worker exits, so a failed order never leaves
+        the next worker with a closed gripper or a deployed arm.
+        """
+        elapsed = self.now() - self.state_t0
+        return bool(
+            (elapsed > 0.5 and self.commands_ready())
+            or elapsed >= ABORT_SHUTDOWN_TIMEOUT_S)
+
     def log_manipulation_snapshot(self, label: str) -> None:
         """Log measured grasp geometry without changing control decisions."""
         if self.use_dual_tissue_grasp:
@@ -5280,9 +5295,7 @@ class ShelfPickController(Node):
                     f"ID={self.target_marker_id})")
 
         elif self.state == STATE_ABORT:
-            elapsed = self.now() - self.state_t0
-            if ((elapsed > 0.5 and self.commands_ready())
-                    or elapsed >= ABORT_SHUTDOWN_TIMEOUT_S):
+            if self._abort_recovery_ready():
                 self.get_logger().error(
                     "abort motion settled; shutting down client cleanly")
                 rclpy.shutdown()
