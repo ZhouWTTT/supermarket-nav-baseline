@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""超市分拣 - 连续多单抓取启动 GUI（1111 版，与主目录界面完全一致）。
+"""超市分拣 - 正式行走录入 + 记忆矩阵直达抓取启动 GUI。
 
-一键启动仿真 Server 与连续订单客户端 ``continuous_goods_client.py``：
-客户端先随机生成一批不重复的货物订单（默认 5 单），每单执行「抓货区抓取 →
-终点直接扔货 → 返回抓货区 → 下一单」，界面实时显示 Server / Client 两个
-容器的日志。
+一键启动仿真 Server 与快照优先客户端 ``snapshot_pick_client.py``：
+客户端先按正式行走流程逐架走到货架前标准站点（E→D→C→B→A）录入全部商品，
+写入 3×15 记忆矩阵（logs/memory_matrix.json），之后每单查矩阵直达对应
+货架/层做局部定位抓取，避免整排货架扫描；每单执行「抓货区抓取 → 终点直接
+扔货 → 返回抓货区 → 下一单」，界面实时显示 Server / Client 两个容器的
+日志与记忆矩阵可视化。
 
-与主目录 gui_launcher_continuous.py 完全一致，仅去掉了「镜像组」选择栏，
-固定使用官方 final 镜像（server 镜像自带代码，无需挂载）。
-挂载的是本目录（1111/supermarket-nav-baseline）。
+挂载的是当前仓库目录，固定使用官方 final 镜像。
 
 依赖：宿主机 python3 + tkinter + docker。
 """
@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import random
 import subprocess
@@ -43,6 +44,24 @@ KINDS = [
     "kele", "maidong", "heweidao", "shupian", "zhijin",
     "kouxiangtang", "sanmingzhi", "pingguo", "chengzi",
 ]
+# 记忆矩阵：每种货物的展示用短名与颜色
+KIND_SHORT = {
+    "kele": "可乐", "maidong": "脉动", "heweidao": "核桃刀",
+    "shupian": "薯片", "zhijin": "纸巾", "kouxiangtang": "口香糖",
+    "sanmingzhi": "三明治", "pingguo": "苹果", "chengzi": "橙子",
+}
+KIND_COLORS = {
+    "kele": "#FF6B6B", "maidong": "#4ECDC4", "heweidao": "#FFE066",
+    "shupian": "#FFA94D", "zhijin": "#B197FC", "kouxiangtang": "#69DB7C",
+    "sanmingzhi": "#74C0FC", "pingguo": "#FF9F9F", "chengzi": "#FFD43B",
+}
+MATRIX_EMPTY_COLOR = "#F1F3F5"
+MATRIX_CONSUMED_COLOR = "#ADB5BD"
+MATRIX_ROWS = ("L1", "L2", "L3")
+MATRIX_COLS = [
+    f"{shelf}{col}"
+    for shelf in ("A", "B", "C", "D", "E")
+    for col in ("1", "2", "3")]
 DEFAULT_ORDERS_COUNT = 5
 
 
@@ -67,7 +86,7 @@ def run_cmd(args, **kwargs):
 class LauncherApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("超市分拣 - 连续多单抓取启动器")
+        self.root.title("超市分拣 - 正式行走录入+记忆直达抓取")
         self.root.geometry("960x700")
         self.root.minsize(800, 560)
 
@@ -80,6 +99,7 @@ class LauncherApp:
         self._build_logs()
         self._regenerate_orders()
         self._poll_status()
+        self._poll_memory_matrix()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -97,6 +117,10 @@ class LauncherApp:
         self.record_var = tk.BooleanVar(value=True)
         self.res_var = tk.StringVar(value="640x480")
         self.fps_var = tk.StringVar(value="24")
+        # 默认"余光"模式：不专门行走录入，订单抓取过程自动填记忆矩阵；
+        # 需要完整矩阵时再勾选行走录入。
+        self.snapshot_first_var = tk.BooleanVar(value=False)
+        self.snapshot_passes_var = tk.IntVar(value=1)
 
         row1 = ttk.Frame(top)
         row1.pack(fill="x")
@@ -130,6 +154,13 @@ class LauncherApp:
 
         row2b = ttk.Frame(top)
         row2b.pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(
+            row2b, text="先正式行走录入(记忆矩阵)",
+            variable=self.snapshot_first_var).pack(side="left", padx=(0, 8))
+        ttk.Label(row2b, text="录入趟数:").pack(side="left")
+        ttk.Spinbox(
+            row2b, from_=1, to=5, textvariable=self.snapshot_passes_var,
+            width=4).pack(side="left", padx=(4, 16))
         ttk.Checkbutton(
             row2b, text="自动录像",
             variable=self.record_var).pack(side="left", padx=(0, 16))
@@ -200,9 +231,11 @@ class LauncherApp:
             foreground="#0a6c0a").pack(anchor="w", pady=(6, 0))
         ttk.Label(
             top,
-            text="提示：客户端每单执行「抓货区抓取 → 终点直接扔货 → 返回抓货区」"
-                 "，送完一单后自动返回并继续下一单；订单允许重复，可手动"
-                 "增删改；每次运行自动录像到 logs/（无论正常结束还是停止）。",
+            text="提示：默认不专门扫描，订单抓取过程中 tracker 持续用 YOLO"
+                 "余光录入当前货架（首单可能仍需扫描，多单后矩阵逐步变全，"
+                 "后续订单直达）；勾选行走录入则开局先逐架录一遍完整矩阵；"
+                 "每单执行「抓货区抓取 → 终点直接扔货 → 返回抓货区」；"
+                 "订单可手动增删改；每次运行自动录像到 logs/。",
             foreground="#666666").pack(anchor="w")
 
     def _build_logs(self):
@@ -211,6 +244,62 @@ class LauncherApp:
 
         self.server_text = self._make_log_tab(tabs, "Server 日志")
         self.client_text = self._make_log_tab(tabs, "Client 日志")
+        self._build_memory_matrix_tab(tabs)
+
+    def _build_memory_matrix_tab(self, tabs):
+        """3 层 × 5 货架 × 3 列的记忆矩阵可视化面板。"""
+        frame = ttk.Frame(tabs)
+
+        header = ttk.Frame(frame)
+        header.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(
+            header, text="记忆矩阵（行=层 L1/L2/L3，列=货架×列 A1..E3）",
+            font=("DejaVu Sans", 10, "bold")).pack(side="left")
+        self.matrix_status = ttk.Label(header, text="等待数据...")
+        self.matrix_status.pack(side="right")
+
+        grid_frame = ttk.Frame(frame)
+        grid_frame.pack(padx=8, pady=2)
+        ttk.Label(grid_frame, text="", width=5).grid(row=0, column=0)
+        for col_index, col_label in enumerate(MATRIX_COLS):
+            ttk.Label(
+                grid_frame, text=col_label, width=6,
+                anchor="center").grid(row=0, column=col_index + 1)
+        self.matrix_labels: dict[str, list[tk.Label]] = {}
+        for row_index, level in enumerate(MATRIX_ROWS):
+            ttk.Label(
+                grid_frame, text=level, width=5,
+                anchor="center").grid(row=row_index + 1, column=0)
+            row_labels = []
+            for col_index in range(len(MATRIX_COLS)):
+                label = tk.Label(
+                    grid_frame, text="", width=6, height=1,
+                    relief="ridge", bg=MATRIX_EMPTY_COLOR,
+                    font=("DejaVu Sans", 9))
+                label.grid(
+                    row=row_index + 1, column=col_index + 1,
+                    padx=1, pady=1, sticky="nsew")
+                row_labels.append(label)
+            self.matrix_labels[level] = row_labels
+
+        self.matrix_approx_label = ttk.Label(
+            frame, text="近似记录(无码): 无", foreground="#555555")
+        self.matrix_approx_label.pack(fill="x", padx=8, pady=(6, 0))
+
+        legend = ttk.Frame(frame)
+        legend.pack(fill="x", padx=8, pady=(6, 8))
+        for kind in KINDS:
+            swatch = tk.Label(
+                legend, text="  ", bg=KIND_COLORS[kind], width=2)
+            swatch.pack(side="left", padx=(6, 1))
+            ttk.Label(
+                legend, text=KIND_SHORT[kind]).pack(side="left")
+        consumed = tk.Label(
+            legend, text="  ", bg=MATRIX_CONSUMED_COLOR, width=2)
+        consumed.pack(side="left", padx=(16, 1))
+        ttk.Label(legend, text="已取走").pack(side="left")
+
+        tabs.add(frame, text="记忆矩阵")
 
     def _make_log_tab(self, tabs, title):
         frame = ttk.Frame(tabs)
@@ -331,6 +420,7 @@ class LauncherApp:
             "bash", "-lc",
             "cd /workspace/supermarket_sorting_task && "
             "source /opt/ros/humble/setup.bash && "
+            "mkdir -p logs && "
             "python3 examples/supermarket_sorting/"
             "supermarket_sorting_server.py 2>&1 | "
             "tee logs/gui_server_$(date +%H%M%S).log",
@@ -339,6 +429,11 @@ class LauncherApp:
 
     def _client_args(self) -> list[str]:
         orders = ",".join(self.orders)
+        snapshot_args = ""
+        if self.snapshot_first_var.get():
+            snapshot_args = (
+                " --record-first "
+                f"--record-passes {int(self.snapshot_passes_var.get())}")
         args = [
             "docker", "run", "--rm", "-d",
             "--name", CLIENT_NAME,
@@ -366,11 +461,12 @@ class LauncherApp:
             "cd /workspace/supermarket_sorting_task && "
             "source /opt/ros/humble/setup.bash && "
             "python3 examples/supermarket_sorting/"
-            "continuous_goods_client.py "
+            "snapshot_pick_client.py "
             f"--orders {orders} "
             f"--max-scan-cycles {int(self.cycles_var.get())}"
+            + snapshot_args
             + (" --show" if self.show_yolo_var.get() else "")
-            + " 2>&1 | tee logs/gui_client_continuous_"
+            + " 2>&1 | tee logs/gui_client_snapshot_pick_"
             + f"$(date +%H%M%S).log",
         ]
         return args
@@ -440,10 +536,9 @@ class LauncherApp:
             messagebox.showerror(
                 "订单为空", "请先用“随机生成”或“添加”生成订单列表。")
             return
-        # 清理同名残留容器
+        # 清理同名残留容器（包括已退出但未删除的容器）
         for name in (CLIENT_NAME, SERVER_NAME):
-            if self._docker_running(name):
-                run_cmd(["docker", "rm", "-f", name])
+            run_cmd(["docker", "rm", "-f", name])
 
         self._append_log(self.server_text, "正在启动 Server ...\n")
         code, _, err = run_cmd(self._server_args())
@@ -510,6 +605,96 @@ class LauncherApp:
                 self._last_log[name] = out
                 self._append_log(widget, out if out else "(暂无输出)\n")
 
+    def _poll_memory_matrix(self):
+        """轮询 logs/memory_matrix.json 并刷新 3×15 网格。"""
+        path = os.path.join(REPO_ROOT, "logs", "memory_matrix.json")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            self.matrix_status.config(text="暂无数据")
+            self._matrix_job = self.root.after(1000, self._poll_memory_matrix)
+            return
+        grid = data.get("grid", {})
+        for level in MATRIX_ROWS:
+            row = grid.get(level) or []
+            for col_index in range(len(MATRIX_COLS)):
+                label = self.matrix_labels[level][col_index]
+                cell = (
+                    row[col_index]
+                    if col_index < len(row) else None)
+                if not isinstance(cell, dict):
+                    label.config(text="", bg=MATRIX_EMPTY_COLOR)
+                    continue
+                kind = str(cell.get("kind", "?"))
+                consumed = bool(cell.get("consumed", False))
+                text = KIND_SHORT.get(kind, kind)
+                if consumed:
+                    text = "✓" + text
+                label.config(
+                    text=text,
+                    bg=(MATRIX_CONSUMED_COLOR if consumed
+                        else KIND_COLORS.get(kind, "#DEE2E6")))
+        # YOLO-only 近似记录铺到网格：无精确记录的格子显示 "≈种类"，
+        # 新版带 approx_cols 时按站点坐标放到具体列。
+        approx = data.get("approx", {})
+        approx_cols = data.get("approx_cols", {})
+        for key, records in approx.items():
+            try:
+                level, shelf = key.split("|")
+            except ValueError:
+                continue
+            if level not in MATRIX_ROWS or shelf not in "ABCDE":
+                continue
+            col_base = MATRIX_COLS.index(f"{shelf}1")
+            kinds = sorted(records)
+            if not kinds:
+                continue
+            cols_map = approx_cols.get(key, {})
+            if cols_map:
+                for kind in kinds:
+                    column = str(cols_map.get(kind, ""))
+                    if column not in ("1", "2", "3"):
+                        continue
+                    label = self.matrix_labels[level][
+                        col_base + int(column) - 1]
+                    if str(label.cget("text")):
+                        continue  # 已有精确记录，不覆盖
+                    label.config(
+                        text="≈" + KIND_SHORT.get(kind, kind),
+                        bg=KIND_COLORS.get(kind, "#DEE2E6"))
+            else:
+                for i in range(3):
+                    label = self.matrix_labels[level][col_base + i]
+                    if str(label.cget("text")):
+                        continue
+                    kind = kinds[i % len(kinds)]
+                    label.config(
+                        text="≈" + KIND_SHORT.get(kind, kind),
+                        bg=KIND_COLORS.get(kind, "#DEE2E6"))
+        try:
+            updated = float(data.get("updated_at", 0.0))
+            stamp = datetime.datetime.fromtimestamp(
+                updated).strftime("%H:%M:%S")
+            self.matrix_status.config(text=f"更新于 {stamp}")
+        except (TypeError, ValueError, OSError):
+            self.matrix_status.config(text="已更新")
+        approx_parts = []
+        for key, records in sorted(approx.items()):
+            try:
+                level, shelf = key.split("|")
+            except ValueError:
+                continue
+            kinds = "/".join(
+                KIND_SHORT.get(str(kind), str(kind))
+                for kind in sorted(records))
+            approx_parts.append(f"{shelf}-{level}: {kinds}")
+        self.matrix_approx_label.config(
+            text=(
+                "近似记录(无码): " + ("；".join(approx_parts)
+                                    if approx_parts else "无")))
+        self._matrix_job = self.root.after(1000, self._poll_memory_matrix)
+
     def _append_log(self, widget: tk.Text, text: str):
         widget.configure(state="normal")
         widget.delete("1.0", "end")
@@ -521,6 +706,8 @@ class LauncherApp:
         self._stop_recorder()
         if self._poll_job is not None:
             self.root.after_cancel(self._poll_job)
+        if getattr(self, "_matrix_job", None) is not None:
+            self.root.after_cancel(self._matrix_job)
         self.root.destroy()
 
 

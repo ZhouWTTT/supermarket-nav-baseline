@@ -48,6 +48,7 @@ from memory_matrix import (  # noqa: E402
     MEMORY_REROUTE_SAVING_M,
     STATION_Y_MAX,
     STATION_Y_MIN,
+    grasp_eligible_candidates,
     primary_candidates_from_document,
     read_memory_document,
     select_memory_hint,
@@ -212,6 +213,12 @@ ROUTE_LEG_HARD_TIMEOUT_S = 150.0
 # the end of the parent grasp state machine.
 BACKUP_SPEED_MPS = 0.30
 BACKUP_TIMEOUT_S = 8.0
+# Heweidao can slide in the fingers during the first delivery turn while it is
+# still settling after grasp.  Limit only that product and loaded interval;
+# every other product and all later delivery/return turns retain the normal
+# navigator limits.
+POST_GRAB_SLOW_TURN_WATCHDOG_GRACE_S = 10.0
+HEWEIDAO_LOADED_TURN_MAX_RPS = 0.35
 TRANSIT_SLIDE_TARGET_M = 0.006
 TRANSIT_SLIDE_TOLERANCE_M = 0.010
 TRANSIT_SLIDE_TIMEOUT_S = 8.0
@@ -338,6 +345,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
         # ── our flow state ──
         self.flow_phase = "grab"
+        self._post_grab_slow_turn_until = 0.0
+        self._post_grab_slow_turn_logged = False
         self._nav_goal = None
         self._nav_last_log = 0.0
         self._last_nav_reason = None
@@ -434,6 +443,40 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         super().set_state(new_state)
         if previous != self.state and started is not None:
             self._pick_state_started_at = now
+
+    def _heweidao_loaded_turn_limit_active(self) -> bool:
+        """Whether heweidao is still being carried towards delivery."""
+        return (
+            getattr(self, "target_kind", None) == "heweidao"
+            and getattr(self, "flow_phase", None) in {
+                "backup", "restore_height", "nav_to_delivery"
+            })
+
+    def _post_grab_slow_turn_active(self) -> bool:
+        """Whether the initial slow-turn watchdog grace is still active."""
+        until = float(getattr(self, "_post_grab_slow_turn_until", 0.0))
+        return (
+            until > 0.0
+            and self._heweidao_loaded_turn_limit_active()
+            and self.now() < until)
+
+    def set_twist(self, linear: float, angular: float) -> None:
+        """Apply normal limits plus the heweidao loaded-delivery turn cap."""
+        requested_angular = float(angular)
+        if self._heweidao_loaded_turn_limit_active():
+            angular = float(np.clip(
+                requested_angular,
+                -HEWEIDAO_LOADED_TURN_MAX_RPS,
+                HEWEIDAO_LOADED_TURN_MAX_RPS))
+            if (abs(angular - requested_angular) > 1e-9
+                    and not getattr(
+                        self, "_post_grab_slow_turn_logged", False)):
+                self._post_grab_slow_turn_logged = True
+                self.get_logger().info(
+                    "[loaded-turn] limiting heweidao delivery turn "
+                    f"w={requested_angular:.2f}->{angular:.2f}rad/s "
+                    "until delivery arrival")
+        super().set_twist(linear, angular)
 
     def _set_flow_phase(self, new_phase: str) -> None:
         """Change the outer phase and account for elapsed wall-clock time."""
@@ -547,8 +590,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         if self.memory_file is None:
             return None
         document = read_memory_document(self.memory_file)
-        candidates = primary_candidates_from_document(
-            document, self.target_kind)
+        candidates = grasp_eligible_candidates(
+            self.target_kind,
+            primary_candidates_from_document(document, self.target_kind))
         return select_memory_hint(
             candidates, self.base_xy,
             self.memory_confidence_threshold,
@@ -561,6 +605,22 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
     def _apply_memory_hint(self, hint: dict, reason: str) -> None:
         hint_x = float(hint["x"])
         hint_z = float(hint["z"])
+        column = str(hint.get("column", ""))
+        if (self.close_recheck
+                and column in {"1", "2", "3"}
+                and self.configure_direct_slot_target(
+                    str(hint["shelf"]), str(hint["level"]), column,
+                    product_y=hint.get("world_y"),
+                    product_z=hint.get("world_z"))):
+            self.scan_preferred_x = hint_x
+            self.memory_active_hint = (
+                str(hint["shelf"]), str(hint["level"]))
+            self.memory_last_scan_station_x = hint_x
+            self.get_logger().info(
+                f"[memory] {reason} -> direct slot "
+                f"{hint['shelf']}-{hint['level']}-{column} "
+                f"x={hint_x:.3f} conf={float(hint['confidence']):.3f}")
+            return
         self.configure_inventory_scan_hint(hint_x, hint_z)
         self.memory_active_hint = (
             str(hint["shelf"]), str(hint["level"]))
@@ -1028,6 +1088,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         # The parent reaches DONE only after horizontal withdrawal is complete.
         # Increase holding preload now, then restore during straight backup;
         # rotation waits for verified height feedback.
+        grabbed_at = self.now()
+        self._post_grab_slow_turn_until = (
+            grabbed_at + POST_GRAB_SLOW_TURN_WATCHDOG_GRACE_S
+            if self.target_kind == "heweidao" else 0.0)
+        self._post_grab_slow_turn_logged = False
         if not self._memory_consumed:
             slot = self.target_slot()
             if slot is not None:
@@ -1123,6 +1188,20 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             DELIVERY_APPROACH[1],
             DELIVERY_APPROACH[2],
         )
+
+    def _delivery_watchdog_goal(self) -> tuple[float, float, float]:
+        """Return the goal of the delivery leg that is actually active.
+
+        Continuous-order clients add a flow-level watchdog around this
+        multi-leg route.  Resetting the navigator to the final drop goal while
+        an entry/trunk leg is active desynchronizes the route state machine and
+        makes it execute already-passed legs at the table.
+        """
+        route_goal = getattr(self, "_route_leg_goal", None)
+        if (getattr(self, "delivery_nav_stage", None) != "slot_refine"
+                and route_goal is not None):
+            return tuple(float(value) for value in route_goal)
+        return self._delivery_slot_goal()
 
     def _backup_tick(self) -> None:
         """Reverse along the grasp heading while holding the current yaw."""
@@ -2396,12 +2475,31 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             -PLACE_CLEAR_TABLE_SPEED_MPS,
             float(np.clip(2.0 * yaw_error, -0.25, 0.25)))
 
+    def _place_base_motion_active(self) -> bool:
+        """Return whether the active placement stage intentionally moves the base.
+
+        The refined table-placement flow performs its final creep in stage 0.
+        Derived controllers that use different stage meanings must override
+        this hook; otherwise the fixed-base safety gate below can silently
+        cancel their intended motion.
+        """
+        return self.place_stage == 0 and not self.place_creep_done
+
     def smooth_commands(self) -> None:
         """Limit loaded placement arm motion and the final slide descent."""
         previous_slide = self.cmd_slide
         previous_left_arm = self.cmd_left_arm.copy()
         previous_right_arm = self.cmd_right_arm.copy()
         super().smooth_commands()
+
+        # Enforce the one-shot cap on the published command too.  This keeps a
+        # previously accumulated angular command from coasting above the new
+        # desired limit during the first loaded turn.
+        if self._heweidao_loaded_turn_limit_active():
+            self.cmd_angular = float(np.clip(
+                self.cmd_angular,
+                -HEWEIDAO_LOADED_TURN_MAX_RPS,
+                HEWEIDAO_LOADED_TURN_MAX_RPS))
 
         loaded_place_extension = (
             self.flow_phase == "place"
@@ -2460,8 +2558,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         # Once the final creep has stopped, arm positioning, refinement,
         # descent and release all run against one fixed world-frame base.
         if (self.flow_phase == "place"
-                and (self.place_stage in {1, 2, 3, 4}
-                     or (self.place_stage == 0 and self.place_creep_done))):
+                and not self._place_base_motion_active()):
             self.cmd_linear = 0.0
             self.cmd_angular = 0.0
 
@@ -2885,6 +2982,9 @@ def main() -> int:
             "phase": phase,
             "state": state,
             "error": error,
+            "no_middle_tissue": bool(
+                controller is not None
+                and getattr(controller, "no_middle_tissue", False)),
             "elapsed_s": round(time.monotonic() - started_at, 3),
             "formal_mode": bool(args.formal_mode),
             "place_slot": args.place_slot,

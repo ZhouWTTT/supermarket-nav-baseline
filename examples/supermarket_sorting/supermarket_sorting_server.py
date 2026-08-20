@@ -389,6 +389,11 @@ def build_config():
     cfg.init_state["base_orientation"] = Rotation.from_euler("z", np.pi / 2.0).as_quat()[[3, 0, 1, 2]].tolist()
 
     cfg.task_run_prefix = run_prefix
+    diagnostic_source = os.getenv(
+        "SUPERMARKET_DIAGNOSTIC_TRACK_SOURCE", "").strip()
+    cfg.diagnostic_track_body = (
+        body_name_overrides.get(diagnostic_source)
+        if diagnostic_source else None)
     cfg.task_targets = [
         {"id": body_name_overrides[source_body], "kind": source_kind_by_body[source_body]}
         for source_body in selected_source_bodies
@@ -419,6 +424,8 @@ class TaskMMK2ROS2(MMK2ROS2):
         )
         self.task_publisher.publish(String(data=self.task_message))
         print(f"[server] task published: {self.task_message}")
+        self.diagnostic_track_body = config.diagnostic_track_body
+        self.diagnostic_track_last_time = -1.0
 
 
 def spin_node(node):
@@ -448,6 +455,52 @@ def main():
     try:
         while rclpy.ok() and exec_node.running:
             exec_node.step(exec_node.target_control)
+            if (exec_node.diagnostic_track_body
+                    and exec_node.mj_data.time
+                    >= exec_node.diagnostic_track_last_time + 0.25):
+                body = exec_node.mj_data.body(
+                    exec_node.diagnostic_track_body)
+                print(
+                    "[body-track] "
+                    f"t={exec_node.mj_data.time:.2f} "
+                    f"name={exec_node.diagnostic_track_body} "
+                    f"xyz={np.round(body.xpos, 4)} "
+                    f"quat={np.round(body.xquat, 4)}",
+                    flush=True)
+                target_body_id = exec_node.mj_model.body(
+                    exec_node.diagnostic_track_body).id
+                contact_pairs = set()
+                for contact in exec_node.mj_data.contact:
+                    geom1 = exec_node.mj_model.geom(contact.geom1)
+                    geom2 = exec_node.mj_model.geom(contact.geom2)
+                    body1 = exec_node.mj_model.body(geom1.bodyid).name
+                    body2 = exec_node.mj_model.body(geom2.bodyid).name
+                    target_contact = (
+                        geom1.bodyid == target_body_id
+                        or geom2.bodyid == target_body_id)
+                    robot_scene_contact = (
+                        (body1.startswith("rgt_")
+                         and (body2.startswith("lft_")
+                              or body2.startswith("shelf_")))
+                        or (body2.startswith("rgt_")
+                            and (body1.startswith("lft_")
+                                 or body1.startswith("shelf_"))))
+                    if target_contact or robot_scene_contact:
+                        label1 = f"{body1}:{geom1.name or contact.geom1}"
+                        label2 = f"{body2}:{geom2.name or contact.geom2}"
+                        contact_pairs.add(
+                            f"{label1}<->{label2} "
+                            f"pos={np.round(contact.pos, 4)} "
+                            f"dist={contact.dist:.5f} "
+                            f"centres={np.round(exec_node.mj_data.geom_xpos[contact.geom1], 4)}/"
+                            f"{np.round(exec_node.mj_data.geom_xpos[contact.geom2], 4)}")
+                if contact_pairs:
+                    print(
+                        "[contact-track] "
+                        f"t={exec_node.mj_data.time:.2f} "
+                        f"pairs={sorted(contact_pairs)}",
+                        flush=True)
+                exec_node.diagnostic_track_last_time = exec_node.mj_data.time
     except KeyboardInterrupt:
         pass
     finally:

@@ -26,8 +26,8 @@
   但当前正式链路仍通过 `KeleDetectNode` 导入它；若正式依赖出现问题，需要先向
   用户说明这个事实，不要悄悄删除。
 - 不允许一次抓取多件商品。正式流程必须保持“一次 worker / 一次行程 / 一件商品”。
-- `continuous_goods_client.py` 和 GUI 连续扔货 Demo 不是正式比赛放桌流程，不要与
-  `competition_runner.py -> integrated_nav_pick_place.py` 混用。
+- GUI 多单调试只保留 `gui_snapshot_pick.py -> snapshot_pick_client.py`；正式比赛
+  入口仍是 `scripts/run_baseline.sh -> competition_runner.py`，不要混用两种入口。
 - 用户之前明确要求不进行测试。默认只做代码审查、日志分析、AST/语法和
   `git diff --check` 等静态检查；需要启动仿真或正式流程时，等用户明确要求。
 - 优化速度时必须同时考虑鲁棒性，不能仅提高上限而绕开激光急停、轨迹预测、

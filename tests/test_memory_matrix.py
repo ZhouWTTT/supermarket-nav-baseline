@@ -124,6 +124,22 @@ class MemoryMatrixTests(unittest.TestCase):
         self.assertEqual(candidate["observations"], 4)
         self.assertEqual(candidate["sample_count"], 16)
 
+    def test_closer_observation_overrides_older_higher_confidence(self):
+        matrix = MemoryMatrix()
+        matrix.record_at(
+            "B", "L2", "2", -1, "kele", 0.98,
+            observation_distance=0.80, sample_count=4,
+            world_x=-0.83, world_y=3.16, world_z=0.90)
+        matrix.record_at(
+            "B", "L2", "2", -1, "kele", 0.72,
+            observation_distance=0.60, sample_count=4,
+            world_x=-0.85, world_y=3.22, world_z=0.92)
+
+        candidate = matrix.candidates_for("kele")[0]
+        self.assertEqual(candidate["confidence"], 0.72)
+        self.assertEqual(candidate["observation_distance"], 0.60)
+        self.assertEqual(candidate["world_y"], 3.22)
+
     def test_navigation_uses_gui_primary_not_hidden_candidate(self):
         matrix = MemoryMatrix()
         # 历史上这格曾被识别为苹果，后来更近的脉动成为 GUI 主证据。
@@ -140,6 +156,17 @@ class MemoryMatrixTests(unittest.TestCase):
         self.assertEqual(
             matrix.primary_candidates_for("maidong")[0]["slot_key"],
             "L3|A|2")
+
+    def test_primary_candidate_keeps_observed_world_coordinates(self):
+        matrix = MemoryMatrix()
+        self.assertTrue(matrix.record_at(
+            "C", "L2", "3", -1, "kele", 0.96,
+            observation_distance=0.42, sample_count=6,
+            world_x=0.255, world_y=3.218, world_z=0.921))
+
+        cell = matrix.cells["L2|C|3"]
+        self.assertEqual(cell["world_y"], 3.218)
+        self.assertEqual(cell["world_z"], 0.921)
 
     def test_consuming_item_invalidates_same_level_duplicates(self):
         matrix = MemoryMatrix()

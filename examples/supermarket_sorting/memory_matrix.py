@@ -244,9 +244,15 @@ def select_memory_hint(
             "z": z,
             "shelf": shelf,
             "level": level,
+            "column": str(candidate.get("column", "")),
             "slot_key": str(candidate.get("slot_key", "")),
             "confidence": confidence,
             "observed_distance": observed_distance,
+            "world_x": candidate.get("world_x"),
+            "world_y": candidate.get("world_y"),
+            "world_z": candidate.get("world_z"),
+            "sample_count": candidate.get("sample_count"),
+            "last_seen": candidate.get("last_seen"),
             "travel": travel,
             "close_relaxed": False,
             "reliable": False,
@@ -297,6 +303,23 @@ def primary_candidates_from_document(
     return result
 
 
+def grasp_eligible_candidates(
+        kind: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Filter memory evidence by constraints that apply before ranking.
+
+    The dual-arm tissue grasp is only valid in a shelf's middle column.  Side
+    column tissue detections must therefore be removed before nearest-candidate
+    selection; rejecting them afterwards can discard the chosen B candidate
+    and accidentally hide a valid C middle-column candidate.
+    """
+    if str(kind) != "zhijin":
+        return list(candidates)
+    return [
+        candidate for candidate in candidates
+        if str(candidate.get("column", "")) == "2"
+    ]
+
+
 def read_memory_document(path: Path | str) -> dict[str, Any]:
     """Return a complete matrix document, or an empty one during atomic writes."""
     try:
@@ -339,6 +362,9 @@ class MemoryMatrix:
             observer_xy: tuple[float, float] | None = None,
             observed_at: float | None = None,
             sample_count: int = 1,
+            world_x: float | None = None,
+            world_y: float | None = None,
+            world_z: float | None = None,
     ) -> bool:
         """按显式槽位记录一批已完成多帧确认的观测。
 
@@ -387,6 +413,9 @@ class MemoryMatrix:
                     "shelf": shelf,
                     "level": level,
                     "column": column,
+                    "world_x": world_x,
+                    "world_y": world_y,
+                    "world_z": world_z,
                     "confidence": round(confidence, 3),
                     "closest_distance": (
                         None if distance is None else round(distance, 3)),
@@ -433,16 +462,30 @@ class MemoryMatrix:
                         old_rep_distance is not None
                         and old_rep_distance
                         <= new_closest + OBSERVATION_DISTANCE_BAND_M)
+                    # 只要新观测明显更近，就以它为准：近距观测的类别/位置
+                    # 比远距高置信度更可信，防止旧远距记录长期压住新近距证据。
+                    new_is_closer = (
+                        old_rep_distance is not None
+                        and distance
+                        < old_rep_distance - 0.01)
                     new_is_near = (
                         distance
                         <= new_closest + OBSERVATION_DISTANCE_BAND_M)
                     if (not old_still_near
+                            or new_is_closer
                             or (new_is_near and confidence > old_confidence)):
                         candidate["confidence"] = round(confidence, 3)
                         candidate["observation_distance"] = round(
                             distance, 3)
                         representative_updated = True
 
+            if representative_updated:
+                if world_x is not None:
+                    candidate["world_x"] = float(world_x)
+                if world_y is not None:
+                    candidate["world_y"] = float(world_y)
+                if world_z is not None:
+                    candidate["world_z"] = float(world_z)
             if representative_updated and observer_xy is not None:
                 try:
                     observer_x, observer_y = (
@@ -485,7 +528,7 @@ class MemoryMatrix:
         consumed = bool(self.cells.get(key, {}).get("consumed", False))
         self.cells[key] = {
             name: value for name, value in primary.items()
-            if name not in ("observations", "sample_count", "last_seen")
+            if name != "observations"
         }
         self.cells[key]["consumed"] = consumed
 
@@ -806,7 +849,10 @@ class MemoryMatrixTracker(Node):
                 -1, kind, acc["conf"],
                 observation_distance=distance_med,
                 observer_xy=self.base_xy,
-                sample_count=sample_count):
+                sample_count=sample_count,
+                world_x=x_med,
+                world_y=y_med,
+                world_z=z_med):
             primary = self.matrix.cells.get(
                 f"{level}|{shelf_name}|{column}", {})
             distance_text = (

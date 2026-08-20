@@ -1330,7 +1330,8 @@ class NavigationController:
 
         signed_distance = -self._reverse_recovery_distance_m
         if not self._straight_translation_is_free(
-                bx, by, byaw, signed_distance):
+                bx, by, byaw, signed_distance,
+                allow_dynamic_inflation=True):
             return False
 
         self._reverse_recovery_phase = "backup"
@@ -1462,7 +1463,8 @@ class NavigationController:
             self.stop_reason = "reverse_recovery_rear_stop"
             return 0.0, 0.0, False
         if not self._straight_translation_is_free(
-                bx, by, byaw, -remaining):
+                bx, by, byaw, -remaining,
+                allow_dynamic_inflation=True):
             self._finish_reverse_recovery(bx, by, byaw, now)
             self.stop_reason = "reverse_recovery_path_blocked"
             return 0.0, 0.0, False
@@ -1473,7 +1475,8 @@ class NavigationController:
             min(self._reverse_recovery_max_ang,
                 self._reverse_recovery_yaw_gain * yaw_error))
         if not self._motion_is_free(
-                bx, by, byaw, -self._reverse_recovery_speed, angular):
+                bx, by, byaw, -self._reverse_recovery_speed, angular,
+                allow_dynamic_inflation=True):
             self._finish_reverse_recovery(bx, by, byaw, now)
             self.stop_reason = "reverse_recovery_arc_blocked"
             return 0.0, 0.0, False
@@ -1614,7 +1617,8 @@ class NavigationController:
             <= self._stop_dist)
 
     def _straight_translation_is_free(
-            self, bx, by, byaw, signed_distance):
+            self, bx, by, byaw, signed_distance,
+            allow_dynamic_inflation=False):
         """Check a complete straight candidate, including inflation escape."""
         distance = abs(float(signed_distance))
         if distance <= 1e-6:
@@ -1640,6 +1644,7 @@ class NavigationController:
                 return False
             clearance = self.cm.raw_dynamic_clearance_world(x, y)
             if (escaping_dynamic_inflation
+                    and not allow_dynamic_inflation
                     and math.isfinite(previous_clearance)
                     and math.isfinite(clearance)
                     and clearance + 1e-4 < previous_clearance):
@@ -1649,7 +1654,13 @@ class NavigationController:
                 # geometry changes must not veto an otherwise safe backup.
                 return False
             if not self.cm.is_free_world(x, y):
-                if (not escaping_dynamic_inflation
+                in_dynamic_halo = (
+                    allow_dynamic_inflation
+                    and self.cm.is_static_free_world(x, y)
+                    and math.isfinite(clearance)
+                    and clearance > 0.5 * self.cm.resolution)
+                if not in_dynamic_halo and (
+                        not escaping_dynamic_inflation
                         or not math.isfinite(clearance)
                         or clearance <= 0.5 * self.cm.resolution
                         or clearance + 1e-4 < previous_clearance):
@@ -1660,12 +1671,14 @@ class NavigationController:
                     <= WHOLE_BODY_KEEP_OUT_RADIUS):
                 return False
         if (escaping_dynamic_inflation
+                and not allow_dynamic_inflation
                 and previous_clearance < start_clearance + 0.001):
             return False
         return True
 
     def _motion_is_free(self, bx, by, byaw, linear, angular,
-                        horizon=0.45, sample_dt=0.05):
+                        horizon=0.45, sample_dt=0.05,
+                        allow_dynamic_inflation=False):
         """Check the near-future arc, allowing safe inflation-layer escape.
 
         If the current pose lies only in a dynamic obstacle's inflated halo,
@@ -1700,7 +1713,13 @@ class NavigationController:
                 return False
             clearance = self.cm.raw_dynamic_clearance_world(x, y)
             if not self.cm.is_free_world(x, y):
-                if (not escaping_dynamic_inflation
+                in_dynamic_halo = (
+                    allow_dynamic_inflation
+                    and self.cm.is_static_free_world(x, y)
+                    and math.isfinite(clearance)
+                    and clearance > 0.5 * self.cm.resolution)
+                if not in_dynamic_halo and (
+                        not escaping_dynamic_inflation
                         or not math.isfinite(clearance)
                         or clearance <= 0.5 * self.cm.resolution
                         or clearance + 1e-4 < previous_clearance):
@@ -1714,7 +1733,7 @@ class NavigationController:
                     x, y, DELIVERY_TABLE_COSTMAP_BOUNDS)
                     <= WHOLE_BODY_KEEP_OUT_RADIUS):
                 return False
-        if escaping_dynamic_inflation:
+        if escaping_dynamic_inflation and not allow_dynamic_inflation:
             required_progress = min(
                 0.005,
                 max(0.001, 0.10 * abs(linear) * adaptive_horizon))
