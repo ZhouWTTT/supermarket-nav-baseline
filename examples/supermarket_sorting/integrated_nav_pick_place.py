@@ -48,6 +48,7 @@ from memory_matrix import (  # noqa: E402
     MEMORY_REROUTE_SAVING_M,
     STATION_Y_MAX,
     STATION_Y_MIN,
+    grasp_eligible_candidates,
     primary_candidates_from_document,
     read_memory_document,
     select_memory_hint,
@@ -645,8 +646,12 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         if self.memory_file is None:
             return None
         document = read_memory_document(self.memory_file)
-        candidates = primary_candidates_from_document(
-            document, self.target_kind)
+        # zhijin 双夹只在货架中列有效：在排序前先过滤非中列候选，
+        # 避免 reject 掉选中候选后意外隐藏有效的中列候选。
+        candidates = grasp_eligible_candidates(
+            self.target_kind,
+            primary_candidates_from_document(
+                document, self.target_kind))
         return select_memory_hint(
             candidates, self.base_xy,
             self.memory_confidence_threshold,
