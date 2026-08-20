@@ -616,6 +616,12 @@ class CompetitionRunner(Node):
             error = (
                 "worker reported a delivered kind that is not an eligible "
                 f"pending order: {result.get('kind')!r}")
+        no_middle_tissue = bool(
+            order is not None
+            and order.kind == "zhijin"
+            and result.get("no_middle_tissue"))
+        finish_max_attempts = (
+            1 if no_middle_tissue else self.args.max_attempts)
 
         if self.task is not None and order is not None:
             if dispatch_order is not None and order.id != dispatch_order.id:
@@ -628,7 +634,7 @@ class CompetitionRunner(Node):
                 delivered=delivered,
                 marker_id=marker_id,
                 error=None if delivered else str(error),
-                max_attempts=self.args.max_attempts,
+                max_attempts=finish_max_attempts,
             )
             if (not delivered
                     and isinstance(drop_event, dict)
