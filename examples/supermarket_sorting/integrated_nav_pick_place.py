@@ -207,9 +207,9 @@ ROUTE_LEG_PROGRESS_M = 0.10
 ROUTE_LEG_STALL_TIMEOUT_S = 35.0
 # A leg stuck behind a dynamic box now fails via the widened stall check
 # below (any persistent stop reason).  This hard timeout is only the final
-# ceiling for slow-but-progressing legs; 60 s at the observed slowest real
-# sim rate (~0.12 m/s) still covers every route leg in this arena.
-ROUTE_LEG_HARD_TIMEOUT_S = 60.0
+# ceiling for slow-but-progressing legs; 150 s at the observed slowest real
+# sim rate still covers every route leg in this arena.
+ROUTE_LEG_HARD_TIMEOUT_S = 150.0
 
 # Keep the held product clear of the shelf before delivery navigation starts
 # turning the base.  The arms and product still protrude toward the shelf at
@@ -1477,7 +1477,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             return True
 
         reference = self._drop_candidate_reference_world
-        over_table = self._tcp_over_delivery_table(reference)
+        # 交付判定用官方裁判框（无边距）：产品掉落时手腕只要在物理桌面上方
+        # 即按“桌面上方掉落=交付”，与正式计分口径一致，避免桌缘内 4 cm 内
+        # 的真实桌内落点被误判为桌外而白白重试。
+        over_table = self._tcp_over_delivery_table_official(reference)
         self._start_transport_drop_recovery(
             now, over_table=over_table, details=details,
             reference=reference)
@@ -1986,6 +1989,29 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             np.all(np.isfinite(tcp))
             and x_min + margin <= float(tcp[0]) <= x_max - margin
             and y_min + margin <= float(tcp[1]) <= y_max - margin)
+
+    @staticmethod
+    def _tcp_over_delivery_table_official(tcp: np.ndarray | None) -> bool:
+        """Whether the reference point lies above the tabletop per the
+        official referee ``delivery_box`` (referee.py), which has NO inset
+        margin: x ∈ [-2.42, -1.46], y ∈ [-3.63, -3.19].
+
+        Z is intentionally left unconstrained: the drop reference height is
+        the wrist pose at the moment of loss, not the settled goods height,
+        so mirroring the referee's z range would reintroduce false
+        "outside table" classifications for drops from the transport height.
+        The drop-monitor uses this box so a product lost with the wrist over
+        the physical tabletop counts as delivered, matching the official
+        scoring zone; the placement-flow verifications keep the conservative
+        ``PLACE_RELEASE_TABLE_MARGIN_M`` inset.
+        """
+        if tcp is None or np.asarray(tcp).shape != (3,):
+            return False
+        x_min, y_min, x_max, y_max = DELIVERY_TABLE_XML_BOUNDS
+        return (
+            np.all(np.isfinite(tcp))
+            and x_min <= float(tcp[0]) <= x_max
+            and y_min <= float(tcp[1]) <= y_max)
 
     def _tcp_at_assigned_slot(self, tcp: np.ndarray | None) -> bool:
         """Require the measured release XY to remain near its own slot."""
