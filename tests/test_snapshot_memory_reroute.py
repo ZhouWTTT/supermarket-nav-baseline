@@ -26,6 +26,74 @@ except ImportError as exc:  # Host without ROS/discoverse; Client runs it.
 
 @unittest.skipIf(client is None, f"runtime dependencies unavailable: {IMPORT_ERROR}")
 class MemoryRerouteTests(unittest.TestCase):
+    def test_pending_orders_are_selected_by_nearest_memory_travel(self):
+        orders = ["kele", "maidong", "shupian"]
+        hints = {
+            "kele": {"travel": 4.2},
+            "maidong": {"travel": 1.1},
+            "shupian": {"travel": 2.7},
+        }
+
+        selected = client._select_nearest_pending_order(
+            [0, 1, 2], orders, hints.get)
+
+        self.assertEqual(selected, 1)
+
+    def test_pending_order_selection_falls_back_to_source_order(self):
+        orders = ["kele", "maidong", "shupian"]
+
+        selected = client._select_nearest_pending_order(
+            [2, 0, 1], orders, lambda _kind: None)
+
+        self.assertEqual(selected, 0)
+
+    def test_delivery_table_defines_five_distinct_slots(self):
+        slots = client.integrated.DELIVERY_PLACE_SLOTS_XY
+
+        self.assertEqual(len(slots), 5)
+        self.assertEqual(len(set(slots)), 5)
+
+    def test_record_initial_shelf_transit_uses_only_temporary_speed_cap(self):
+        recorder = client.FormalWalkRecorder.__new__(
+            client.FormalWalkRecorder)
+        recorder._initial_shelf_transit = True
+        recorder._normal_nav_max_lin = 0.90
+        recorder.nav = mock.Mock()
+        recorder.nav.controller.max_lin = 0.90
+
+        with mock.patch.object(
+                client.IntegratedNavPickPlace, "drive_to",
+                return_value=False):
+            self.assertFalse(recorder.drive_to([1.80, 2.475], 1.57))
+
+        self.assertAlmostEqual(
+            recorder.nav.controller.max_lin,
+            client.RECORD_INITIAL_TRANSIT_MAX_LIN_MPS)
+        self.assertTrue(recorder._initial_shelf_transit)
+
+    def test_record_speed_cap_restores_at_first_shelf(self):
+        recorder = client.FormalWalkRecorder.__new__(
+            client.FormalWalkRecorder)
+        recorder._initial_shelf_transit = True
+        recorder._normal_nav_max_lin = 0.90
+        recorder.nav = mock.Mock()
+        recorder.nav.controller.max_lin = 0.90
+        recorder.get_logger = mock.Mock(return_value=mock.Mock())
+
+        with mock.patch.object(
+                client.IntegratedNavPickPlace, "drive_to",
+                return_value=True):
+            self.assertTrue(recorder.drive_to([1.80, 2.475], 1.57))
+
+        self.assertAlmostEqual(recorder.nav.controller.max_lin, 0.90)
+        self.assertFalse(recorder._initial_shelf_transit)
+
+        with mock.patch.object(
+                client.IntegratedNavPickPlace, "drive_to",
+                return_value=False):
+            recorder.drive_to([0.90, 2.475], 1.57)
+        self.assertAlmostEqual(recorder.nav.controller.max_lin, 0.90)
+
     def test_old_candidate_cannot_trigger_dynamic_reroute(self):
         candidate = {
             "slot_key": "L3|A|1", "shelf": "A", "last_seen": 99.0}

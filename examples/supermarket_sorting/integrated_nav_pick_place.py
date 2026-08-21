@@ -463,7 +463,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
     def set_twist(self, linear: float, angular: float) -> None:
         """Apply normal limits plus the heweidao loaded-delivery turn cap."""
         requested_angular = float(angular)
-        if self._heweidao_loaded_turn_limit_active():
+        if self._post_grab_slow_turn_active():
             angular = float(np.clip(
                 requested_angular,
                 -HEWEIDAO_LOADED_TURN_MAX_RPS,
@@ -2495,7 +2495,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         # Enforce the one-shot cap on the published command too.  This keeps a
         # previously accumulated angular command from coasting above the new
         # desired limit during the first loaded turn.
-        if self._heweidao_loaded_turn_limit_active():
+        if self._post_grab_slow_turn_active():
             self.cmd_angular = float(np.clip(
                 self.cmd_angular,
                 -HEWEIDAO_LOADED_TURN_MAX_RPS,

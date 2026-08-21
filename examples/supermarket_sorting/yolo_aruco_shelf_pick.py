@@ -228,8 +228,8 @@ SCAN_CAMERA_REACHED_HEAD_RAD = 0.030
 # frame rate.  Previously the 2.5 s dwell per pose added ~75 s of pure wait
 # per full shelf sweep.
 SCAN_CAMERA_STABLE_S = 0.10
-SCAN_SETTLE_S = 0.15
-SCAN_DWELL_S = 0.6
+SCAN_SETTLE_S = 0.10
+SCAN_DWELL_S = 0.45
 # During a formal multi-order run, the first *graspable* pending class at a scan
 # pose is usually much cheaper to finish than crossing several shelf stations
 # for the class chosen before perception started.  Do not commit on YOLO alone:
@@ -432,16 +432,16 @@ MIDDLE_SPHERE_DEPLOY_TIMEOUT_S = 7.0
 # remains stationary during this motion.  Only the pregrasp and contact IK
 # endpoints are generated; the controller streams continuously between them.
 FRONT_GRASP_OVERSHOOT_M = 0.03
-ARM_COMMAND_MAX_STEP_RAD = 0.022
+ARM_COMMAND_MAX_STEP_RAD = 0.026
 # 收回阶段（STATE_RETREAT）使用更小的关节步长：抓取后带着货物往回撤时
 # 速度放慢约一半，避免快速收臂让货物晃动/刮擦货架。
-RETREAT_ARM_MAX_STEP_RAD = 0.010
+RETREAT_ARM_MAX_STEP_RAD = 0.013
 # Every product profile uses the same measured Cartesian terminal slowdown.
 # This is a command-rate limit, not a per-class position correction: outside
 # the final 50 mm the arm keeps its current speed, then smoothly ramps down to
 # the smaller joint step as the TCP approaches the contact target.
 FORWARD_TERMINAL_ZONE_M = 0.050
-FORWARD_TERMINAL_ARM_STEP_RAD = 0.006
+FORWARD_TERMINAL_ARM_STEP_RAD = 0.0075
 ARM_REACHED_TOLERANCE_RAD = 0.025
 ARM_READY_SETTLE_S = 0.08
 DEPLOY_TIMEOUT_S = 5.0
@@ -453,8 +453,8 @@ LIFT_AMOUNT_M = 0.06
 # joint interpolation without measured-TCP correction, convergence gates, or
 # replanning.  Keeping the peak Cartesian-equivalent speed low prevents light
 # goods from being struck while eliminating feedback-induced shaking.
-GENERIC_DIRECT_FORWARD_SPEED_MPS = 0.036
-GENERIC_DIRECT_FORWARD_MIN_DURATION_S = 2.5
+GENERIC_DIRECT_FORWARD_SPEED_MPS = 0.043
+GENERIC_DIRECT_FORWARD_MIN_DURATION_S = 2.1
 GENERIC_DIRECT_FORWARD_SETTLE_S = 0.5
 GENERIC_DIRECT_FORWARD_MIN_SETTLE_S = 0.20
 # A single feedback sample can cross the endpoint tolerance while the arm is
@@ -463,7 +463,10 @@ GENERIC_DIRECT_FORWARD_MIN_SETTLE_S = 0.20
 MOTION_ENDPOINT_STABILITY_S = 0.12
 # The fixed deploy dwell is a safety ceiling; with the convergence gate the
 # arm normally starts forward as soon as the pregrasp is reached.
-GENERIC_DIRECT_DEPLOY_DWELL_S = 2.0
+# Keep a short minimum dwell before accepting arm feedback, but avoid holding
+# every ordinary grasp for a full two seconds after the joints are already
+# within the existing soft tolerance.
+GENERIC_DIRECT_DEPLOY_DWELL_S = 1.5
 GENERIC_DEPLOY_SOFT_ARM_TOLERANCE_RAD = 0.12
 GENERIC_DEPLOY_HARD_TIMEOUT_S = 8.0
 # 部署期 pregrasp 未收敛时，向前微调基座、回到 ALIGN 重新解算并重试，

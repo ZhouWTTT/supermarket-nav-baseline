@@ -706,15 +706,18 @@ class NavigationController:
         self.nav_goal_x = self.nav_goal_y = None
 
         # Velocity limits
-        self.max_lin = 0.90
+        # Conservative fast profile: raise open-space cruise and acceleration
+        # while leaving obstacle scaling, emergency stops and arc prediction
+        # unchanged.
+        self.max_lin = 1.05
         # 导航行进最大角速度：2026-08-17 从 2.5 降至 2.0 rad/s，
         # 降低载货转弯时的甩动与商品滑落风险。
         self.max_ang = 2.0
         # Keep useful speed through the last open-space approach.  Obstacle
         # clearance scaling and all hard-stop checks below still take
         # precedence, so this only raises the cap when the route is clear.
-        self.near_goal_max_lin = 0.35
-        self.max_lin_acc = 1.2
+        self.near_goal_max_lin = 0.42
+        self.max_lin_acc = 1.6
         self.max_ang_acc = 5.0
         self.dt = 0.02
         self._last_update_time = None

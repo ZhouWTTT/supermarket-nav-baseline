@@ -80,6 +80,13 @@ MEMORY_CLOSE_CONFIDENCE_MIN = 0.70
 # 行进中发现更近的可靠货架时，至少节省这些路程才改道；每单最多一次。
 MEMORY_REROUTE_SAVING_M = 0.30
 
+# The initial run from the spawn area to the first (E) shelf is a long,
+# unloaded transit through open space.  Raise only its linear cap; all shelf
+# to shelf, order, loaded-delivery and return legs keep the navigator default.
+# Obstacle slowdown, emergency stops, heading gating and arc prediction remain
+# inside the shared navigation controller and still take precedence.
+RECORD_INITIAL_TRANSIT_MAX_LIN_MPS = 1.20
+
 
 def _shelf_for_scan_x(world_x: float) -> str:
     """把扫描站 x 归一到货架字母。"""
@@ -267,6 +274,32 @@ class FormalWalkRecorder(integrated.IntegratedNavPickPlace):
         self.max_scan_cycles = max(1, int(passes))
         self.finished = False
         self._last_finished_station = None
+        self._initial_shelf_transit = True
+        self._normal_nav_max_lin = float(self.nav.controller.max_lin)
+
+    def drive_to(
+            self, target_xy, final_yaw: float,
+            position_tolerance: float = 0.055,
+            linear_min_mps: float | None = None) -> bool:
+        """Raise the cap only until the recorder reaches its first shelf."""
+        controller = self.nav.controller
+        if self._initial_shelf_transit:
+            controller.max_lin = max(
+                self._normal_nav_max_lin,
+                RECORD_INITIAL_TRANSIT_MAX_LIN_MPS)
+        else:
+            controller.max_lin = self._normal_nav_max_lin
+
+        arrived = super().drive_to(
+            target_xy, final_yaw, position_tolerance,
+            linear_min_mps=linear_min_mps)
+        if arrived and self._initial_shelf_transit:
+            self._initial_shelf_transit = False
+            controller.max_lin = self._normal_nav_max_lin
+            self.get_logger().info(
+                "[record] initial shelf transit complete; restoring "
+                f"navigation max_lin={self._normal_nav_max_lin:.2f}m/s")
+        return arrived
 
     def _nearest_scan_stations(self) -> list[int]:
         """按 E→D→C→B→A 固定顺序逐架走（与正式流程的站点顺序一致）。"""
@@ -355,6 +388,37 @@ def generate_orders(count: int, seed: int | None) -> list[str]:
     return rng.choices(ALL_GOODS_KINDS, k=count)
 
 
+def _select_nearest_pending_order(
+        pending_indices, orders, hint_for) -> int | None:
+    """Choose the pending order whose remembered shelf is nearest now.
+
+    Orders without a usable memory hint remain eligible, but rank after every
+    order with a finite route estimate.  Source order is the deterministic
+    fallback and also keeps duplicate goods stable.
+    """
+    hint_cache = {}
+    ranked = []
+    for source_index in pending_indices:
+        kind = orders[source_index]
+        if kind not in hint_cache:
+            hint_cache[kind] = hint_for(kind)
+        hint = hint_cache[kind]
+        try:
+            travel = float(hint["travel"]) if hint is not None else float("inf")
+        except (KeyError, TypeError, ValueError):
+            travel = float("inf")
+        usable_hint = hint is not None and math.isfinite(travel)
+        if not usable_hint:
+            travel = float("inf")
+        ranked.append(((not usable_hint, travel, source_index), source_index))
+    return min(ranked, key=lambda item: item[0])[1] if ranked else None
+
+
+def _prefer_west_scan_start(order_index: int) -> bool:
+    """Only order 2 deliberately pauses at A to refresh matrix evidence."""
+    return int(order_index) == 1
+
+
 # ---------------------------------------------------------------------------
 # 连续订单流程常量
 # ---------------------------------------------------------------------------
@@ -366,10 +430,10 @@ SHELF_RETURN_GOAL = (1.92, pick.SCAN_Y, pick.YAW_NORTH)
 # 后续订单（从 A 货架开始扫）返回西端起点，避免先回 E 再折返 A。
 SHELF_RETURN_GOAL_WEST = (pick.SCAN_X[-1], pick.SCAN_Y, pick.YAW_NORTH)
 
-DROP_RELEASE_DWELL_S = 1.5     # 张爪后停留时间，让货物完全脱手
+DROP_RELEASE_DWELL_S = 1.0     # 张爪后停留时间，让货物完全脱手
 DROP_RETREAT_DWELL_S = 1.0     # 手臂收回后的停留时间
 DROP_BACKUP_DIST_M = 0.18      # 卸货后倒车距离，离开刚扔下的货物
-DROP_BACKUP_SPEED_MPS = 0.25
+DROP_BACKUP_SPEED_MPS = 0.20
 DROP_BACKUP_TIMEOUT_S = 8.0
 # 终点抬升释放：把手臂抬高到上层货架抓取高度（slide 收到顶、TCP z≈1.2m），
 # 再伸长手臂、松爪释放（不做桌面放置）。
@@ -378,7 +442,7 @@ DROP_RAISE_EXTEND_M = 0.55      # 伸长距离（朝南越过配送区）
 DROP_RAISE_SLIDE = -0.04        # 抬升 slide（顶层抓取姿态，= SLIDE_MIN）
 # 抬臂/伸臂是"高位持货"姿态，误差可容忍：达到软门槛就提前进入下一步，
 # 不再干等收敛（KDL 与仿真的运动学偏差常让 0.06 rad 硬门槛永远过不了）。
-DROP_RAISE_SOFT_S = 3.0
+DROP_RAISE_SOFT_S = 2.5
 DROP_RAISE_SOFT_ARM_TOLERANCE_RAD = 0.10
 DROP_RAISE_SOFT_SLIDE_TOLERANCE_M = 0.05
 DROP_RAISE_TIMEOUT_S = 8.0      # 抬升到位硬超时兜底
@@ -387,7 +451,7 @@ DROP_RAISE_EXTEND_FINAL_M = 0.75
 DROP_RAISE_EXTEND_TIMEOUT_S = 6.0
 # 放货前朝桌子方向前进一小段（不怕撞桌；带超时防死锁）
 DROP_CREEP_DIST_M = 0.50
-DROP_CREEP_SPEED_MPS = 0.10
+DROP_CREEP_SPEED_MPS = 0.14
 DROP_CREEP_TIMEOUT_S = 6.0
 
 ABORT_SETTLE_S = 1.0           # 抓取中止后等待手臂收回稳定
@@ -435,10 +499,15 @@ class ContinuousOrderController(IntegratedNavPickPlace):
                  place_retreat_dwell_s: float = DROP_RETREAT_DWELL_S,
                  nav_during_scan: bool = True,
                  backup_after_grab_m: float = 0.15,
-                 close_recheck: bool = True):
+                 close_recheck: bool = True,
+                 place_slot: int = 0):
+        if not 0 <= int(place_slot) < len(integrated.DELIVERY_PLACE_SLOTS_XY):
+            raise ValueError(f"invalid delivery place slot: {place_slot}")
+        place_x, place_y = integrated.DELIVERY_PLACE_SLOTS_XY[int(place_slot)]
         super().__init__(
             target_kind, max_scan_cycles,
             tcp_diagnostic_ground_truth, scan_skip_lower,
+            place_x=place_x, place_y=place_y, place_slot=int(place_slot),
             place_release_dwell_s=place_release_dwell_s,
             place_retreat_dwell_s=place_retreat_dwell_s,
             nav_during_scan=nav_during_scan,
@@ -476,6 +545,7 @@ class ContinuousOrderController(IntegratedNavPickPlace):
         self._drop_extend_t0 = 0.0
         self._drop_creep_start_y = None
         self._drop_creep_t0 = 0.0
+        self._drop_creep_done = False
 
         # 导航防死锁看门狗状态
         self._watchdog_phase = None
@@ -494,7 +564,11 @@ class ContinuousOrderController(IntegratedNavPickPlace):
 
         self.get_logger().info(
             f"[continuous] order controller ready kind={target_kind} "
-            f"drop_goal={DROP_GOAL} return_goal={SHELF_RETURN_GOAL_WEST}")
+            f"place_slot={int(place_slot) + 1}/"
+            f"{len(integrated.DELIVERY_PLACE_SLOTS_XY)} "
+            f"place_xy=({place_x:.2f}, {place_y:.2f}) "
+            f"drop_goal={self._delivery_slot_goal()} "
+            f"return_goal={SHELF_RETURN_GOAL_WEST}")
 
     # ------------------------------------------------------------------
     # 抓取阶段（复用父级状态机，但屏蔽 abort 时的全局 shutdown）
@@ -585,8 +659,43 @@ class ContinuousOrderController(IntegratedNavPickPlace):
     # 伸长手臂 -> 松爪）
     # ------------------------------------------------------------------
     def _place_base_motion_active(self) -> bool:
-        """The continuous drop flow performs its table creep in stage 1."""
-        return self.place_stage == 1
+        """Allow the guarded table creep while the loaded arm is raised.
+
+        Stage 0 now overlaps the high-place arm/slide motion with the final
+        low-speed base approach.  Once the measured distance (or its timeout)
+        completes, the fixed-base gate is restored before final extension and
+        release.
+        """
+        return (self.place_stage in {0, 1}
+                and not getattr(self, "_drop_creep_done", False))
+
+    def _advance_drop_creep(self, now: float, log_tag: str) -> bool:
+        """Advance the shared, yaw-guarded final approach without staging.
+
+        Returning a boolean lets arm/slide readiness and base progress run in
+        parallel.  Whichever finishes first waits for the other, so the final
+        extension still starts only after both conditions are satisfied.
+        """
+        if getattr(self, "_drop_creep_done", False):
+            self.set_twist(0.0, 0.0)
+            return True
+        if self._drop_creep_start_y is None:
+            self._drop_creep_start_y = float(self.base_xy[1])
+            self._drop_creep_t0 = now
+        crept = float(self._drop_creep_start_y - self.base_xy[1])
+        if (crept >= DROP_CREEP_DIST_M
+                or now - self._drop_creep_t0 >= DROP_CREEP_TIMEOUT_S):
+            self._drop_creep_done = True
+            self.set_twist(0.0, 0.0)
+            self.get_logger().info(
+                f"[{log_tag}] advanced {crept:.3f}m towards the table")
+            return True
+
+        yaw_err = pick.wrap_to_pi(-math.pi / 2.0 - self.base_yaw)
+        angular = float(np.clip(2.0 * yaw_err, -0.3, 0.3))
+        linear = DROP_CREEP_SPEED_MPS if abs(yaw_err) <= 0.10 else 0.0
+        self.set_twist(linear, angular)
+        return False
 
     def _drop_tick(self) -> None:
         now = self.now()
@@ -595,7 +704,9 @@ class ContinuousOrderController(IntegratedNavPickPlace):
             return
 
         if self.place_stage == 0:
-            # 先把手臂抬高到上层货架抓取高度并伸长（前进时货物已在高位，不会碰桌）
+            # 抬高手臂的同时低速靠桌，避免在导航交接点原地等待 3--8 s。
+            # 只有朝向误差足够小才前进，而且必须“抬臂+靠桌”都完成
+            # 才能进入最终伸臂和松爪。
             if self.drop_raise_joints is None:
                 self.drop_raise_joints = self._solve_drop_raise()
                 if self.drop_raise_joints is not None:
@@ -612,12 +723,11 @@ class ContinuousOrderController(IntegratedNavPickPlace):
                     self.get_logger().warn(
                         "[drop-raise] IK failed; falling back to "
                         "extend/release")
-                    # 不跳过向桌子的最后一段前进：右臂 raise 失败时也要先
-                    # 走完 stage 1 的 0.5m creep，否则会在离桌一小段处直接
-                    # 释放（左臂 raise 成功会走完这段，右臂却放不到位）。
                     self.place_stage = 1
                     self.place_t0 = now
+                    self._advance_drop_creep(now, "drop-creep")
                     return
+            creep_done = self._advance_drop_creep(now, "drop-creep")
             raise_elapsed = now - self._drop_raise_t0
             measured_slide = self.joints.get("slide_joint")
             slide_error = (
@@ -632,31 +742,19 @@ class ContinuousOrderController(IntegratedNavPickPlace):
                     arm_tolerance=0.06, slide_tolerance=0.03)
                     or soft_ready
                     or raise_elapsed >= DROP_RAISE_TIMEOUT_S):
-                self.place_stage = 1
+                self.place_stage = 2 if creep_done else 1
                 self.place_t0 = now
                 self.get_logger().info(
-                    "[drop-raise] arm raised; creeping towards the table"
+                    "[drop-raise] arm raised; "
+                    + ("final approach already complete"
+                       if creep_done else "continuing table approach")
                     + (" (soft)" if soft_ready else ""))
             return
         if self.place_stage == 1:
-            # 手臂已抬高，再朝桌子方向前进最后一段（带超时防死锁）
-            if self._drop_creep_start_y is None:
-                self._drop_creep_start_y = float(self.base_xy[1])
-                self._drop_creep_t0 = now
-            crept = float(self._drop_creep_start_y - self.base_xy[1])
-            if (crept >= DROP_CREEP_DIST_M
-                    or now - self._drop_creep_t0 >= DROP_CREEP_TIMEOUT_S):
-                self.set_twist(0.0, 0.0)
+            # 抬臂已完成，继续交接时已启动的剩余靠桌距离。
+            if self._advance_drop_creep(now, "drop-creep"):
                 self.place_stage = 2
                 self.place_t0 = now
-                self.get_logger().info(
-                    f"[drop-creep] advanced {crept:.3f}m towards the table")
-            else:
-                yaw_err = pick.wrap_to_pi(-math.pi / 2.0 - self.base_yaw)
-                angular = float(np.clip(2.0 * yaw_err, -0.3, 0.3))
-                linear = (
-                    DROP_CREEP_SPEED_MPS if abs(yaw_err) <= 0.10 else 0.0)
-                self.set_twist(linear, angular)
             return
         if self.place_stage == 2:
             # 松爪前最后延展：把手臂再往外伸一段（带超时兜底）
@@ -735,8 +833,16 @@ class ContinuousOrderController(IntegratedNavPickPlace):
         if extend_m is None:
             extend_m = DROP_RAISE_EXTEND_M
         bx, by = float(self.base_xy[0]), float(self.base_xy[1])
+        # The fast continuous flow keeps the existing high-release motion,
+        # but shifts its reach by the slot's Y offset.  Together with the
+        # slot-specific navigation X this preserves both dimensions of the
+        # five-position layout without adding the slower refined-place stages.
+        slot_depth_offset = (
+            float(integrated.DELIVERY_TABLE_PLACE_WORLD[1])
+            - float(self.place_world[1]))
         world = np.array(
-            [bx, by - extend_m, DROP_RAISE_TCP_Z], dtype=float)
+            [bx, by - extend_m - slot_depth_offset, DROP_RAISE_TCP_Z],
+            dtype=float)
         reference = self.selected_arm_positions()
         for slide in (DROP_RAISE_SLIDE, 0.0, 0.05, 0.10):
             joints = self._solve_place_world(
@@ -747,36 +853,25 @@ class ContinuousOrderController(IntegratedNavPickPlace):
         return None
 
     def _drop_tick_dual(self, now: float) -> None:
-        """双机械臂（zhijin）：先抬升 slide，再朝桌子前进并张开夹爪释放。"""
+        """双机械臂（zhijin）：并行抬升 slide 与靠桌，再张爪释放。"""
         if self.place_stage == 0:
             self.des_slide = DROP_RAISE_SLIDE
+            creep_done = self._advance_drop_creep(
+                now, "drop-dual-creep")
             slide = self.joints.get("slide_joint")
             if (slide is not None
                     and abs(float(slide) - DROP_RAISE_SLIDE) < 0.03):
-                self.place_stage = 1
-                self.place_t0 = now
-                self.get_logger().info("[drop-dual] raised; creeping forward")
-            return
-        if self.place_stage == 1:
-            # 手臂已抬高，朝桌子方向前进最后一段（带超时防死锁）
-            if self._drop_creep_start_y is None:
-                self._drop_creep_start_y = float(self.base_xy[1])
-                self._drop_creep_t0 = now
-            crept = float(self._drop_creep_start_y - self.base_xy[1])
-            if (crept >= DROP_CREEP_DIST_M
-                    or now - self._drop_creep_t0 >= DROP_CREEP_TIMEOUT_S):
-                self.set_twist(0.0, 0.0)
-                self.place_stage = 2
+                self.place_stage = 2 if creep_done else 1
                 self.place_t0 = now
                 self.get_logger().info(
-                    f"[drop-dual-creep] advanced {crept:.3f}m towards the "
-                    "table")
-            else:
-                yaw_err = pick.wrap_to_pi(-math.pi / 2.0 - self.base_yaw)
-                angular = float(np.clip(2.0 * yaw_err, -0.3, 0.3))
-                linear = (
-                    DROP_CREEP_SPEED_MPS if abs(yaw_err) <= 0.10 else 0.0)
-                self.set_twist(linear, angular)
+                    "[drop-dual] raised; "
+                    + ("final approach already complete"
+                       if creep_done else "continuing table approach"))
+            return
+        if self.place_stage == 1:
+            if self._advance_drop_creep(now, "drop-dual-creep"):
+                self.place_stage = 2
+                self.place_t0 = now
             return
         if self.place_stage == 2:
             self.des_left_grip = pick.GRIP_OPEN
@@ -824,12 +919,27 @@ class ContinuousOrderController(IntegratedNavPickPlace):
         if (moved_back >= DROP_BACKUP_DIST_M
                 or elapsed > DROP_BACKUP_TIMEOUT_S):
             self.set_twist(0.0, 0.0)
-            self._start_return_to_shelf()
+            if self.order_index == 0:
+                # 第一单后回到 A，让第二单从 A 开始并补充第一趟正式录入
+                # 后可能变化的记忆矩阵。第二单完成后不再重复固定返航。
+                self._start_return_to_shelf()
+            else:
+                self._complete_order_at_delivery_exit(now)
             return
 
-        linear = float(np.clip(DROP_BACKUP_SPEED_MPS, 0.0, 0.15))
+        linear = float(np.clip(DROP_BACKUP_SPEED_MPS, 0.0, 0.20))
         angular = float(np.clip(2.0 * yaw_err, -0.6, 0.6))
         self.set_twist(-linear, angular)   # 负数 = 倒车
+
+    def _complete_order_at_delivery_exit(self, now: float) -> None:
+        """Finish order 2+ after release retreat, without a forced A visit."""
+        self.flow_phase = "order_done"
+        self.order_done = True
+        self.order_done_at = float(now)
+        self.get_logger().info(
+            f"[flow] ORDER {self.order_index + 1}/{self.order_count} "
+            f"({self.target_kind}) COMPLETE — delivery retreat finished; "
+            "next order will route from memory without a forced A stop")
 
     # ------------------------------------------------------------------
     # 返回抓货区
@@ -1321,6 +1431,11 @@ def main() -> None:
         parse_orders_arg(args.orders)
         if args.orders
         else generate_orders(args.orders_count, args.seed))
+    if len(orders) > len(integrated.DELIVERY_PLACE_SLOTS_XY):
+        raise ValueError(
+            f"received {len(orders)} orders but only "
+            f"{len(integrated.DELIVERY_PLACE_SLOTS_XY)} collision-separated "
+            "delivery slots are available")
 
     import rclpy
     from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
@@ -1485,6 +1600,7 @@ def main() -> None:
 
         def make_controller(
                 kind: str, index: int,
+                place_slot: int,
                 exclude_marker_ids=None, exclude_slots=None):
             ctrl = ContinuousOrderController(
                 kind, args.max_scan_cycles,
@@ -1493,7 +1609,8 @@ def main() -> None:
                 place_retreat_dwell_s=args.drop_retreat_dwell,
                 nav_during_scan=not args.no_nav_during_scan,
                 backup_after_grab_m=args.backup_after_grab,
-                close_recheck=not args.no_close_recheck)
+                close_recheck=not args.no_close_recheck,
+                place_slot=place_slot)
             ctrl.order_index = index
             ctrl.order_count = len(orders)
             ctrl.memory_rerouted = False
@@ -1502,8 +1619,9 @@ def main() -> None:
             ctrl.memory_consume_callback = (
                 lambda completed: _consume_grabbed_memory(
                     completed, matrix_tracker))
-            # 只有第一单从最近的 E 货架开始扫；之后每单从最西侧 A 货架开始
-            ctrl.scan_prefer_west_start = index > 0
+            # 第一单沿用最近的 E 起点；只让第二单从 A 开始，以补充正式录入
+            # 后的记忆矩阵。第三单及以后不再强制停 A，优先按矩阵直达。
+            ctrl.scan_prefer_west_start = _prefer_west_scan_start(index)
             # 重试时排除上次抓取失败的槽位 marker，让扫描去找同类商品的
             # 另一个位置，避免每次重试都撞同一个卡住的槽位（死循环感）。
             if exclude_marker_ids:
@@ -1577,11 +1695,11 @@ def main() -> None:
             return ctrl
 
         def start_order(
-                kind: str, index: int,
+                kind: str, index: int, place_slot: int,
                 exclude_marker_ids=None, exclude_slots=None):
             nonlocal controller, viewer
             ctrl = make_controller(
-                kind, index,
+                kind, index, place_slot,
                 exclude_marker_ids=exclude_marker_ids,
                 exclude_slots=exclude_slots)
             executor.add_node(ctrl)
@@ -1590,7 +1708,9 @@ def main() -> None:
             if viewer is not None:
                 viewer.controller = ctrl
             ctrl.get_logger().info(
-                f"[orders] START order {index + 1}/{len(orders)}: {kind}")
+                f"[orders] START dispatch {index + 1}/{len(orders)}: {kind}; "
+                f"place_slot={place_slot + 1}/"
+                f"{len(integrated.DELIVERY_PLACE_SLOTS_XY)}")
 
         def finish_controller(ctrl):
             executor.remove_node(ctrl)
@@ -1602,7 +1722,44 @@ def main() -> None:
                 pass
             ctrl.destroy_node()
 
-        start_order(orders[0], 0)
+        results = []          # (kind, status)
+        pending_indices = list(range(len(orders)))
+        retries = {source_index: 0 for source_index in pending_indices}
+        failed_markers = {
+            source_index: set() for source_index in pending_indices}
+        failed_slots = {
+            source_index: set() for source_index in pending_indices}
+        order_idx = 0
+        delivered_count = 0
+        active_source_index = None
+
+        def select_next_order() -> tuple[int, str] | None:
+            source_index = _select_nearest_pending_order(
+                pending_indices, orders,
+                lambda kind: _memory_hint_for(kind, log_decision=False))
+            if source_index is None:
+                return None
+            return source_index, orders[source_index]
+
+        def start_next_order() -> bool:
+            nonlocal active_source_index
+            selected = select_next_order()
+            if selected is None:
+                active_source_index = None
+                return False
+            active_source_index, kind = selected
+            hint = _memory_hint_for(kind, log_decision=False)
+            hint_text = (
+                "no-memory/source-order fallback" if hint is None
+                else f"travel={float(hint['travel']):.2f}m "
+                     f"shelf={hint['shelf']}-{hint['level']}")
+            matrix_tracker.get_logger().info(
+                f"[orders] nearest pending -> source="
+                f"{active_source_index + 1} kind={kind} {hint_text}")
+            start_order(kind, order_idx, delivered_count)
+            return True
+
+        start_next_order()
 
         if args.show:
             if _cv_gui_available():
@@ -1621,11 +1778,6 @@ def main() -> None:
 
         _ensure_spin()
 
-        results = []          # (kind, status)
-        retries = {kind: 0 for kind in orders}
-        failed_markers = {kind: set() for kind in orders}
-        failed_slots = {kind: set() for kind in orders}
-        order_idx = 0
         last_memory_reroute_check = 0.0
 
         while rclpy.ok():
@@ -1653,7 +1805,7 @@ def main() -> None:
                 try:
                     next_hint = _memory_hint_for(
                         controller.target_kind,
-                        failed_slots[controller.target_kind],
+                        failed_slots[active_source_index],
                         log_decision=False,
                         exclude_shelves=(
                             controller.memory_exhausted_shelves),
@@ -1706,7 +1858,7 @@ def main() -> None:
                 try:
                     refreshed_hint = _memory_hint_for(
                         controller.target_kind,
-                        failed_slots[controller.target_kind],
+                        failed_slots[active_source_index],
                         log_decision=False,
                         exclude_shelves=(
                             controller.memory_exhausted_shelves),
@@ -1761,11 +1913,12 @@ def main() -> None:
                     f"[orders] COMPLETE order {controller.order_index + 1}: "
                     f"{kind}")
                 finish_controller(controller)
+                pending_indices.remove(active_source_index)
+                delivered_count += 1
                 order_idx += 1
-                if order_idx >= len(orders):
+                if not start_next_order():
                     controller = None
                     break
-                start_order(orders[order_idx], order_idx)
             elif controller.order_aborted:
                 kind = controller.target_kind
                 reason = controller.abort_reason or "unknown"
@@ -1776,37 +1929,41 @@ def main() -> None:
                         f"[orders] SKIP order {controller.order_index + 1}: "
                         "no middle-column tissue is available")
                     finish_controller(controller)
+                    pending_indices.remove(active_source_index)
                     order_idx += 1
-                    if order_idx >= len(orders):
+                    if not start_next_order():
                         controller = None
                         break
-                    start_order(orders[order_idx], order_idx)
                     continue
                 failed_marker = controller.target_marker_id
                 if failed_marker is not None:
-                    failed_markers[kind].add(int(failed_marker))
+                    failed_markers[active_source_index].add(int(failed_marker))
                 failed_slot = controller.target_slot_key()
                 if failed_slot is not None:
-                    failed_slots[kind].add(failed_slot)
-                retries[kind] += 1
+                    failed_slots[active_source_index].add(failed_slot)
+                retries[active_source_index] += 1
                 controller.get_logger().error(
                     f"[orders] FAILED order: {kind} ({reason}); "
-                    f"retry={retries[kind]}/{args.max_retries} "
-                    f"excluded_markers={sorted(failed_markers[kind])} "
-                    f"excluded_slots={sorted(failed_slots[kind])}")
+                    f"retry={retries[active_source_index]}/"
+                    f"{args.max_retries} "
+                    f"excluded_markers="
+                    f"{sorted(failed_markers[active_source_index])} "
+                    f"excluded_slots="
+                    f"{sorted(failed_slots[active_source_index])}")
                 finish_controller(controller)
-                if retries[kind] <= args.max_retries:
+                if retries[active_source_index] <= args.max_retries:
                     start_order(
-                        kind, order_idx,
-                        exclude_marker_ids=failed_markers[kind],
-                        exclude_slots=failed_slots[kind])
+                        kind, order_idx, delivered_count,
+                        exclude_marker_ids=(
+                            failed_markers[active_source_index]),
+                        exclude_slots=failed_slots[active_source_index])
                 else:
                     results.append((kind, f"failed({reason})"))
+                    pending_indices.remove(active_source_index)
                     order_idx += 1
-                    if order_idx >= len(orders):
+                    if not start_next_order():
                         controller = None
                         break
-                    start_order(orders[order_idx], order_idx)
             else:
                 time.sleep(0.02)
 
