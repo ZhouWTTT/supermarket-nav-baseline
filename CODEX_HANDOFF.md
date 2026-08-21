@@ -1,6 +1,9 @@
 # 超市分拣项目工作交接
 
 > 生成时间：2026-08-15（Asia/Shanghai）
+> 最近更新：2026-08-17 —— 新增"审查发现与待办"小节：放置掉落根因诊断、
+> `PRODUCT_CENTER_ABOVE_MARKER_M` 双表漂移、固定布局 JSON 灰色使用、其他小隐患。
+> 本次审查仅做阅读与诊断，**未修改任何代码**。
 > 工作目录：`/home/zwt/baseline_dev`
 > 用途：让新的 Codex 对话先阅读本文，再继续导航、识别、抓取、放置和多订单性能优化。
 
@@ -89,7 +92,8 @@ run_baseline.sh
 
 ### 1. 导航和狭窄通道脱困
 
-- 导航器最大线速度为 `0.90 m/s`，最大角速度为 `2.5 rad/s`。
+- 导航器最大线速度为 `0.90 m/s`，最大角速度为 `2.0 rad/s`
+  （2026-08-17 从 `2.5` 下调，降低载货转弯甩动与商品滑落风险）。
 - 抓取父控制器的速度输出限制也已对齐到 `±0.90 m/s`、`±2.50 rad/s`，不会再被
   旧的 `0.4 m/s`、`1.4 rad/s` 二次截断。
 - 近目标开放区域速度上限为 `0.35 m/s`。
@@ -239,6 +243,84 @@ run_baseline.sh
 5. **路径记忆**：缓存并非每条路线都能命中；必须从日志同时确认 `cache_hit: true`
    和 `cached_path_active: true`。触发恢复的缓存现在会主动失效，这是预期行为。
 
+## 2026-08-17 审查发现与待办（尚未实施任何修改）
+
+> 本节由一次全库代码审查产生：现象、根因、修复建议。修复动作需用户明确授权后再做。
+
+### 1. 放置阶段"机械臂扭动 + 商品掉落"（最高优先，直接影响放置成功率）
+
+**现象**：放置时机械臂不是平稳下放，而是怪异扭动，随后回到正常姿势才松开商品；
+大部分商品在扭动途中掉落（stage 2 松的是空爪）。释放顺序本身正确（先验证低姿才松爪），
+问题出在 stage 0 的伸臂运动。
+
+**代码定位**：`integrated_nav_pick_place.py` 的 `_compute_place_arm_joints`（1326 行）
+与 `_solve_place_world`（1408 行）。
+
+**根因分析（静态审查结论，未经实跑验证）**：
+- `arm_kdl.py:377-424` 的 IK 是解析多解：肩/肘/腕各 ± 两个分支（最多 8 个解），
+  分支间关节差可达 2~3 rad，但都满足同一 TCP 目标；
+- `_compute_place_arm_joints` 的参考构型顺序是 `refs = [compact, measured, pregrasp]`
+  （1340-1346 行），compact（运输回收姿态 `PLACE_RETREAT_ARM_R/L`）排第一；
+- `_solve_place_world` 选解只最小化"与 reference 的切比雪夫距离"（1429-1432 行），
+  **不校验与当前实测关节的连续性**；
+- 结果：很可能选中 compact 分支的解（离实测构型远），从实测构型出发的关节线性插值
+  在笛卡尔空间是经过奇异/镜像构型的怪路径 → "扭动"，商品被甩落/撞落；
+- 对照：抓取 IK `solve_kdl_world`（yolo_aruco_shelf_pick.py:2631）的 reference 就是
+  运动起点（pregrasp），所以抓取路径连续、不扭；
+- 次要因素：stage 0 中 slide（0.006→0.2~0.45）与手臂同时运动，slide 约 1.5 s 到位
+  而手臂限速 ramp（`PLACE_LOADED_ARM_MAX_STEP_RAD=0.006`，起步 0.00025）需十几秒，
+  轨迹不协调。
+
+**修复建议（改动均小）**：
+1. refs 顺序改为 `[measured, compact, pregrasp]`，选解加连续性门限（解与实测
+   max 关节差 > 1.0 rad 则拒绝/告警）；这是最小侵入的验证性修改；
+2. 治本：对候选解做 8~16 点关节插值 + FK 采样，检查 TCP/肘部路径单调合理
+   （不越过桌沿、不低于安全高度、不贴近车体）；
+3. `[place] approach IK=` 日志加 `ref_source` 与 `max_joint_delta_from_measured`；
+4. stage 0 让 slide 与手臂按比例同步到位。
+
+**验证方法**：下次运行抓 `[place] approach IK=` 与 `[place] waiting for approach
+pose` 行；若 arm_error 初始 > 1.0 rad 或 stage 0 耗时 > 10 s，即坐实跨分支解。
+
+### 2. `PRODUCT_CENTER_ABOVE_MARKER_M` 双表漂移
+
+- `competition_task.py:34-44` 与 `yolo_aruco_shelf_pick.py:85-95` 各有一份，数值已
+  不一致：kele 0.0715 vs 0.0315、heweidao 0.0355 vs 0.00、shupian 0.054 vs 0.030、
+  maidong 0.104 vs 0.034、kouxiangtang 0.030 vs 0.020；
+- 正式链路只用 yolo_aruco_shelf_pick 的表；competition_task 的表仅被
+  `associate_detection_marker()`（当前只有单测调用）使用；
+- 风险：未来把 `associate_detection_marker` 接入正式链路会静默使用旧值；且测试
+  在给死路径做回归，产生虚假安全感；
+- 建议：以 `competition_task.py` 为单一来源（无 ROS 依赖、宿主机可测），
+  `yolo_aruco_shelf_pick.py` 改为导入；短期不做就加一致性断言测试；注释写明口径
+  （码中心到商品中心的竖直距离）。
+
+### 3. 正式路径对固定布局 JSON 的灰色使用
+
+- 澄清：运行时 client 不从 server 读任何布局数据（仅 ROS2 话题）；问题在于 client
+  仓库自带的 `retail_competition_layout.json` 被正式逻辑两处读取：
+  - `yolo_aruco_shelf_pick.py:1709`：`fixed_layout_by_marker()[marker_id]["shelf"]=="A"`
+    决定左/右臂（west_column）；
+  - `yolo_aruco_shelf_pick.py:2767`：`middle_tissue_column_x()` 决定纸巾"直接探入"抓法；
+- 这两处读的是固定结构（码→货架字母、列位置），不读每轮变化的商品真值，不算违规；
+  但依赖"官方 45 码位布局与仓库 JSON 一致"的未验证假设，且正式代码中出现布局文件
+  加载调用，合规观感差；
+- 建议：改用实测/常量判定——`memory_matrix.shelf_for_scan_x(target_world[0])=="A"`
+  （`SHELF_SCAN_X` 常量，与 `middle_tissue_column_x()` 输出一致）与中列判定，
+  然后删除 `middle_tissue_column_x()`；JSON 仅保留给 `--tcp-diagnostic-ground-truth`
+  等诊断开关。
+
+### 4. 其他小隐患（低优先）
+
+- **worker 无单订单超时**：`SUPERMARKET_ORDER_TIMEOUT=0` 默认禁用；若 match-timeout
+  调大（官方命令用 3600 s），单次卡死可拖住整场。建议设 180~240 s；
+- **跨 run 竞态**：`competition_runner.py:117-125` 收到新 run_prefix 时旧 worker
+  结果可能被记到新任务（匿名订单 id 跨 run 重复）。建议结果文件/worker 记录带
+  run_prefix，收尾时校验不一致则丢弃；
+- **深度单位三套写法**：`kele_detect.py` 的 `patch_depth_m` 无条件 ×1e-3（假定 mm）、
+  `foreground_depth_estimate` 用启发式判定、`aruco_detect.py` 用 `depth > 20.0` 判定；
+  官方深度流格式变化会静默错 1000 倍。建议在相机信息回调处统一一次单位判定。
+
 ## 正式启动方式
 
 ### Server（组织方镜像，Client 不得依赖本地 Server 源码）
@@ -333,13 +415,20 @@ sudo docker logs supermarket_sorting_client 2>&1 | \
 
 ## 下一步建议
 
-1. 用户授权运行时，先以当前 `master@10b1957` 做一次三单正式流程，确认没有功能
-   回归，再尝试五单。
-2. 重点验证日志顺序：同高度后缩发生在升降柱恢复之前；旋转前 slide 已到
+按优先级排列（2026-08-17 更新，新增第 1、2 项）：
+
+1. 【最高优先】放置掉落：按上文"审查发现 1"做最小修改（refs 顺序改 measured 优先 +
+   连续性门限 + `[place] approach IK=` 日志加 ref_source/max_joint_delta），跑一次三单
+   验证 arm_error 初始值与掉落率是否改善；若坐实跨分支解再考虑中间路径 FK 采样校验。
+2. 顺手修两个小隐患：`PRODUCT_CENTER_ABOVE_MARKER_M` 合并单一来源；正式路径去掉
+   `fixed_layout_by_marker()` 依赖（改 `shelf_for_scan_x`/`SHELF_SCAN_X` 判定）。
+3. 用户授权运行时，先以当前 HEAD 做一次三单正式流程，确认没有功能回归，再尝试五单；
+   本次审查未修改任何代码，当前 HEAD 与上次运行等价。
+4. 重点验证日志顺序：同高度后缩发生在升降柱恢复之前；旋转前 slide 已到
    `0.006 m`；导航到桌期间夹爪保持为苹果/橙子 `0.06`；只有 low pose verified
    后才出现释放。
-3. 若再次在狭窄通道卡住，先确认是否出现 `lateral_escape_replan`，以及侧向路径是否
+5. 若再次在狭窄通道卡住，先确认是否出现 `lateral_escape_replan`，以及侧向路径是否
    被普通重规划立即覆盖。
-4. 使用新的 `summary.json` 分阶段耗时确定 400 秒瓶颈，优先处理扫描、抓取或仿真
+6. 使用新的 `summary.json` 分阶段耗时确定 400 秒瓶颈，优先处理扫描、抓取或仿真
    实时率中占比最大的部分，避免继续无依据地提高全局速度。
-5. 未经用户明确要求，不修改废弃文件、不提交、不推送。
+7. 未经用户明确要求，不修改废弃文件、不提交、不推送。

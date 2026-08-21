@@ -228,8 +228,8 @@ SCAN_CAMERA_REACHED_HEAD_RAD = 0.030
 # frame rate.  Previously the 2.5 s dwell per pose added ~75 s of pure wait
 # per full shelf sweep.
 SCAN_CAMERA_STABLE_S = 0.10
-SCAN_SETTLE_S = 0.15
-SCAN_DWELL_S = 0.6
+SCAN_SETTLE_S = 0.10
+SCAN_DWELL_S = 0.45
 # During a formal multi-order run, the first *graspable* pending class at a scan
 # pose is usually much cheaper to finish than crossing several shelf stations
 # for the class chosen before perception started.  Do not commit on YOLO alone:
@@ -1158,6 +1158,14 @@ class ShelfPickController(Node):
         self.des_linear = self.des_angular = 0.0
         self.cmd_linear = self.cmd_angular = 0.0
         self.commands_ready_since = None
+        # Preserve the complete feedback carried by JointState/Odometry for
+        # placement diagnostics.  The controller itself only needs joint
+        # positions, but velocity/effort and measured chassis twist are needed
+        # to distinguish a commanded move from oscillation, contact or stall.
+        self.joint_velocities = {}
+        self.joint_efforts = {}
+        self.base_measured_linear = 0.0
+        self.base_measured_angular = 0.0
 
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 5)
         self.slide_pub = self.create_publisher(
@@ -1197,6 +1205,8 @@ class ShelfPickController(Node):
         self.base_yaw = float(Rotation.from_quat([
             orientation.x, orientation.y, orientation.z, orientation.w,
         ]).as_euler("xyz")[2])
+        self.base_measured_linear = float(message.twist.twist.linear.x)
+        self.base_measured_angular = float(message.twist.twist.angular.z)
         self.last_odom_time = self.now()
 
     def joint_cb(self, message: JointState) -> None:
@@ -1204,6 +1214,16 @@ class ShelfPickController(Node):
             name: float(message.position[index])
             for index, name in enumerate(message.name)
             if index < len(message.position)
+        }
+        self.joint_velocities = {
+            name: float(message.velocity[index])
+            for index, name in enumerate(message.name)
+            if index < len(message.velocity)
+        }
+        self.joint_efforts = {
+            name: float(message.effort[index])
+            for index, name in enumerate(message.name)
+            if index < len(message.effort)
         }
         self.last_joint_time = self.now()
 
