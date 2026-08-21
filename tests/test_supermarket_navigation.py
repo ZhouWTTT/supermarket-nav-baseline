@@ -180,6 +180,16 @@ class CostmapTests(unittest.TestCase):
         self.assertLess(gy, 0)
         self.assertFalse(costmap.in_bounds(gx, gy))
 
+    def test_throat_pose_is_only_inside_static_inflation(self):
+        costmap = Costmap2D()
+        # Regression for the fixed corridor-board north endpoint.  The logged
+        # stall pose is inside the conservative whole-body inflation while it
+        # remains outside the physical board itself.
+        self.assertFalse(costmap.is_static_free_world(0.53, 2.23))
+        self.assertTrue(costmap.is_static_raw_free_world(0.53, 2.23))
+        self.assertGreater(
+            costmap.raw_static_clearance_world(0.53, 2.23), 0.50)
+
     def test_line_check_covers_grid_cells_touched_near_corner(self):
         costmap = Costmap2D()
         costmap.master[85, 38] = LETHAL
@@ -378,6 +388,35 @@ class ControllerTests(unittest.TestCase):
             -1.60, -2.67))
         self.assertTrue(self.controller._table_rotation_is_free(
             *DELIVERY_APPROACH[:2]))
+
+    def test_throat_static_inflation_allows_only_outward_motion(self):
+        x, y = 0.53, 2.23
+        self.assertTrue(self.controller._motion_is_free(
+            x, y, math.radians(157.0), 0.10, 0.0))
+        self.assertFalse(self.controller._motion_is_free(
+            x, y, -math.pi / 2.0, 0.35, 0.0))
+
+    def test_throat_pose_can_start_navigation_to_shelf_d(self):
+        self.controller.set_goal(0.92, 2.475, math.pi / 2.0)
+        x, y, yaw = 0.53, 2.23, math.radians(157.0)
+        scan = FakeScan([float("inf")] * 360)
+        reached = False
+        for tick in range(2000):
+            v, w, reached = self.controller.compute_velocity(
+                x, y, yaw, scan, time_now=1.0 + tick * 0.02)
+            if tick == 0:
+                self.assertGreater(v, 0.0)
+                self.assertNotEqual(
+                    self.controller.stop_reason, "arc_blocked")
+            yaw = wrap_to_pi(yaw + w * 0.02)
+            x += v * math.cos(yaw) * 0.02
+            y += v * math.sin(yaw) * 0.02
+            self.assertTrue(
+                self.costmap.is_static_raw_free_world(x, y))
+            if reached:
+                break
+        self.assertTrue(reached)
+        self.assertTrue(self.costmap.is_static_free_world(x, y))
 
     def test_requested_d_b_delivery_sequence_avoids_inflated_boxes(self):
         costmap = Costmap2D()

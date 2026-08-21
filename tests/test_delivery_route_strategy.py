@@ -62,7 +62,7 @@ class DeliveryRouteStrategyTests(unittest.TestCase):
             delivery.IntegratedNavPickPlace)
         controller.base_xy = np.asarray(base_xy, dtype=float)
         controller.base_yaw = -math.pi / 2.0
-        controller.place_world = np.asarray([-1.94, -3.43, 0.85])
+        controller.place_world = np.asarray([-1.94, -3.48, 0.85])
         controller.place_slot = 1
         controller.flow_phase = "grab"
         controller.des_slide = 0.11
@@ -88,6 +88,24 @@ class DeliveryRouteStrategyTests(unittest.TestCase):
         controller.scan_direct_fallback_used = False
         controller.scan_route_final_goal = None
         return controller
+
+    def test_delivery_slots_are_shifted_south_and_clear_table_edges(self):
+        expected = (
+            (-2.20, -3.50),
+            (-1.94, -3.48),
+            (-1.68, -3.46),
+            (-2.07, -3.34),
+            (-1.81, -3.32),
+        )
+        self.assertEqual(delivery.DELIVERY_PLACE_SLOTS_XY, expected)
+
+        x_min, y_min, x_max, y_max = delivery.DELIVERY_TABLE_XML_BOUNDS
+        minimum_margin = 0.13 - 1e-9
+        for x, y in delivery.DELIVERY_PLACE_SLOTS_XY:
+            self.assertGreaterEqual(x - x_min, minimum_margin)
+            self.assertGreaterEqual(x_max - x, minimum_margin)
+            self.assertGreaterEqual(y - y_min, minimum_margin)
+            self.assertGreaterEqual(y_max - y, minimum_margin)
 
     def test_forward_delivery_uses_live_trunk_live_sequence(self):
         controller = self._controller(base_xy=(0.0, 2.30))

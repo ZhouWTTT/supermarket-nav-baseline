@@ -133,13 +133,15 @@ DELIVERY_TABLE_TOP_Z_M = 0.767
 # south, so more-negative Y is deeper on the table.  Three staggered inner
 # slots are filled first, followed by two outer slots.  A literal five-item
 # depth-only row would leave less than 90 mm between centres on this 440 mm
-# deep table and would overlap the larger products.
+# deep table and would overlap the larger products.  All slots are shifted
+# 50 mm south from the original layout so the fourth and fifth products are
+# not released at the north edge of the tabletop.
 DELIVERY_PLACE_SLOTS_XY = (
-    (-2.20, -3.45),  # 1: deepest, inner-left
-    (-1.94, -3.43),  # 2: inner-centre
-    (-1.68, -3.41),  # 3: inner-right
-    (-2.07, -3.29),  # 4: outer-left
-    (-1.81, -3.27),  # 5: outer-right / nearest
+    (-2.20, -3.50),  # 1: deepest, inner-left
+    (-1.94, -3.48),  # 2: inner-centre
+    (-1.68, -3.46),  # 3: inner-right
+    (-2.07, -3.34),  # 4: outer-left
+    (-1.81, -3.32),  # 5: outer-right / nearest
 )
 PLACE_SLOT_IK_NUDGE_M = 0.020
 PLACE_SLOT_XY_TOLERANCE_M = 0.020

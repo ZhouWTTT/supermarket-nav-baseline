@@ -179,7 +179,15 @@ class Costmap2D:
         self._pause_depth = False  # set True during pure rotation
 
         # Layers
+        # Keep the physical static geometry separate from its conservative
+        # whole-body inflation.  The distinction is needed when localisation or
+        # tracking error leaves the base just inside an inflated boundary: the
+        # controller may safely move away from the physical obstacle, but must
+        # never move through it.
+        self.static_raw = np.zeros(
+            (self.height, self.width), dtype=np.int8)
         self.static = np.zeros((self.height, self.width), dtype=np.int8)
+        self._static_obstacle_bounds = []
         # Keep raw laser hits separate from their inflated representation.
         # Inflating ``dynamic`` in-place on every scan makes obstacles grow by
         # one robot radius per update until the whole corridor is blocked.
@@ -236,34 +244,40 @@ class Costmap2D:
 
     def _build_static(self):
         """Mark immutable scene geometry in the static layer."""
-        s = self.static
+        s = self.static_raw
+
+        def add_rect(xmin, ymin, xmax, ymax):
+            bounds = (float(xmin), float(ymin), float(xmax), float(ymax))
+            self._static_obstacle_bounds.append(bounds)
+            self._fill_rect(s, *bounds, LETHAL)
 
         # --- perimeter walls (inner edges at ±2.47 and ±3.72) ---
-        self._fill_rect(s, -2.50, -3.78,  2.50, -3.72, LETHAL)  # south
-        self._fill_rect(s, -2.50,  3.72,  2.50,  3.78, LETHAL)  # north
-        self._fill_rect(s, -2.53, -3.75, -2.47,  3.75, LETHAL)  # west
-        self._fill_rect(s,  2.47, -3.75,  2.53,  3.75, LETHAL)  # east
+        add_rect(-2.50, -3.78,  2.50, -3.72)  # south
+        add_rect(-2.50,  3.72,  2.50,  3.78)  # north
+        add_rect(-2.53, -3.75, -2.47,  3.75)  # west
+        add_rect( 2.47, -3.75,  2.53,  3.75)  # east
 
         # --- corridor right board (x≈0.53, y∈[-3.72, 1.70], half-w 0.03) ---
-        self._fill_rect(s, 0.50, -3.72, 0.56, 1.70, LETHAL)
+        add_rect(0.50, -3.72, 0.56, 1.70)
 
         # --- five shelves (back edge at y=3.473, front at y=3.173) ---
         for cx in SHELF_CENTERS_X:
-            self._fill_rect(s,
-                            cx - SHELF_HALF_W, SHELF_Y_CENTER - SHELF_HALF_D,
-                            cx + SHELF_HALF_W, SHELF_Y_CENTER + SHELF_HALF_D + 0.02,
-                            LETHAL)
+            add_rect(
+                cx - SHELF_HALF_W, SHELF_Y_CENTER - SHELF_HALF_D,
+                cx + SHELF_HALF_W,
+                SHELF_Y_CENTER + SHELF_HALF_D + 0.02)
 
         # --- delivery table (0.96×0.44 m at -1.94, -3.41) ---
         # table top + legs → block a generous bounding box
-        self._fill_rect(s, *DELIVERY_TABLE_COSTMAP_BOUNDS, LETHAL)
+        add_rect(*DELIVERY_TABLE_COSTMAP_BOUNDS)
 
     def _inflate_and_build(self):
         """Inflate static obstacles, build cost gradient, combine into master."""
         from scipy.ndimage import distance_transform_edt
 
-        occupied = (self.static == LETHAL).astype(np.int8)
+        occupied = (self.static_raw == LETHAL).astype(np.int8)
         inflated = maximum_filter(occupied, footprint=self._static_disk)
+        self.static.fill(FREE)
         self.static[inflated > 0] = LETHAL
 
         # Build cost gradient: higher cost near obstacles
@@ -492,6 +506,45 @@ class Costmap2D:
             self.in_bounds(gx, gy)
             and self.static[gy, gx] < LETHAL
         )
+
+    def is_static_raw_free_world(self, wx, wy):
+        """Whether a point is outside physical, uninflated static geometry."""
+        gx, gy = self.world_to_grid(wx, wy)
+        return (
+            self.in_bounds(gx, gy)
+            and self.static_raw[gy, gx] < LETHAL
+        )
+
+    def is_static_motion_free_world(self, wx, wy):
+        """Continuous static-inflation check for short local trajectories.
+
+        The global planner deliberately uses a conservative raster inflation.
+        A local trajectory uses the exact rectangle geometry instead, avoiding
+        a one-cell alias at obstacle corners while preserving the configured
+        whole-body clearance.
+        """
+        gx, gy = self.world_to_grid(wx, wy)
+        return (
+            self.in_bounds(gx, gy)
+            and self.raw_static_clearance_world(wx, wy)
+            > self.static_inflation_radius_m
+        )
+
+    def is_dynamic_free_world(self, wx, wy):
+        """Whether a point is outside the inflated live-obstacle layer."""
+        gx, gy = self.world_to_grid(wx, wy)
+        return (
+            self.in_bounds(gx, gy)
+            and self.dynamic[gy, gx] < LETHAL
+        )
+
+    def raw_static_clearance_world(self, wx, wy):
+        """Continuous clearance to the nearest physical static rectangle."""
+        if not self._static_obstacle_bounds:
+            return float('inf')
+        return min(
+            point_to_rect_clearance(wx, wy, bounds)
+            for bounds in self._static_obstacle_bounds)
 
     def raw_dynamic_clearance_world(self, wx, wy):
         """Distance to the nearest uninflated lidar/RGB-D obstacle hit."""
@@ -767,7 +820,7 @@ class NavigationController:
         self._reverse_recovery_started_at = 0.0
         self._reverse_recovery_trigger_s = 1.0
         self._reverse_recovery_no_progress_m = 0.03
-        self._reverse_recovery_distance_m = 0.12
+        self._reverse_recovery_distance_m = 0.20
         self._reverse_recovery_speed = 0.10
         self._reverse_recovery_timeout_s = 10.0
         # The lidar is about 0.09 m ahead of base_link while the chassis rear
@@ -1271,6 +1324,15 @@ class NavigationController:
         """Enter measured straight backup after a persistent local block."""
         self._recovery_action = None
         recoverable = {"lidar_stop", "arc_blocked", "rotation_loop"}
+        # 近障碍处的 heading_alignment 是"被夹住转不开"：狭窄通道/走廊内
+        # 原地转向被前后障碍顶住（实测走廊里 lidar≈0.30m、w=2.0 全力转
+        # 35s 只转 3°）。此时需要倒退脱困后重规划；开阔地的大转角对齐是
+        # 正常行为，不允许倒退触发。
+        if reason == "heading_alignment":
+            composite = min(
+                self.lidar_clearance, self.depth_clearance_val)
+            if composite < self._slow_dist:
+                recoverable = recoverable | {"heading_alignment"}
         if reason not in recoverable:
             self._reverse_recovery_blocked_time = max(
                 0.0,
@@ -1620,15 +1682,23 @@ class NavigationController:
         if distance <= 1e-6:
             return True
         direction = 1.0 if signed_distance > 0.0 else -1.0
-        start_free = self.cm.is_free_world(bx, by)
-        start_static_free = self.cm.is_static_free_world(bx, by)
+        start_static_free = self.cm.is_static_motion_free_world(bx, by)
+        start_static_raw_free = self.cm.is_static_raw_free_world(bx, by)
+        start_static_clearance = self.cm.raw_static_clearance_world(bx, by)
+        start_dynamic_free = self.cm.is_dynamic_free_world(bx, by)
         start_clearance = self.cm.raw_dynamic_clearance_world(bx, by)
+        escaping_static_inflation = (
+            not start_static_free
+            and start_static_raw_free
+            and math.isfinite(start_static_clearance)
+            and start_static_clearance > 0.5 * self.cm.resolution
+        )
         escaping_dynamic_inflation = (
-            not start_free
-            and start_static_free
+            not start_dynamic_free
             and math.isfinite(start_clearance)
             and start_clearance > 0.5 * self.cm.resolution
         )
+        previous_static_clearance = start_static_clearance
         previous_clearance = start_clearance
         sample_step = 0.5 * self.cm.resolution
         steps = max(1, int(math.ceil(distance / sample_step)))
@@ -1636,8 +1706,15 @@ class NavigationController:
             travelled = distance * index / steps
             x = bx + direction * travelled * math.cos(byaw)
             y = by + direction * travelled * math.sin(byaw)
-            if not self.cm.is_static_free_world(x, y):
-                return False
+            static_free = self.cm.is_static_motion_free_world(x, y)
+            static_clearance = self.cm.raw_static_clearance_world(x, y)
+            if not static_free:
+                if (not escaping_static_inflation
+                        or not self.cm.is_static_raw_free_world(x, y)
+                        or not math.isfinite(static_clearance)
+                        or static_clearance + 1e-6
+                        < previous_static_clearance):
+                    return False
             clearance = self.cm.raw_dynamic_clearance_world(x, y)
             if (escaping_dynamic_inflation
                     and math.isfinite(previous_clearance)
@@ -1648,12 +1725,13 @@ class NavigationController:
                 # candidate already lies in free cells, millimetre-level scan
                 # geometry changes must not veto an otherwise safe backup.
                 return False
-            if not self.cm.is_free_world(x, y):
+            if not self.cm.is_dynamic_free_world(x, y):
                 if (not escaping_dynamic_inflation
                         or not math.isfinite(clearance)
                         or clearance <= 0.5 * self.cm.resolution
                         or clearance + 1e-4 < previous_clearance):
                     return False
+            previous_static_clearance = static_clearance
             previous_clearance = clearance
             if (point_to_rect_clearance(
                     x, y, DELIVERY_TABLE_COSTMAP_BOUNDS)
@@ -1662,16 +1740,21 @@ class NavigationController:
         if (escaping_dynamic_inflation
                 and previous_clearance < start_clearance + 0.001):
             return False
+        if (escaping_static_inflation
+                and previous_static_clearance
+                < start_static_clearance + 1e-5):
+            return False
         return True
 
     def _motion_is_free(self, bx, by, byaw, linear, angular,
                         horizon=0.45, sample_dt=0.05):
         """Check the near-future arc, allowing safe inflation-layer escape.
 
-        If the current pose lies only in a dynamic obstacle's inflated halo,
-        permit a trajectory that monotonically increases clearance from the
-        raw obstacle hits.  Static cells and raw dynamic hit cells remain
-        forbidden, so this recovery cannot drive through a real obstacle.
+        If the current pose lies only in a static or dynamic obstacle's
+        inflated halo, permit a trajectory that monotonically increases
+        clearance from the corresponding physical/raw obstacle.  Physical
+        static cells and raw dynamic hit cells remain forbidden, so this
+        recovery cannot drive through a real obstacle.
         At low speed the prediction horizon is shortened so a safe creep is
         not rejected because of an arc the robot will not reach soon.
         """
@@ -1680,15 +1763,23 @@ class NavigationController:
         adaptive_horizon = horizon * min(1.0, abs(linear) / 0.35)
         adaptive_horizon = max(0.08, adaptive_horizon)
         x, y, yaw = bx, by, byaw
-        start_free = self.cm.is_free_world(x, y)
-        start_static_free = self.cm.is_static_free_world(x, y)
+        start_static_free = self.cm.is_static_motion_free_world(x, y)
+        start_static_raw_free = self.cm.is_static_raw_free_world(x, y)
+        start_static_clearance = self.cm.raw_static_clearance_world(x, y)
+        start_dynamic_free = self.cm.is_dynamic_free_world(x, y)
         start_clearance = self.cm.raw_dynamic_clearance_world(x, y)
+        escaping_static_inflation = (
+            not start_static_free
+            and start_static_raw_free
+            and math.isfinite(start_static_clearance)
+            and start_static_clearance > 0.5 * self.cm.resolution
+        )
         escaping_dynamic_inflation = (
-            not start_free
-            and start_static_free
+            not start_dynamic_free
             and math.isfinite(start_clearance)
             and start_clearance > 0.5 * self.cm.resolution
         )
+        previous_static_clearance = start_static_clearance
         previous_clearance = start_clearance
         steps = max(1, int(math.ceil(adaptive_horizon / sample_dt)))
         dt = adaptive_horizon / steps
@@ -1696,15 +1787,23 @@ class NavigationController:
             yaw = wrap_to_pi(yaw + angular * dt)
             x += linear * math.cos(yaw) * dt
             y += linear * math.sin(yaw) * dt
-            if not self.cm.is_static_free_world(x, y):
-                return False
+            static_free = self.cm.is_static_motion_free_world(x, y)
+            static_clearance = self.cm.raw_static_clearance_world(x, y)
+            if not static_free:
+                if (not escaping_static_inflation
+                        or not self.cm.is_static_raw_free_world(x, y)
+                        or not math.isfinite(static_clearance)
+                        or static_clearance + 1e-6
+                        < previous_static_clearance):
+                    return False
             clearance = self.cm.raw_dynamic_clearance_world(x, y)
-            if not self.cm.is_free_world(x, y):
+            if not self.cm.is_dynamic_free_world(x, y):
                 if (not escaping_dynamic_inflation
                         or not math.isfinite(clearance)
                         or clearance <= 0.5 * self.cm.resolution
                         or clearance + 1e-4 < previous_clearance):
                     return False
+            previous_static_clearance = static_clearance
             previous_clearance = clearance
             # The table is fixed and known exactly.  This analytical guard is
             # intentionally independent of the raster costmap so a rounding,
@@ -1719,6 +1818,12 @@ class NavigationController:
                 0.005,
                 max(0.001, 0.10 * abs(linear) * adaptive_horizon))
             if previous_clearance < start_clearance + required_progress:
+                return False
+        if escaping_static_inflation:
+            required_static_progress = max(
+                1e-5, 0.02 * abs(linear) * adaptive_horizon)
+            if (previous_static_clearance
+                    < start_static_clearance + required_static_progress):
                 return False
         return True
 
