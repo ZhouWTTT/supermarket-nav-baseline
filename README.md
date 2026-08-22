@@ -30,8 +30,8 @@ The entry script supports these optional environment variables:
 - `SUPERMARKET_MAX_ATTEMPTS`: attempts per anonymous order, default `2`.
 - `SUPERMARKET_INVENTORY_CONFIRMATIONS`: synchronized observations required
   before reusing a kind-to-ArUco mapping, default `3`.
-- `SUPERMARKET_ORDER_TIMEOUT`: per-order timeout in seconds; `0` disables it
-  and is the default.
+- `SUPERMARKET_ORDER_TIMEOUT`: per-order timeout in seconds, default `300`;
+  `0` disables it.
 - `SUPERMARKET_MATCH_TIMEOUT`: safe match deadline, default `570`.
 - `SUPERMARKET_SHOW=1`: request the optional OpenCV result window.
 
@@ -71,10 +71,9 @@ requires host networking, `ROS_DOMAIN_ID=99`, CycloneDDS, and GPU access.
 
 ## Development checks
 
-The task model has no ROS dependency and can be checked on the host:
+The formal entry script can be checked on the host without ROS:
 
 ```bash
-python3 tests/test_competition_task.py
 bash -n scripts/run_baseline.sh
 ```
 

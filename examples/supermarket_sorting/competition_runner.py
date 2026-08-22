@@ -620,8 +620,15 @@ class CompetitionRunner(Node):
             order is not None
             and order.kind == "zhijin"
             and result.get("no_middle_tissue"))
+        # Keep the worker result schema unchanged.  Infrastructure failures
+        # are carried through the existing free-form error string rather than
+        # adding a new result field that an official consumer may reject.
+        result_error = result.get("error")
+        fatal_match = (
+            isinstance(result_error, str)
+            and result_error.startswith("fatal-match:"))
         finish_max_attempts = (
-            1 if no_middle_tissue else self.args.max_attempts)
+            1 if (no_middle_tissue or fatal_match) else self.args.max_attempts)
 
         if self.task is not None and order is not None:
             if dispatch_order is not None and order.id != dispatch_order.id:
@@ -697,6 +704,11 @@ class CompetitionRunner(Node):
         self.worker_stop_reason = None
         self.worker_terminate_at = None
         self._publish_stop()
+        if fatal_match:
+            self.get_logger().error(
+                "worker reported an infrastructure-level fatal failure; "
+                "ending the match without launching another motion worker")
+            self._finish_match("fatal_worker")
 
     def _resolve_worker_order(self, result: dict):
         """Map a worker's committed class to one eligible pending order."""
@@ -894,8 +906,8 @@ def parse_args() -> argparse.Namespace:
         "--memory-confidence-threshold", type=float, default=0.90,
         help="minimum confidence for normal memory-directed shelf routing")
     parser.add_argument(
-        "--order-timeout", type=float, default=0.0,
-        help="per-order timeout in seconds; 0 disables it")
+        "--order-timeout", type=float, default=300.0,
+        help="per-order timeout in seconds; 0 disables it (default: 300)")
     parser.add_argument("--match-timeout", type=float, default=570.0)
     parser.add_argument(
         "--target-time", type=float, default=400.0,

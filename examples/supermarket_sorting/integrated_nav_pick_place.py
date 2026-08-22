@@ -167,11 +167,24 @@ PRODUCT_HALF_HEIGHT_M = {
 # gripper.  The product drops the remaining 1 cm onto the table, then the arm
 # raises vertically and the chassis backs away horizontally.
 PLACE_PRODUCT_BOTTOM_CLEARANCE_M = 0.010
+# Spheres can roll after even a short free fall.  Lower them to 3 mm above the
+# measured tabletop while boxes retain the original 10 mm clearance.
+PLACE_PRODUCT_BOTTOM_CLEARANCE_BY_KIND_M = {
+    "chengzi": 0.003,
+    "pingguo": 0.003,
+}
 PLACE_APPROACH_CLEARANCE_M = 0.060
 PLACE_DESCENT_SLIDE_STEP_M = 0.0015
 PLACE_BASE_SETTLE_S = 0.35
 PLACE_ARM_SETTLE_TOLERANCE_RAD = 0.025
 PLACE_SLIDE_SETTLE_TOLERANCE_M = 0.004
+# stage0 overhead approach 的 slide 收敛容差。半高表回退后 release_z 目标
+# 比实际低约 6mm，slide 下降时商品底部先触桌被顶住，实测卡位误差 ≈6mm，
+# 4mm 的全局收敛门永远过不了导致 approach 死等 30s（实测 kele 在桌子上方
+# 停留 18s 等待收敛）。approach 只是把 slide 放到 overhead 高度，触桌卡位
+# 6mm 不影响后续 stage1 水平精修（slide 不动）与 stage2 下降（触桌检测
+# 依力矩饱和触发松爪），故单独放宽到 8mm，全局常量保持不变。
+PLACE_APPROACH_SLIDE_TOLERANCE_M = 0.008
 PLACE_XY_REFINE_STEP_M = 0.020
 PLACE_XY_REFINE_SETTLE_S = 0.30
 PLACE_XY_REFINE_TIMEOUT_S = 12.0
@@ -179,6 +192,15 @@ PLACE_XY_COMMAND_MIN_WAIT_S = 0.75
 PLACE_XY_STATIONARY_SETTLE_S = 0.30
 PLACE_XY_STATIONARY_ARM_RAD_S = 0.020
 PLACE_XY_STATIONARY_SLIDE_MPS = 0.005
+# Under a held product the passive slide settles about 6 mm away from its
+# command even though its velocity is effectively zero.  Keep the normal
+# 4 mm command-ready gate above, but let the Cartesian refinement consume a
+# genuinely stationary loaded pose inside this separate safety envelope.
+PLACE_XY_STATIONARY_SLIDE_ERROR_M = 0.012
+# A placement timeout must end by lowering onto the table, never by sweeping a
+# clamped product back through the table edge.  This envelope is only a last
+# resort; normal refinement still targets the 20 mm assigned-slot tolerance.
+PLACE_XY_TIMEOUT_FALLBACK_TOLERANCE_M = 0.080
 PLACE_DESCENT_TIMEOUT_S = 10.0
 PLACE_VERTICAL_CLEARANCE_M = 0.070
 PLACE_VERTICAL_CLEAR_TIMEOUT_S = 5.0
@@ -193,6 +215,14 @@ PLACE_SLIDE_STALL_VEL_MPS = 0.002      # slide 速度低于此值才算"没有�
 PLACE_STALL_CMD_MIN_AGE_S = 2.0        # 命令发出至少这么久才允许判停滞（防起步误判）
 PLACE_CONTACT_BOTTOM_LOW_TOL_M = 0.005     # 商品底部允许低于桌面 5 mm
 PLACE_CONTACT_BOTTOM_HIGH_TOL_M = 0.020    # 商品底部允许高于桌面 20 mm
+# Spheres are deliberately released only 3 mm above the table.  Reusing the
+# 20 mm box tolerance for an emergency/drop decision leaves enough free fall
+# for an orange or apple to bounce and roll, so keep their low-release gate
+# much closer to the surface without slowing the commanded descent.
+PLACE_CONTACT_BOTTOM_HIGH_TOL_BY_KIND_M = {
+    "chengzi": 0.008,
+    "pingguo": 0.008,
+}
 PLACE_CLEAR_TABLE_MARGIN_M = 0.060
 PLACE_CLEAR_TABLE_SPEED_MPS = 0.60
 PLACE_CLEAR_TABLE_TIMEOUT_S = 15.0
@@ -204,6 +234,7 @@ NAV_TRANSIT_GATE_M = 0.10
 NAV_PRECISE_HANDOFF_MARGIN_M = 0.02
 NAV_LASER_STALE_S = 0.50           # fail safe if the 12 Hz scan stops
 NAV_STATE_STALE_S = 0.50           # odom/joints must also remain live
+FEEDBACK_LOSS_HARD_TIMEOUT_S = 10.0
 NAV_PROGRESS_LOG_S = 3.0
 
 # Reusable delivery trunk.  Shelf-specific and slot-specific motion remains
@@ -215,6 +246,8 @@ DELIVERY_TRUNK_REVERSE_GOAL = (
 DELIVERY_TRUNK_CACHE_START_TOLERANCE_M = 0.18
 DELIVERY_TRUNK_CACHE_GOAL_TOLERANCE_M = 0.12
 ROUTE_LEG_PROGRESS_M = 0.10
+ROUTE_LEG_REPLAN_STALL_S = 20.0
+ROUTE_LEG_REPLAN_MAX = 1
 ROUTE_LEG_STALL_TIMEOUT_S = 35.0
 # A leg stuck behind a dynamic box now fails via the widened stall check
 # below (any persistent stop reason).  This hard timeout is only the final
@@ -233,9 +266,22 @@ BACKUP_TIMEOUT_S = 8.0
 # navigator limits.
 POST_GRAB_SLOW_TURN_WATCHDOG_GRACE_S = 10.0
 HEWEIDAO_LOADED_TURN_MAX_RPS = 0.35
+# Product-specific loaded transit limits.  These are not blanket navigation
+# slowdowns: they apply only after a successful grasp and before delivery.
+# Kouxiangtang slipped in two independent runs exactly as the route requested
+# 1.0--2.0 rad/s turns; limiting yaw removes that lateral impulse while the
+# 0.75 m/s straight cap keeps the match-time cost modest.
+LOADED_TRANSPORT_LIMITS = {
+    "kouxiangtang": (0.75, 0.35),
+    "heweidao": (None, HEWEIDAO_LOADED_TURN_MAX_RPS),
+    "chengzi": (0.80, 0.55),
+    "pingguo": (0.80, 0.55),
+}
 TRANSIT_SLIDE_TARGET_M = 0.006
 TRANSIT_SLIDE_TOLERANCE_M = 0.010
 TRANSIT_SLIDE_TIMEOUT_S = 8.0
+TRANSIT_SLIDE_HARD_TIMEOUT_S = 12.0
+TRANSIT_SLIDE_DEGRADED_MAX_ERROR_M = 0.050
 # Gripper commands use 1.0=open and 0.0=fully closed.  Add holding preload
 # only after the arm has withdrawn from the shelf, so capture stability/empty
 # grasp checks remain unchanged.  This moves sandwich 0.16 -> 0.12; generic
@@ -258,6 +304,14 @@ TRANSPORT_DROP_FAILURE_SETTLE_S = 0.15
 # at the nominal endpoint.
 PLACE_CREEP_DISTANCE_M = 0.25
 PLACE_CREEP_SPEED_MPS = 0.50
+# The final 25 cm is driven while the product is extended over the tabletop.
+# Reduce only that short segment for weak lateral and spherical grasps; the
+# route to the table retains the limits above.
+PLACE_CREEP_SPEED_BY_KIND_MPS = {
+    "kouxiangtang": 0.25,
+    "chengzi": 0.20,
+    "pingguo": 0.20,
+}
 PLACE_CREEP_FRONT_STOP_M = 0.25
 # Preserve the successful longitudinal arm reach measured on the deepest
 # slot, but do not drive the same 0.25 m for outer slots that are substantially
@@ -272,6 +326,26 @@ PLACE_CREEP_MAX_ANGULAR_RPS = 0.30
 # shocked loose.  Empty-arm recovery after release keeps the normal speed.
 PLACE_LOADED_ARM_MAX_STEP_RAD = 0.006
 PLACE_LOADED_ARM_STEP_RAMP_RAD = 0.00025
+# Round products can remain secure for long chassis transit yet slip when a
+# large multi-joint placement reconfiguration accelerates the fingers.  Give
+# spheres a product-specific quarter-speed cap; correctness is worth the
+# roughly 15--20 s controlled move and other products keep the faster rate.
+PLACE_LOADED_ARM_MAX_STEP_BY_KIND_RAD = {
+    "chengzi": 0.0030,
+    "pingguo": 0.0030,
+}
+PLACE_LOADED_ARM_STEP_RAMP_BY_KIND_RAD = {
+    "chengzi": 0.00010,
+    "pingguo": 0.00010,
+}
+# The capture gate remains deliberately strict while lifting from the shelf.
+# After that capture has been verified, a sphere can settle deeper between the
+# fingers during a long route without being empty.  Reserve transport-drop
+# recovery for feedback close to the empty-gripper position.
+SPHERE_TRANSPORT_HELD_MINIMUM = {
+    "chengzi": 0.30,
+    "pingguo": 0.30,
+}
 PLACE_RELEASE_TABLE_MARGIN_M = 0.04
 PLACE_APPROACH_HARD_TIMEOUT_S = 30.0
 PLACE_APPROACH_PROGRESS_LOG_S = 2.0
@@ -332,8 +406,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
       "return_to_west"  — after the first delivery, navigate back to shelf A.
       "return_west_scan" — hold at A and record all shelf camera views.
       "return_west_recover" — restore the neutral transit posture.
-      "drop_success_recover" — product fell above table; recover and clear it.
-      "drop_failed_recover" — product fell in transit; recover before retry.
+      "drop_success_recover" — low slot release detected; clear vertically.
+      "drop_failed_recover" — premature product loss; recover before retry.
       "drop_failed"     — terminal failed attempt awaiting worker shutdown.
       "done"            — flow finished.
     """
@@ -383,6 +457,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.drop_event = None
         self.terminal_error = None
         self._fatal_error = None
+        self._fatal_match = False
         self._fatal_recovery_started_at = 0.0
         self._startup_posture_recovered = False
 
@@ -421,6 +496,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._route_leg_started_at = 0.0
         self._route_leg_last_progress_at = 0.0
         self._route_leg_best_distance = float("inf")
+        self._route_leg_replans = 0
         self.delivery_nav_stage = None
         self.delivery_direct_fallback_used = False
         self.scan_trunk_route_stage = None
@@ -438,6 +514,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_ik_reference_joints = None
         self._place_ik_attempted = False
         self._place_arm_target_sent = False
+        self._place_slide_target_sent = False
         self._place_base_settle_started_at = None
         self._place_base_reference_xy = None
         self._place_base_reference_yaw = None
@@ -467,16 +544,22 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._backup_t0 = 0.0
         self._backup_logged = False
         self._height_restore_t0 = 0.0
+        self._height_restore_monotonic_t0 = 0.0
         self._height_restore_timeout_logged = False
         self._transport_grip_command = None
         self._drop_monitor_armed_at = None
         self._drop_signature_since = None
         self._drop_candidate_reference_world = None
         self._drop_recovery_started_at = 0.0
+        self._drop_recovery_vertical_clear = False
+        self._drop_recovery_vertical_clear_started_at = 0.0
         self._flow_done_logged = False
         self._table_escape_logged = False
         self._laser_warn_log = 0.0
         self._state_warn_log = 0.0
+        self._feedback_stale_since = None
+        self._feedback_warn_monotonic = 0.0
+        self._feedback_timeout_triggered = False
         self.return_scan_pose_index = 0
         self.return_scan_pose_started_at = 0.0
         self.return_scan_camera_ready_since = None
@@ -540,9 +623,35 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             and self._heweidao_loaded_turn_limit_active()
             and self.now() < until)
 
+    def _loaded_transport_limits(
+            self) -> tuple[float | None, float | None]:
+        """Return product-specific velocity caps while carrying to table."""
+        if getattr(self, "flow_phase", None) not in {
+                "backup", "restore_height", "nav_to_delivery"}:
+            return None, None
+        return LOADED_TRANSPORT_LIMITS.get(
+            getattr(self, "target_kind", None), (None, None))
+
     def set_twist(self, linear: float, angular: float) -> None:
-        """Apply normal limits plus the heweidao loaded-delivery turn cap."""
+        """Apply normal limits plus product-specific loaded transit caps."""
+        requested_linear = float(linear)
         requested_angular = float(angular)
+        linear_cap, angular_cap = self._loaded_transport_limits()
+        if linear_cap is not None:
+            linear = float(np.clip(
+                requested_linear, -linear_cap, linear_cap))
+        if angular_cap is not None:
+            angular = float(np.clip(
+                requested_angular, -angular_cap, angular_cap))
+        if ((abs(float(linear) - requested_linear) > 1e-9
+             or abs(float(angular) - requested_angular) > 1e-9)
+                and not getattr(self, "_loaded_motion_limit_logged", False)):
+            self._loaded_motion_limit_logged = True
+            self.get_logger().info(
+                "[loaded-motion] limiting carried product motion "
+                f"kind={self.target_kind} "
+                f"v={requested_linear:.2f}->{float(linear):.2f}m/s "
+                f"w={requested_angular:.2f}->{float(angular):.2f}rad/s")
         if self._post_grab_slow_turn_active():
             angular = float(np.clip(
                 requested_angular,
@@ -836,6 +945,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._route_leg_last_progress_at = now
         self._route_leg_best_distance = float(np.linalg.norm(
             np.asarray(goal[:2], dtype=float) - self.base_xy))
+        self._route_leg_replans = 0
         self._nav_last_log = 0.0
         self._last_nav_reason = None
         self._nav_memory_logged = False
@@ -918,6 +1028,16 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             stop_reason.startswith("no_path")
             or stop_reason.startswith("stuck_no_path"))
         recovery_exhausted = self.nav.recovery_exhausted()
+        # A loaded product can legitimately need more than 20 s to complete a
+        # large initial heading change because set_twist() caps its angular
+        # speed.  The goal distance is constant during that manoeuvre, but the
+        # robot is not stalled.  Keep the replan budget for an actual obstacle
+        # stop later in the route.
+        active_heading_alignment = (
+            stop_reason == "heading_alignment" and abs(float(w)) >= 0.05)
+        if active_heading_alignment:
+            self._route_leg_last_progress_at = now
+            stalled = 0.0
         # A leg can stall behind a dynamic box with stop_reason
         # lidar_stop/arc_blocked/rotation_loop while the planner still finds
         # a path (so no_path is False and recovery may not be exhausted).
@@ -925,7 +1045,30 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         # ROUTE_LEG_STALL_TIMEOUT_S without 0.10 m of progress the leg fails
         # and the caller can fall back instead of waiting out a 150 s ceiling.
         persistent_stop = (
-            no_path or recovery_exhausted or stop_reason is not None)
+            not active_heading_alignment
+            and (no_path or recovery_exhausted or stop_reason is not None))
+        if (stalled >= ROUTE_LEG_REPLAN_STALL_S
+                and persistent_stop
+                and self._route_leg_replans < ROUTE_LEG_REPLAN_MAX):
+            self._route_leg_replans += 1
+            self.nav.invalidate_active_cached_path(
+                f"route_leg:{self._route_leg_name}:live_replan", now=now)
+            # Replan from the measured pose against the current lidar map.
+            # Do not reload the same cached route that led into the stop.
+            self.nav.set_goal(
+                *self._route_leg_goal,
+                use_path_memory=False,
+                lock_cached_path=False)
+            self._route_leg_last_progress_at = now
+            self._route_leg_best_distance = distance
+            self._nav_memory_logged = False
+            self._last_nav_reason = None
+            self.get_logger().warn(
+                f"[route:{self._route_leg_name}] no progress for "
+                f"{stalled:.1f}s with stop_reason={stop_reason}; "
+                f"forcing live replan {self._route_leg_replans}/"
+                f"{ROUTE_LEG_REPLAN_MAX}")
+            return False, None
         failure = None
         if elapsed >= ROUTE_LEG_HARD_TIMEOUT_S:
             failure = (
@@ -1003,7 +1146,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
     # ------------------------------------------------------------------
     def drive_to(self, target_xy, final_yaw: float,
                  position_tolerance: float = 0.055,
-                 linear_min_mps: float | None = None) -> bool:
+                 linear_min_mps: float | None = None,
+                 linear_gain: float = pick.NAV_LINEAR_GAIN,
+                 rotate_gate_rad: float = pick.NAV_ROTATE_GATE_RAD,
+                 translate_angular_max_rps: float = (
+                     pick.NAV_TRANSLATE_ANGULAR_MAX_RADPS)) -> bool:
         target = np.asarray(target_xy, dtype=float)
         distance = float(np.linalg.norm(target - self.base_xy))
 
@@ -1129,7 +1276,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
         arrived = super().drive_to(
             target_xy, final_yaw, position_tolerance,
-            linear_min_mps=linear_min_mps)
+            linear_min_mps=linear_min_mps,
+            linear_gain=linear_gain,
+            rotate_gate_rad=rotate_gate_rad,
+            translate_angular_max_rps=translate_angular_max_rps)
         if arrived:
             self.cmd_linear = 0.0
             self.cmd_angular = 0.0
@@ -1147,6 +1297,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             grabbed_at + POST_GRAB_SLOW_TURN_WATCHDOG_GRACE_S
             if self.target_kind == "heweidao" else 0.0)
         self._post_grab_slow_turn_logged = False
+        self._loaded_motion_limit_logged = False
         if not self._memory_consumed:
             slot = self.target_slot()
             if slot is not None:
@@ -1195,6 +1346,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
     def _start_height_restore(self) -> None:
         self._set_flow_phase("restore_height")
         self._height_restore_t0 = self.now()
+        self._height_restore_monotonic_t0 = time.monotonic()
         self._height_restore_timeout_logged = False
         self.des_slide = self._transit_slide_target()
         self.set_twist(0.0, 0.0)
@@ -1205,6 +1357,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
     def _restore_height_tick(self) -> None:
         now = self.now()
+        elapsed = max(
+            0.0, time.monotonic() - self._height_restore_monotonic_t0)
         target_slide = self._transit_slide_target()
         self.set_twist(0.0, 0.0)
         self.des_slide = target_slide
@@ -1219,14 +1373,39 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 self._start_delivery_navigation()
                 return
         if (not self._height_restore_timeout_logged
-                and now - self._height_restore_t0
-                >= TRANSIT_SLIDE_TIMEOUT_S):
+                and elapsed >= TRANSIT_SLIDE_TIMEOUT_S):
             self._height_restore_timeout_logged = True
             self.get_logger().warn(
                 f"[flow] post-grasp transit slide restore timed out after "
                 f"{TRANSIT_SLIDE_TIMEOUT_S:.1f}s "
                 f"(measured={measured_slide}, target={target_slide:.3f}); "
-                "remaining stopped and holding the target")
+                "remaining stopped through the hard safety ceiling")
+        if elapsed < TRANSIT_SLIDE_HARD_TIMEOUT_S:
+            return
+
+        measured_finite = False
+        error = float("inf")
+        try:
+            measured = float(measured_slide)
+            measured_finite = math.isfinite(measured)
+            if measured_finite:
+                error = abs(measured - target_slide)
+        except (TypeError, ValueError):
+            measured = float("nan")
+        if (measured_finite
+                and error <= TRANSIT_SLIDE_DEGRADED_MAX_ERROR_M):
+            self.get_logger().warn(
+                "[flow] transit slide missed the normal tolerance but is "
+                f"inside the degraded safety envelope after {elapsed:.1f}s "
+                f"(measured={measured:.3f}, error={error:.3f}m); "
+                "continuing delivery navigation")
+            self._start_delivery_navigation()
+            return
+
+        self._enter_fatal_recovery(RuntimeError(
+            "post-grasp transit slide remained outside the safe envelope "
+            f"for {elapsed:.1f}s (measured={measured_slide}, "
+            f"target={target_slide:.3f}, error={error:.3f}m)"))
 
     def _start_delivery_navigation(self) -> None:
         self._set_flow_phase("nav_to_delivery")
@@ -1610,7 +1789,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         if measured is None:
             return False, {"mode": "single", "feedback": "missing"}
         if self.use_sphere_grasp:
-            threshold = float(self.sphere_capture_minimum())
+            threshold = float(SPHERE_TRANSPORT_HELD_MINIMUM.get(
+                self.target_kind, self.sphere_capture_minimum()))
             return (
                 measured <= threshold,
                 {
@@ -1632,14 +1812,15 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             })
 
     def _start_transport_drop_recovery(
-            self, now: float, *, over_table: bool, details: dict,
+            self, now: float, *, delivered: bool, over_table: bool,
+            details: dict,
             reference: np.ndarray | None = None) -> None:
         """Stop motion and recover posture after a confirmed product loss."""
         if reference is None:
             reference = self._held_product_reference_world()
         reference_list = self._rounded_list(reference)
         self.drop_event = {
-            "outcome": "delivered_above_table" if over_table else "retry",
+            "outcome": "delivered_above_table" if delivered else "retry",
             "phase": self.flow_phase,
             "place_stage": int(self.place_stage),
             "product_reference_world": reference_list,
@@ -1649,7 +1830,38 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.set_twist(0.0, 0.0)
         self.cmd_linear = 0.0
         self.cmd_angular = 0.0
-        self._command_initial_arm_posture()
+        # If the item has just fallen onto the table, immediately sweeping the
+        # wrist toward the compact posture can hit it before it settles.  Lock
+        # both measured arms and raise only the common slide first; neutral arm
+        # recovery begins in _drop_recovery_tick after vertical clearance.
+        self._drop_recovery_vertical_clear = bool(over_table)
+        self._drop_recovery_vertical_clear_started_at = now
+        if self._drop_recovery_vertical_clear:
+            measured_slide = self.joints.get("slide_joint")
+            measured_left = self.arm_positions("left")
+            measured_right = self.arm_positions("right")
+            if (measured_slide is not None
+                    and math.isfinite(float(measured_slide))
+                    and np.all(np.isfinite(measured_left))
+                    and np.all(np.isfinite(measured_right))):
+                self.des_left_arm = measured_left.copy()
+                self.des_right_arm = measured_right.copy()
+                self.des_left_grip = pick.GRIP_OPEN
+                self.des_right_grip = pick.GRIP_OPEN
+                self.des_slide = max(
+                    pick.SLIDE_MIN,
+                    float(measured_slide) - PLACE_VERTICAL_CLEARANCE_M)
+                self.commands_ready_since = None
+                self.get_logger().warn(
+                    "[drop-monitor] product loss occurred over the table; "
+                    "raising the empty wrists vertically before neutral "
+                    f"recovery slide={float(measured_slide):.3f}->"
+                    f"{self.des_slide:.3f}")
+            else:
+                self._drop_recovery_vertical_clear = False
+                self._command_initial_arm_posture()
+        else:
+            self._command_initial_arm_posture()
         self.commands_ready_since = None
         self._drop_recovery_started_at = now
         self._drop_signature_since = None
@@ -1657,24 +1869,25 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
         event_json = json.dumps(
             self.drop_event, ensure_ascii=False, separators=(",", ":"))
-        if over_table:
+        if delivered:
             # Delivery is irreversible at this point.  Mark it immediately so
             # a later posture/return-scan fault cannot schedule a duplicate.
             self.delivery_completed_by_drop = True
             self.placement_completed = True
             self.get_logger().info(
-                "[drop-monitor] product released above delivery table; "
-                "counting order as delivered and skipping remaining loaded "
-                f"placement stages event={event_json}")
+                "[drop-monitor] product released at the assigned low table "
+                "pose; counting order as delivered and skipping remaining "
+                f"loaded placement stages event={event_json}")
             self._set_flow_phase("drop_success_recover")
             return
 
         self.terminal_error = (
-            "product dropped during transport; retry this order "
-            f"event={event_json}")
+            "product dropped before verified low table release; retry this "
+            f"order event={event_json}")
         self.get_logger().error(
-            "[drop-monitor] product lost outside delivery table; stopping "
-            f"worker for same-order retry event={event_json}")
+            "[drop-monitor] product loss did not satisfy the assigned-slot "
+            "low-release gate; stopping worker for same-order retry "
+            f"event={event_json}")
         self._set_flow_phase("drop_failed_recover")
 
     def _monitor_held_product(self, now: float) -> bool:
@@ -1722,12 +1935,22 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             return True
 
         reference = self._drop_candidate_reference_world
-        # 交付判定用官方裁判框（无边距）：产品掉落时手腕只要在物理桌面上方
-        # 即按“桌面上方掉落=交付”，与正式计分口径一致，避免桌缘内 4 cm 内
-        # 的真实桌内落点被误判为桌外而白白重试。
+        # A high wrist above the official box is not proof of a stable table
+        # placement: the orange run lost its grip about 147 mm above the table
+        # and could still bounce or roll off.  Accept an uncommanded release
+        # only during the vertical-descent stage, inside the conservative
+        # table inset and assigned slot, with the estimated product bottom at
+        # table height.  Keep the official rectangle separately so every
+        # over-table loss receives a vertical-first arm recovery.
         over_table = self._tcp_over_delivery_table_official(reference)
+        delivered = bool(
+            self.flow_phase == "place"
+            and self.place_stage == 2
+            and self._tcp_over_delivery_table(reference)
+            and self._tcp_at_assigned_slot(reference)
+            and self._product_bottom_at_table(reference))
         self._start_transport_drop_recovery(
-            now, over_table=over_table, details=details,
+            now, delivered=delivered, over_table=over_table, details=details,
             reference=reference)
         return True
 
@@ -1736,6 +1959,29 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.set_twist(0.0, 0.0)
         self.cmd_linear = 0.0
         self.cmd_angular = 0.0
+        if self._drop_recovery_vertical_clear:
+            self.des_left_grip = pick.GRIP_OPEN
+            self.des_right_grip = pick.GRIP_OPEN
+            ready = self.dual_commands_ready(
+                arm_tolerance=0.05, slide_tolerance=0.020)
+            timed_out = (
+                now - self._drop_recovery_vertical_clear_started_at
+                >= PLACE_VERTICAL_CLEAR_TIMEOUT_S)
+            if not ready and not timed_out:
+                return
+            if timed_out:
+                self.get_logger().warn(
+                    "[drop-monitor] vertical wrist clearance did not fully "
+                    f"settle within {PLACE_VERTICAL_CLEAR_TIMEOUT_S:.1f}s; "
+                    "continuing neutral recovery from the raised command")
+            else:
+                self.get_logger().info(
+                    "[drop-monitor] vertical wrist clearance reached; "
+                    "neutral arm recovery may begin")
+            self._drop_recovery_vertical_clear = False
+            self._drop_recovery_started_at = now
+            self._command_initial_arm_posture()
+            return
         self._command_initial_arm_posture()
         ready = (
             self.dual_commands_ready(
@@ -1830,6 +2076,92 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         kills it on timeout.  Catch it here, restore the posture and shut the
         worker down cleanly with the error reported to the runner.
         """
+        # A descent-stage timeout at an already verified low slot is a release
+        # condition, not a reason to open and retract simultaneously.  Reuse
+        # the normal in-place release state so the loaded arm remains fixed
+        # through the full gripper dwell.  If the exception happened after the
+        # release state had already begun, use the same vertical-first recovery
+        # as a confirmed low drop before any neutral arm motion.
+        if (self._transport_grip_command is not None
+                and self.flow_phase == "place"
+                and self.place_stage in {2, 3}
+                and not self.placement_completed
+                and not self.delivery_completed_by_drop):
+            now = self.now()
+            reference = self._held_product_reference_world()
+            verified_low_slot = bool(
+                self._tcp_over_delivery_table(reference)
+                and self._tcp_at_assigned_slot(reference)
+                and self._product_bottom_at_table(reference))
+            if verified_low_slot:
+                if self.place_stage == 2:
+                    self.get_logger().warn(
+                        "[place-recovery] descent failed after the product "
+                        "reached its verified low slot; stopping the slide "
+                        "and entering the normal fixed-arm release dwell "
+                        f"(cause={type(exc).__name__}: {exc})")
+                    self._place_contact_release(now, reference)
+                else:
+                    details = {
+                        "mode": "fatal_recovery",
+                        "reason": "exception_during_verified_release",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    self.get_logger().warn(
+                        "[place-recovery] release-stage error at a verified "
+                        "low slot; clearing the open wrists vertically before "
+                        f"neutral recovery (cause={type(exc).__name__}: {exc})")
+                    self._start_transport_drop_recovery(
+                        now, delivered=True, over_table=True,
+                        details=details, reference=reference)
+                return
+
+        # Once a loaded wrist is already safely above its assigned table area,
+        # retracting toward the neutral pose can drag or sweep the product over
+        # the table edge.  Convert any stage-0/1 placement failure into the
+        # normal vertical descent instead.  The measured arm pose is frozen,
+        # the common slide lowers the product, and the existing contact/release
+        # gates complete the placement.  Off-table failures still use the
+        # conservative clamped recovery below.
+        if (self._transport_grip_command is not None
+                and self.flow_phase == "place"
+                and self.place_stage in {0, 1}
+                and not self.placement_completed
+                and not self.delivery_completed_by_drop):
+            now = self.now()
+            reference = (
+                self._dual_release_world()
+                if self.use_dual_tissue_grasp
+                else self.selected_tcp_world())
+            release_geometry_ready = (
+                self.use_dual_tissue_grasp
+                or self.place_release_world is not None)
+            if (release_geometry_ready
+                    and self._place_timeout_fallback_safe(reference)):
+                error_xy = (
+                    np.asarray(reference, dtype=float)[:2]
+                    - self.place_world[:2])
+                self.get_logger().warn(
+                    "[place-recovery] loaded placement error occurred over "
+                    "the table; locking the measured arm pose and descending "
+                    "in place instead of retracting with the product "
+                    f"(stage={self.place_stage} "
+                    f"slot_error={np.linalg.norm(error_xy):.3f}m "
+                    f"cause={type(exc).__name__}: {exc})")
+                try:
+                    if self.use_dual_tissue_grasp:
+                        self._begin_dual_place_descent(now, reference)
+                    else:
+                        self._begin_single_place_descent(now, reference)
+                    return
+                except Exception as fallback_exc:  # noqa: BLE001
+                    self.get_logger().error(
+                        "[place-recovery] vertical fallback could not start; "
+                        "continuing to the clamped fatal recovery: "
+                        f"{type(fallback_exc).__name__}: {fallback_exc}")
+                    exc = RuntimeError(
+                        f"{exc}; vertical fallback failed: {fallback_exc}")
+
         if self._fatal_error is None:
             self._fatal_error = f"{type(exc).__name__}: {exc}"
             self._fatal_recovery_started_at = self.now()
@@ -1837,38 +2169,6 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 f"[fatal] phase={self.flow_phase} state={self.state} "
                 f"place_stage={self.place_stage}: {self._fatal_error}; "
                 "recovering posture before exit")
-            # A wrist being somewhere above the official table rectangle is
-            # not proof that the product has been placed.  Only preserve a
-            # delivery result when the same measured slot and product-bottom
-            # checks used by the normal release path are satisfied.
-            if (self._transport_grip_command is not None
-                    and self.flow_phase == "place"
-                    and self.place_stage in {2, 3}
-                    and not self.placement_completed
-                    and not self.delivery_completed_by_drop):
-                reference = self._held_product_reference_world()
-                if (self._tcp_over_delivery_table(reference)
-                        and self._tcp_at_assigned_slot(reference)
-                        and self._product_bottom_at_table(reference)):
-                    self.delivery_completed_by_drop = True
-                    self.placement_completed = True
-                    self.drop_event = {
-                        "outcome": "delivered_above_table",
-                        "phase": self.flow_phase,
-                        "place_stage": int(self.place_stage),
-                        "product_reference_world": self._rounded_list(
-                            reference),
-                        "over_delivery_table": True,
-                        "reason": "fatal_recovery_at_verified_release_pose",
-                        "error": self._fatal_error,
-                    }
-                    event_json = json.dumps(
-                        self.drop_event, ensure_ascii=False,
-                        separators=(",", ":"))
-                    self.get_logger().info(
-                        "[fatal] release geometry was already verified; "
-                        f"counting the controlled recovery release as "
-                        f"delivered event={event_json}")
             self._command_fatal_recovery_posture()
             self.set_twist(0.0, 0.0)
             self.cmd_linear = 0.0
@@ -1968,17 +2268,20 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         -- rather than the wrist -- receives the configured table clearance.
         """
         half_height = PRODUCT_HALF_HEIGHT_M[self.target_kind]
+        bottom_clearance = PLACE_PRODUCT_BOTTOM_CLEARANCE_BY_KIND_M.get(
+            self.target_kind, PLACE_PRODUCT_BOTTOM_CLEARANCE_M)
         return (
             DELIVERY_TABLE_TOP_Z_M
             + half_height
-            + PLACE_PRODUCT_BOTTOM_CLEARANCE_M
+            + bottom_clearance
             + self._tcp_above_product_center())
 
     def _product_bottom_at_table(self, tcp: np.ndarray | None) -> bool:
         """True when the held product's bottom is at/near the table surface.
 
         商品底部世界 z = TCP z − 抓取时 TCP 高出商品中心的高度 − 商品半高。
-        判定带 [桌面−5mm, 桌面+20mm] 同时覆盖两条路径：
+        盒装/长商品使用 [桌面−5mm, 桌面+20mm]，球形商品把上界收紧到
+        +8mm，避免应急释放仍产生足以反弹滚动的自由落差。判定覆盖两条路径：
         * 正常到位：商品底部悬空 10mm（PLACE_PRODUCT_BOTTOM_CLEARANCE_M）；
         * 触桌接触：长商品/夹持偏低导致商品底部先碰桌面、slide 被顶住，
           TCP 高于标称 release_z，但商品底部已在桌面。
@@ -1992,10 +2295,12 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             float(tcp[2])
             - self._tcp_above_product_center()
             - half_height)
+        high_tolerance = PLACE_CONTACT_BOTTOM_HIGH_TOL_BY_KIND_M.get(
+            self.target_kind, PLACE_CONTACT_BOTTOM_HIGH_TOL_M)
         return (
             DELIVERY_TABLE_TOP_Z_M - PLACE_CONTACT_BOTTOM_LOW_TOL_M
             <= bottom_z
-            <= DELIVERY_TABLE_TOP_Z_M + PLACE_CONTACT_BOTTOM_HIGH_TOL_M)
+            <= DELIVERY_TABLE_TOP_Z_M + high_tolerance)
 
     def _place_slide_stalled(self, now: float) -> bool:
         """True once the slide is physically blocked while commanded to move.
@@ -2044,26 +2349,60 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self._place_slide_stall_snapshot = (now, error)
             return False
         if now - start_time >= PLACE_CONTACT_STALL_S:
-            return True
+            reference = self._held_product_reference_world()
+            verified_table_contact = bool(
+                self._place_timeout_fallback_safe(reference)
+                and self._product_bottom_at_table(reference))
+            if verified_table_contact:
+                return True
+            # High effort can also mean that an arm link or gripper body hit
+            # the table edge while the product itself is still high.  Never
+            # turn that collision into an intentional high drop.  Keep the
+            # grip closed and let the bounded stage timeout select the safe
+            # vertical/fatal recovery path instead.
+            if now - self._place_stall_warn_log >= 1.0:
+                self._place_stall_warn_log = now
+                self.get_logger().warn(
+                    "[place] slide stall rejected: product contact geometry "
+                    "is not verified; keeping grip closed "
+                    f"reference={self._rounded_list(reference)} "
+                    f"table={int(self._tcp_over_delivery_table(reference))} "
+                    f"slot={int(self._tcp_at_assigned_slot(reference))} "
+                    f"fallback_safe="
+                    f"{int(self._place_timeout_fallback_safe(reference))} "
+                    f"bottom={int(self._product_bottom_at_table(reference))}")
+            return False
         return False
 
     def _place_contact_release(self, now: float, tcp: np.ndarray | None) -> None:
         """Stop the descent and release in place once goods touch the table.
 
-        把 des_slide 收回当前反馈值（停止下压，避免继续顶压商品/电机堵转），
-        直接进入 stage 3 的就地释放流程；松爪后商品留在桌面即完成放置。
-        tcp 仅用于日志，可能为 None（双臂流程或反馈缺失时）。
+        把 arm 和 des_slide 都锁回当前反馈值：停止下压，也停止尚未完全收敛
+        的横向臂运动，避免松爪期间继续推商品。随后进入 stage 3 的原地释放
+        流程；tcp 仅用于日志，可能为 None（双臂流程或反馈缺失时）。
         """
         measured_slide = self.joints.get("slide_joint")
         if measured_slide is not None and math.isfinite(float(measured_slide)):
             self.des_slide = float(measured_slide)
+        if self.use_dual_tissue_grasp:
+            measured_left = self.arm_positions("left")
+            measured_right = self.arm_positions("right")
+            if (np.all(np.isfinite(measured_left))
+                    and np.all(np.isfinite(measured_right))):
+                self.des_left_arm = measured_left.copy()
+                self.des_right_arm = measured_right.copy()
+        else:
+            measured_arm = self.selected_arm_positions()
+            if np.all(np.isfinite(measured_arm)):
+                self.place_arm_joints = measured_arm.copy()
+                self.set_selected_arm_target(measured_arm)
         self.commands_ready_since = None
         self.place_stage = 3
         self.place_t0 = now
         self._place_release_started_at = now
         self._place_slide_stall_snapshot = None
         self.get_logger().warn(
-            "[place] slide physically blocked (goods touching table); "
+            "[place] verified low table release; locking the measured arms, "
             "stopping descent and releasing in place tcp="
             f"{None if tcp is None else np.round(tcp, 3)}")
 
@@ -2284,7 +2623,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             PLACE_CREEP_MAX_ANGULAR_RPS))
         # Pause translation if odometry shows an unexpectedly large yaw error;
         # correct it first so a nominally southward creep cannot cut sideways.
-        linear = PLACE_CREEP_SPEED_MPS if abs(yaw_err) <= 0.10 else 0.0
+        creep_speed = PLACE_CREEP_SPEED_BY_KIND_MPS.get(
+            self.target_kind, PLACE_CREEP_SPEED_MPS)
+        linear = creep_speed if abs(yaw_err) <= 0.10 else 0.0
         self.set_twist(linear, angular)
         return False
 
@@ -2306,14 +2647,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         official referee ``delivery_box`` (referee.py), which has NO inset
         margin: x ∈ [-2.42, -1.46], y ∈ [-3.63, -3.19].
 
-        Z is intentionally left unconstrained: the drop reference height is
-        the wrist pose at the moment of loss, not the settled goods height,
-        so mirroring the referee's z range would reintroduce false
-        "outside table" classifications for drops from the transport height.
-        The drop-monitor uses this box so a product lost with the wrist over
-        the physical tabletop counts as delivered, matching the official
-        scoring zone; the placement-flow verifications keep the conservative
-        ``PLACE_RELEASE_TABLE_MARGIN_M`` inset.
+        Z is intentionally left unconstrained because this helper is used only
+        to decide whether an empty wrist must clear vertically before neutral
+        recovery.  Delivery still requires the conservative inset, assigned
+        slot and low product-bottom checks in ``_monitor_held_product``.
         """
         if tcp is None or np.asarray(tcp).shape != (3,):
             return False
@@ -2402,7 +2739,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             and abs(float(slide_velocity))
             <= PLACE_XY_STATIONARY_SLIDE_MPS
             and abs(float(measured_slide) - self.des_slide)
-            <= PLACE_SLIDE_SETTLE_TOLERANCE_M)
+            <= PLACE_XY_STATIONARY_SLIDE_ERROR_M)
         if not stationary:
             self._place_refine_motion_stable_since = None
             return False
@@ -2416,9 +2753,25 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.get_logger().warn(
             "[place] refine actuator stationary with residual joint error; "
             "continuing Cartesian correction from measured TCP "
-            f"(dual={int(dual)} residual={residual:.4f}rad)")
+            f"(dual={int(dual)} residual={residual:.4f}rad "
+            f"slide_error="
+            f"{abs(float(measured_slide) - self.des_slide):.4f}m)")
         self._place_refine_motion_stable_since = None
         return True
+
+    def _place_timeout_fallback_safe(
+            self, reference: np.ndarray | None) -> bool:
+        """Whether a loaded pose may descend in place after refinement fails."""
+        if reference is None or np.asarray(reference).shape != (3,):
+            return False
+        reference = np.asarray(reference, dtype=float)
+        if not np.all(np.isfinite(reference)):
+            return False
+        error_xy = reference[:2] - self.place_world[:2]
+        return bool(
+            self._tcp_over_delivery_table(reference)
+            and np.linalg.norm(error_xy)
+            <= PLACE_XY_TIMEOUT_FALLBACK_TOLERANCE_M)
 
     def _place_base_diagnostic(self) -> dict:
         """Report odometry displacement while the physical base is held."""
@@ -2510,6 +2863,40 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             f"with measured arm pose locked, tcp={np.round(tcp, 3)} "
             f"slide={float(measured_slide):.3f}->{target_slide:.3f}")
 
+    def _begin_dual_place_descent(
+            self, now: float, release_world: np.ndarray) -> None:
+        """Lock both loaded arms and lower tissue with the common slide."""
+        measured_slide = self.joints.get("slide_joint")
+        if measured_slide is None:
+            raise RuntimeError("slide feedback unavailable before dual descent")
+        target_z = self._product_release_z()
+        target_slide = float(measured_slide) + (
+            float(release_world[2]) - target_z)
+        if not pick.SLIDE_MIN <= target_slide <= pick.SLIDE_MAX:
+            raise RuntimeError(
+                "dual-arm safe release is outside slide range: "
+                f"target={target_slide:.3f}")
+        measured_left = self.arm_positions("left")
+        measured_right = self.arm_positions("right")
+        if (not np.all(np.isfinite(measured_left))
+                or not np.all(np.isfinite(measured_right))):
+            raise RuntimeError(
+                "dual-arm feedback unavailable before descent")
+        self.dual_release_slide_cmd = target_slide
+        self.des_left_arm = measured_left.copy()
+        self.des_right_arm = measured_right.copy()
+        self.des_slide = target_slide
+        self.commands_ready_since = None
+        self._place_slide_stall_snapshot = None
+        self._dual_descent_sent = True
+        self.place_stage = 2
+        self.place_t0 = now
+        self.get_logger().info(
+            f"[place-dual] horizontal target settled; descending "
+            "vertically with measured arm poses locked "
+            f"centre={np.round(release_world, 3)} "
+            f"slide={float(measured_slide):.3f}->{target_slide:.3f}")
+
     def _start_place_vertical_clear(self, now: float) -> None:
         """Raise vertically after release before arm or chassis retreat."""
         measured_slide = self.joints.get("slide_joint")
@@ -2572,17 +2959,28 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     # commands_ready_since, so calling it every tick would
                     # prevent the settling gate from ever passing.
                     self.set_selected_arm_target(self.place_arm_joints)
-                    if self.place_slide_cmd is not None:
-                        self.des_slide = self.place_slide_cmd
+                    # Keep the carried product high while the loaded arm
+                    # changes IK branches.  Moving the arm and lowering the
+                    # slide together can make the intermediate TCP path dip
+                    # below the tabletop even though both endpoints are safe
+                    # (observed with a lower-shelf orange).  Once the arm is
+                    # pre-positioned, the slide provides a predictable purely
+                    # vertical approach to the overhead pose.
+                    self._place_slide_target_sent = False
                     self.place_t0 = now
                     self._place_stage0_wait_log = 0.0
                     self._place_approach_best_error = float("inf")
                     self._place_approach_best_error_at = now
                     self._place_loaded_arm_step_rad = 0.0
                     self._place_arm_target_sent = True
+                    loaded_arm_max_step = (
+                        PLACE_LOADED_ARM_MAX_STEP_BY_KIND_RAD.get(
+                            self.target_kind, PLACE_LOADED_ARM_MAX_STEP_RAD))
                     self.get_logger().info(
-                        "[place] loaded-arm soft start enabled "
-                        f"max_step={PLACE_LOADED_ARM_MAX_STEP_RAD:.4f}rad/"
+                        "[place] two-stage loaded approach enabled; arm first "
+                        "at transport height, then slow vertical slide; "
+                        "loaded-arm soft start "
+                        f"max_step={loaded_arm_max_step:.4f}rad/"
                         "tick")
                     self.get_logger().info(
                         "[place-joints] motion_start="
@@ -2592,6 +2990,34 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 else:
                     raise RuntimeError(
                         "place IK failed; refusing to release goods off-table")
+            if (self._place_arm_target_sent
+                    and not self._place_slide_target_sent):
+                arm_error = self.selected_arm_error()
+                # 阶段 1：只等臂到位。slide 命令尚未发出（des_slide 仍是
+                # 运输值），此时按 commands_ready 检查 slide 误差会因旧
+                # des_slide 与实测的差 > 容差而死锁（实测卡死：
+                # arm_error=0.0072rad 但 slide=0.0121 永不过 4mm 门）。
+                # slide 到位检查留给阶段 2（slide 命令发出之后）。
+                if arm_error <= PLACE_ARM_SETTLE_TOLERANCE_RAD:
+                    self.des_slide = float(self.place_slide_cmd)
+                    self._place_slide_target_sent = True
+                    self.commands_ready_since = None
+                    self.place_t0 = now
+                    self._place_approach_best_error = arm_error
+                    self._place_approach_best_error_at = now
+                    self._place_slide_stall_snapshot = None
+                    self.get_logger().info(
+                        "[place] loaded arm pre-positioned at transport "
+                        f"height; lowering slide vertically "
+                        f"{self.cmd_slide:.3f}->{self.des_slide:.3f}")
+                elif (now - self._place_stage0_wait_log
+                        >= PLACE_APPROACH_PROGRESS_LOG_S):
+                    self._place_stage0_wait_log = now
+                    self.get_logger().info(
+                        "[place] waiting for loaded arm pre-position "
+                        f"arm_error={arm_error:.4f}rad "
+                        f"slide={self.joints.get('slide_joint')}")
+                return
             # 商品底部已触桌（slide 被顶住）：不必等 approach 到位，就地松爪。
             if self._place_slide_stalled(now):
                 self.get_logger().warn(
@@ -2609,7 +3035,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 else now - self.place_t0)
             converged = self.commands_ready(
                 arm_tolerance=PLACE_ARM_SETTLE_TOLERANCE_RAD,
-                slide_tolerance=PLACE_SLIDE_SETTLE_TOLERANCE_M)
+                slide_tolerance=PLACE_APPROACH_SLIDE_TOLERANCE_M)
             if converged:
                 tcp = self.selected_tcp_world()
                 if tcp is None:
@@ -2839,7 +3265,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 return
             if not self.dual_commands_ready(
                     arm_tolerance=PLACE_ARM_SETTLE_TOLERANCE_RAD,
-                    slide_tolerance=PLACE_SLIDE_SETTLE_TOLERANCE_M):
+                    slide_tolerance=PLACE_APPROACH_SLIDE_TOLERANCE_M):
                 # 商品底部已触桌（slide 被顶住）：就地松爪完成放置。
                 if self._place_slide_stalled(now):
                     self.get_logger().warn(
@@ -2913,38 +3339,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 if (now - self._place_refine_stable_since
                         < PLACE_XY_REFINE_SETTLE_S):
                     return
-                measured_slide = self.joints.get("slide_joint")
-                if measured_slide is None:
-                    return
-                target_z = self._product_release_z()
-                target_slide = float(measured_slide) + (
-                    float(release_world[2]) - target_z)
-                if not pick.SLIDE_MIN <= target_slide <= pick.SLIDE_MAX:
-                    raise RuntimeError(
-                        "dual-arm safe release is outside slide range: "
-                        f"target={target_slide:.3f}")
-                self.dual_release_slide_cmd = target_slide
-                # Lock both measured arm configurations before vertical
-                # motion.  This prevents a loaded, effort-limited joint from
-                # continuing an old horizontal IK correction during descent.
-                measured_left = self.arm_positions("left")
-                measured_right = self.arm_positions("right")
-                if (not np.all(np.isfinite(measured_left))
-                        or not np.all(np.isfinite(measured_right))):
-                    raise RuntimeError(
-                        "dual-arm feedback unavailable before descent")
-                self.des_left_arm = measured_left.copy()
-                self.des_right_arm = measured_right.copy()
-                self.des_slide = target_slide
-                self.commands_ready_since = None
-                self._dual_descent_sent = True
-                self.place_stage = 2
-                self.place_t0 = now
-                self.get_logger().info(
-                    f"[place-dual] horizontal target settled; descending "
-                    f"vertically with measured arm poses locked "
-                    f"centre={np.round(release_world, 3)} "
-                    f"slide={float(measured_slide):.3f}->{target_slide:.3f}")
+                self._begin_dual_place_descent(now, release_world)
                 return
             self._place_refine_stable_since = None
             if not self._configure_dual_place_target(
@@ -3056,6 +3451,15 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         message = str(message)
         self.post_delivery_warnings.append(message)
         self.get_logger().warn(f"[post-delivery] {message}")
+
+    def _on_rotation_recovery_exhausted(self) -> None:
+        """Preserve delivery if optional post-place refinement cannot rotate."""
+        if self.placement_completed:
+            self._post_delivery_warning(
+                "rotation recovery budget exhausted after delivery")
+            self._finish_after_return_scan(self.now())
+            return
+        super()._on_rotation_recovery_exhausted()
 
     def _finish_after_return_scan(self, now: float) -> None:
         self.set_twist(0.0, 0.0)
@@ -3205,6 +3609,21 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         previous_right_arm = self.cmd_right_arm.copy()
         super().smooth_commands()
 
+        # Do not let a command accumulated before a sharp path turn coast
+        # above the carried-product caps while the normal slew limiter catches
+        # up.  This is the exact transition that preceded both observed
+        # kouxiangtang drops.
+        loaded_linear_cap, loaded_angular_cap = (
+            self._loaded_transport_limits())
+        if loaded_linear_cap is not None:
+            self.cmd_linear = float(np.clip(
+                self.cmd_linear,
+                -loaded_linear_cap, loaded_linear_cap))
+        if loaded_angular_cap is not None:
+            self.cmd_angular = float(np.clip(
+                self.cmd_angular,
+                -loaded_angular_cap, loaded_angular_cap))
+
         # Enforce the one-shot cap on the published command too.  This keeps a
         # previously accumulated angular command from coasting above the new
         # desired limit during the first loaded turn.
@@ -3223,10 +3642,16 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 or (not self.use_dual_tissue_grasp
                     and self._place_arm_target_sent)))
         if loaded_place_extension:
+            loaded_arm_max_step = (
+                PLACE_LOADED_ARM_MAX_STEP_BY_KIND_RAD.get(
+                    self.target_kind, PLACE_LOADED_ARM_MAX_STEP_RAD))
+            loaded_arm_step_ramp = (
+                PLACE_LOADED_ARM_STEP_RAMP_BY_KIND_RAD.get(
+                    self.target_kind, PLACE_LOADED_ARM_STEP_RAMP_RAD))
             self._place_loaded_arm_step_rad = min(
-                PLACE_LOADED_ARM_MAX_STEP_RAD,
+                loaded_arm_max_step,
                 self._place_loaded_arm_step_rad
-                + PLACE_LOADED_ARM_STEP_RAMP_RAD)
+                + loaded_arm_step_ramp)
             arm_step = self._place_loaded_arm_step_rad
             if self.use_dual_tissue_grasp:
                 combined = self.synchronized_slew(
@@ -3284,8 +3709,14 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             and self.place_stage == 2
             and self._dual_descent_sent)
         vertical_clear = self.place_stage == 4
+        single_loaded_slide_positioning = (
+            self.flow_phase == "place"
+            and not self.use_dual_tissue_grasp
+            and self.place_stage == 0
+            and self._place_slide_target_sent)
         if (self.flow_phase == "place"
-                and (single_descent or dual_descent or vertical_clear)):
+                and (single_loaded_slide_positioning
+                     or single_descent or dual_descent or vertical_clear)):
             self.cmd_slide = float(self.slew(
                 previous_slide,
                 self.des_slide,
@@ -3294,9 +3725,52 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
     # ------------------------------------------------------------------
     # main control loop
     # ------------------------------------------------------------------
+    def _stop_for_stale_feedback(
+            self, *, odom_stale: bool, joints_stale: bool,
+            laser_stale: bool) -> None:
+        """Stop immediately and terminate the match after persistent loss."""
+        monotonic_now = time.monotonic()
+        if self._feedback_stale_since is None:
+            self._feedback_stale_since = monotonic_now
+        elapsed = max(0.0, monotonic_now - self._feedback_stale_since)
+
+        # Bypass both navigation and the parent's velocity smoothing.  Arm and
+        # gripper commands are deliberately left at their most recent values:
+        # without joint feedback it is unsafe to begin an unverified recovery
+        # trajectory or open a possibly loaded gripper.
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
+        self.cmd_vel_pub.publish(pick.Twist())
+        if monotonic_now - self._feedback_warn_monotonic >= 1.0:
+            self.get_logger().warn(
+                "stopping for stale robot feedback "
+                f"(odom_stale={odom_stale}, joints_stale={joints_stale}, "
+                f"laser_stale={laser_stale}, elapsed={elapsed:.1f}s)")
+            self._feedback_warn_monotonic = monotonic_now
+
+        if (elapsed < FEEDBACK_LOSS_HARD_TIMEOUT_S
+                or self._feedback_timeout_triggered):
+            return
+        self._feedback_timeout_triggered = True
+        self._fatal_match = True
+        self.terminal_error = (
+            "fatal-match: robot feedback unavailable for "
+            f"{elapsed:.1f}s (odom_stale={odom_stale}, "
+            f"joints_stale={joints_stale}, laser_stale={laser_stale})")
+        self.get_logger().error(
+            "[feedback-watchdog] persistent robot feedback loss; stopping "
+            "the match without starting another motion worker: "
+            f"{self.terminal_error}")
+        import rclpy
+        rclpy.shutdown()
+
     def tick(self) -> None:
         if self.base_xy is None or not self.joints:
             self._publish_perception_request(False)
+            self._stop_for_stale_feedback(
+                odom_stale=self.base_xy is None,
+                joints_stale=not self.joints,
+                laser_stale=self.last_scan_time is None)
             return
         self._record_motion_telemetry()
         now = self.now()
@@ -3327,20 +3801,19 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                  or stable_return_scan))
         self._publish_perception_request(perception_needed)
         if odom_stale or joints_stale or laser_stale:
-            # The direct zero command below bypasses normal smoothing.  Keep
-            # the internal command state consistent as well so feedback
-            # recovery cannot resume from a stale pre-stop velocity.
-            self.cmd_linear = 0.0
-            self.cmd_angular = 0.0
-            self.cmd_vel_pub.publish(pick.Twist())
-            if now - self._state_warn_log > 1.0:
-                self.get_logger().warn(
-                    "stopping for stale robot feedback "
-                    f"(odom_stale={odom_stale}, "
-                    f"joints_stale={joints_stale}, "
-                    f"laser_stale={laser_stale})")
-                self._state_warn_log = now
+            self._stop_for_stale_feedback(
+                odom_stale=odom_stale,
+                joints_stale=joints_stale,
+                laser_stale=laser_stale)
             return
+        if self._feedback_stale_since is not None:
+            stale_elapsed = max(
+                0.0, time.monotonic() - self._feedback_stale_since)
+            self.get_logger().info(
+                "[feedback-watchdog] robot feedback recovered after "
+                f"{stale_elapsed:.1f}s")
+            self._feedback_stale_since = None
+            self._feedback_timeout_triggered = False
         if not self.initialized:
             self.initialize_commands()
 
@@ -3771,6 +4244,7 @@ def main() -> int:
             caught_error
             or (None if controller is None else controller._fatal_error)
             or (None if controller is None else controller.terminal_error)
+            or (None if controller is None else controller.abort_reason)
             or f"worker stopped in phase={phase} state={state}")
         result_document = {
             "schema_version": 1,

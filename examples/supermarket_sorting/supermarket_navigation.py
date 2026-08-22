@@ -766,7 +766,7 @@ class NavigationController:
         # Keep useful speed through the last open-space approach.  Obstacle
         # clearance scaling and all hard-stop checks below still take
         # precedence, so this only raises the cap when the route is clear.
-        self.near_goal_max_lin = 0.35
+        self.near_goal_max_lin = 0.40
         self.max_lin_acc = 1.2
         self.max_ang_acc = 5.0
         self.dt = 0.02
@@ -782,7 +782,11 @@ class NavigationController:
 
         # Gains
         self.k_ang = 2.5
-        self.k_lin = 1.0
+        # Raise only the distance-to-speed gain.  The path, arrival tolerance,
+        # acceleration limit, trajectory prediction and emergency stop remain
+        # unchanged, so this removes the long low-command tail without moving
+        # any navigation endpoint.
+        self.k_lin = 1.6
         # Moderate heading errors can follow a safe, very small-radius arc
         # instead of spending several seconds rotating with zero translation.
         # Larger errors still require alignment in place, and trajectory/
@@ -798,7 +802,11 @@ class NavigationController:
         self._blocked_timer = 0.0
         self._blocked_thresh = 0.35
         self._stop_dist = 0.32
-        self._slow_dist = 0.55
+        # Keep the 0.32 m hard stop intact while shortening the linear
+        # slowdown band by 5 cm.  This is deliberately conservative: the
+        # motion-arc prediction and full-width lidar corridor still veto an
+        # unsafe command on every control tick.
+        self._slow_dist = 0.50
         self._stop_arc = math.radians(38)
         self.front_corridor_half_width = FRONT_CORRIDOR_HALF_WIDTH_M
         self.hard_stop_corridor_half_width = (
@@ -865,6 +873,7 @@ class NavigationController:
         # without translation is considered a loop.
         self._rotation_loop_limit = 1.25 * math.pi
         self._rotation_recoveries = 0
+        self._terminal_alignment_active = False
 
         # Per-sensor clearance and stop-reason diagnostics
         self.lidar_clearance = float('inf')
@@ -914,6 +923,7 @@ class NavigationController:
         self._rotation_anchor_y = None
         self._last_base_yaw = None
         self._rotation_recoveries = 0
+        self._terminal_alignment_active = False
         self.stop_reason = None
         self._last_logged_reason = None
         self.lidar_clearance = float('inf')
@@ -1291,6 +1301,27 @@ class NavigationController:
 
     def _update_rotation_watchdog(self, bx, by, byaw):
         """Return True after excessive rotation without translational progress."""
+        # Reaching the position endpoint starts a new, legitimate operation:
+        # rotating to the requested final yaw.  Do not add the preceding path
+        # turn to that terminal turn, otherwise a short move behind the robot
+        # can exceed 225 degrees in total and be mistaken for a rotation loop.
+        # The terminal rotation itself is at most pi and remains watched.
+        terminal_alignment = (
+            self.nav_goal_x is not None
+            and self.nav_goal_y is not None
+            and math.hypot(
+                self.nav_goal_x - bx,
+                self.nav_goal_y - by) < self.pos_tol)
+        if terminal_alignment and not self._terminal_alignment_active:
+            self._rotation_anchor_x = bx
+            self._rotation_anchor_y = by
+            self._rotation_accum = 0.0
+            self._last_base_yaw = byaw
+            self._terminal_alignment_active = True
+            return False
+        if not terminal_alignment:
+            self._terminal_alignment_active = False
+
         if self._rotation_anchor_x is None:
             self._rotation_anchor_x = bx
             self._rotation_anchor_y = by

@@ -26,7 +26,7 @@ runner=(
     --memory-confidence-threshold "${SUPERMARKET_MEMORY_CONFIDENCE:-0.90}"
     --inference-hz "${SUPERMARKET_INFERENCE_HZ:-12}"
     --device "${SUPERMARKET_DEVICE:-cpu}"
-    --order-timeout "${SUPERMARKET_ORDER_TIMEOUT:-0}"
+    --order-timeout "${SUPERMARKET_ORDER_TIMEOUT:-300}"
     --match-timeout "${SUPERMARKET_MATCH_TIMEOUT:-570}"
     --target-time "${SUPERMARKET_TARGET_TIME:-400}"
 )

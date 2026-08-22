@@ -37,6 +37,7 @@ import json
 import math
 import sys
 import threading
+import time
 from collections import deque
 from functools import lru_cache
 from pathlib import Path
@@ -270,12 +271,25 @@ TOP_LEFT_GRASP_X_BIAS_M = 0.000
 NAV_LINEAR_MAX_MPS = 0.90
 NAV_LINEAR_MIN_MPS = 0.10
 # 货架对齐的最后一段使用更低的进给下限：对齐容差只有 2.5cm，高速停车
-# 过冲会偏移抓取位姿。最后 50mm 保持低速，不做加速。
+# 过冲会偏移抓取位姿。仅提高距离比例增益，最后 50mm 仍保持原 0.10m/s
+# 下限，因此快速收敛不改变 2.5cm 到位精度和末端制动速度。
 NAV_ALIGN_LINEAR_MIN_MPS = 0.10
+NAV_LINEAR_GAIN = 1.20
+NAV_ALIGN_LINEAR_GAIN = 1.80
 NAV_ROTATE_GATE_RAD = 0.45
-NAV_ANGULAR_MAX_RADPS = 1.50
+# ALIGN is a short, feedback-controlled pose correction.  Let moderate
+# heading error converge on an arc instead of paying for rotate -> translate
+# -> rotate as three serial motions.  Large errors still rotate in place.
+NAV_ALIGN_ROTATE_GATE_RAD = 0.85
+# 这些转动发生在抓取前，不携货。与外层安全导航的 2.0rad/s 上限
+# 对齐，缩短微调前后的转向时间；抓取后载货导航仍由外层的独立限速管理。
+NAV_ANGULAR_MAX_RADPS = 2.00
 NAV_TRANSLATE_ANGULAR_MAX_RADPS = 1.00
+NAV_ALIGN_TRANSLATE_ANGULAR_MAX_RADPS = 1.50
 NAV_YAW_DEADBAND_RAD = 0.035
+# Preserve the same final-yaw deadband, but remove the long exponential tail
+# caused by the old 2.0 * error command under a slow simulator real-time rate.
+NAV_FINAL_YAW_GAIN = 3.50
 # 原地旋转卡死恢复：旋转指令发出后若 yaw 长时间无变化（被西墙/货架顶住），
 # 先短距离倒车解除卡死再继续旋转，避免在西侧货架贴墙处永久卡住。
 NAV_ROT_STALL_S = 2.5            # 旋转无进展判定时间（秒）
@@ -283,7 +297,16 @@ NAV_ROT_STALL_MIN_CHANGE_RAD = 0.03
 NAV_ROT_UNSTICK_DIST_M = 0.15    # 解除卡死时的倒车距离
 NAV_ROT_UNSTICK_SPEED_MPS = 0.08
 NAV_ROT_UNSTICK_TIMEOUT_S = 4.0
-NAV_ROT_UNSTICK_MAX = 3          # 最多解除次数，超过后重置继续尝试
+NAV_ROT_UNSTICK_MAX = 3          # 最多解除次数，超过后中止当前尝试
+# A table-to-shelf route may legitimately consume the navigator's full 150 s
+# leg budget under the measured simulator real-time rate.  Leave room for the
+# final camera posture/stability gate while retaining a finite state exit.
+GO_SCAN_HARD_TIMEOUT_S = 180.0
+# Direct inventory localisation can legitimately move ALIGN to an adjacent
+# shelf (roughly 1 m) before the centimetre-scale correction.  At the measured
+# simulator real-time rate that takes about 30 s while making steady progress,
+# so retain a finite failure exit without rejecting that valid path.
+ALIGN_HARD_TIMEOUT_S = 45.0
 
 ARUCO_SYNC_TOLERANCE_NS = 200_000_000
 ARUCO_MAX_VERTICAL_GAP_BOX_HEIGHTS = 1.50
@@ -301,6 +324,7 @@ MARKER_SAMPLE_SPREAD_MAX_M = 0.04
 CLOSE_RECHECK_CONFIRMATIONS = 2
 CLOSE_RECHECK_WINDOW_S = 2.0
 CLOSE_RECHECK_POSE_TIMEOUT_S = 3.0
+REVISIT_POSE_COMMAND_TIMEOUT_S = 5.0
 CLOSE_RECHECK_XY_MAX_M = 0.12
 CLOSE_RECHECK_Z_MAX_M = 0.16
 
@@ -473,6 +497,11 @@ GENERIC_DEPLOY_RETRY_MAX = 2
 GENERIC_DEPLOY_RETRY_STEP_M = 0.02
 GENERIC_TOP_LIFT_M = 0.045
 GENERIC_TOP_LIFT_TIMEOUT_S = 5.0
+# Middle-layer goods are already captured when this state runs.  Give the
+# slide substantially longer than the normal convergence window, then prefer
+# a horizontal retreat at the measured height over waiting indefinitely or
+# opening the gripper in STATE_ABORT.
+GENERIC_MIDDLE_LIFT_TIMEOUT_S = 10.0
 
 # A tissue box is 172 mm wide, more than twice one gripper's 80 mm opening.
 # In the fixed layout every tissue target is on the middle shelf, so a separate
@@ -679,6 +708,15 @@ DUAL_TISSUE_LIFT_M = 0.060
 # The old one-step 60 mm joint target completed in ~0.5 s and left the box on
 # the shelf even though both arms had established a symmetric side contact.
 DUAL_TISSUE_ARM_LIFT_SPEED_MPS = 0.012
+# A single 60 mm Cartesian IK solve can select a distant redundant wrist
+# branch even when the starting clamp pose is sound.  In simulation that made
+# the right wrist retain a 1.04 rad error and cross almost 220 mm toward the
+# left arm.  Plan the lift and the raised retreat as short, branch-continuous
+# waypoints, and reject any segment that still asks for a large joint jump.
+DUAL_TISSUE_ARM_LIFT_STEP_M = 0.015
+DUAL_TISSUE_ARM_LIFT_MIN_CLEARANCE_M = 0.025
+DUAL_TISSUE_ARM_RETREAT_STEP_M = 0.055
+DUAL_TISSUE_ARM_SEGMENT_MAX_JOINT_DELTA_RAD = 0.45
 DUAL_TISSUE_LIFT_DWELL_S = 2.5
 DUAL_TISSUE_SLIDE_LIFT_TOLERANCE_M = 0.015
 DUAL_TISSUE_SLIDE_LIFT_STABLE_S = 0.25
@@ -744,6 +782,13 @@ GENERIC_NO_POST_EXTEND_KINDS = {"kouxiangtang"}
 # clear the board; tall goods are unaffected because their centre already
 # exceeds the clearance.
 GENERIC_TCP_FINGER_CLEARANCE_M = 0.06
+# Kouxiangtang was repeatedly contacted near its upper edge: one grasp was
+# already empty after retreat and two nominal captures later slipped during
+# delivery.  Its 80 mm body still leaves 10 mm between this 50 mm TCP height
+# and the board, while moving the jaws 10 mm closer to the product centre.
+GENERIC_TCP_FINGER_CLEARANCE_BY_KIND_M = {
+    "kouxiangtang": 0.050,
+}
 # 所有货物抓取姿态的目标 Z 统一抬升 1cm：让指尖略高于测得的货物中心，
 # 避免指尖落在货架导轨/前缘高度（D 架苹果指尖撞导轨问题），对深度测量
 # 的偏低误差更宽容。对球体（苹果/橙子）与普通货物、各层货架一致生效。
@@ -934,6 +979,8 @@ class ShelfPickController(Node):
 
         self.state = STATE_GO_SCAN
         self.state_t0 = self.now()
+        self.state_monotonic_t0 = time.monotonic()
+        self.abort_reason = None
         self.scan_index = 0
         self.scan_pose_index = 0
         self.scan_camera_ready_since = None
@@ -953,6 +1000,7 @@ class ShelfPickController(Node):
         self.revisit_marker_id = None
         self.revisit_pose_index = 0
         self.revisit_pose_t0 = 0.0
+        self.revisit_pose_monotonic_t0 = 0.0
         self.revisit_poses = REVISIT_POSES
         self.revisit_rounds = {}
         self.revisit_total_rounds = 0
@@ -1058,6 +1106,11 @@ class ShelfPickController(Node):
         self.dual_lift_right_joints = None
         self.dual_lift_retreat_left_joints = None
         self.dual_lift_retreat_right_joints = None
+        self.dual_lift_arm_waypoints = []
+        self.dual_lift_arm_stage = 0
+        self.dual_lift_arm_achieved_m = 0.0
+        self.dual_lift_retreat_waypoints = []
+        self.dual_lift_retreat_stage = 0
         self.dual_lift_settled_since = None
         # 平转 90° 预调整：锁定目标后先原地旋转纸盒，转完再进入双臂抓取。
         self.tissue_rotated_90 = False
@@ -2292,6 +2345,7 @@ class ShelfPickController(Node):
             return
         self.state = new_state
         self.state_t0 = self.now()
+        self.state_monotonic_t0 = time.monotonic()
         self.nav_target = None
         self.commands_ready_since = None
         if new_state == STATE_SCAN:
@@ -2309,6 +2363,15 @@ class ShelfPickController(Node):
                 STATE_CLOSE, STATE_LIFT, STATE_RETREAT,
                 STATE_DONE, STATE_ABORT):
             self.log_manipulation_snapshot(new_state)
+
+    def state_elapsed_monotonic(self) -> float:
+        """Wall-clock time in the active state, immune to ROS clock jumps."""
+        return max(0.0, time.monotonic() - self.state_monotonic_t0)
+
+    def _on_rotation_recovery_exhausted(self) -> None:
+        """Fail a pre-grasp controller after repeated rotation stalls."""
+        self.abort_reason = "rotation recovery budget exhausted"
+        self.set_state(STATE_ABORT)
 
     def _abort_recovery_ready(self) -> bool:
         """True when the abort posture has settled enough to shut down.
@@ -2771,6 +2834,7 @@ class ShelfPickController(Node):
         self.revisit_poses = tuple(poses)
         self.revisit_pose_index = 0
         self.revisit_pose_t0 = self.now()
+        self.revisit_pose_monotonic_t0 = time.monotonic()
         self.revisit_rounds[candidate_key] = (
             self.revisit_rounds.get(candidate_key, 0) + 1)
         self.revisit_total_rounds += 1
@@ -3004,13 +3068,17 @@ class ShelfPickController(Node):
 
     def drive_to(self, target_xy, final_yaw: float,
                  position_tolerance: float = 0.055,
-                 linear_min_mps: float | None = None) -> bool:
+                 linear_min_mps: float | None = None,
+                 linear_gain: float = NAV_LINEAR_GAIN,
+                 rotate_gate_rad: float = NAV_ROTATE_GATE_RAD,
+                 translate_angular_max_rps: float = (
+                     NAV_TRANSLATE_ANGULAR_MAX_RADPS)) -> bool:
         delta = np.asarray(target_xy, dtype=float) - self.base_xy
         distance = float(np.linalg.norm(delta))
         if distance > position_tolerance:
             desired_yaw = math.atan2(delta[1], delta[0])
             yaw_error = wrap_to_pi(desired_yaw - self.base_yaw)
-            if abs(yaw_error) > NAV_ROTATE_GATE_RAD:
+            if abs(yaw_error) > rotate_gate_rad:
                 if self._rotate_with_unstick(desired_yaw):
                     return False
                 self.set_twist(0.0, float(np.clip(
@@ -3018,20 +3086,20 @@ class ShelfPickController(Node):
                     NAV_ANGULAR_MAX_RADPS)))
             else:
                 linear = float(np.clip(
-                    1.2 * distance,
+                    linear_gain * distance,
                     NAV_LINEAR_MIN_MPS if linear_min_mps is None
                     else linear_min_mps,
                     NAV_LINEAR_MAX_MPS))
                 self.set_twist(linear, float(np.clip(
-                    1.8 * yaw_error, -NAV_TRANSLATE_ANGULAR_MAX_RADPS,
-                    NAV_TRANSLATE_ANGULAR_MAX_RADPS)))
+                    1.8 * yaw_error, -translate_angular_max_rps,
+                    translate_angular_max_rps)))
             return False
         yaw_error = wrap_to_pi(final_yaw - self.base_yaw)
         if abs(yaw_error) > NAV_YAW_DEADBAND_RAD:
             if self._rotate_with_unstick(final_yaw):
                 return False
             self.set_twist(0.0, float(np.clip(
-                2.0 * yaw_error, -NAV_ANGULAR_MAX_RADPS,
+                NAV_FINAL_YAW_GAIN * yaw_error, -NAV_ANGULAR_MAX_RADPS,
                 NAV_ANGULAR_MAX_RADPS)))
             return False
         self.set_twist(0.0, 0.0)
@@ -3087,16 +3155,16 @@ class ShelfPickController(Node):
         if now - self._rot_stall_anchor_t >= NAV_ROT_STALL_S:
             if yaw_changed < NAV_ROT_STALL_MIN_CHANGE_RAD and moved < 0.03:
                 self._rot_stall_unsticks += 1
-                if self._rot_stall_unsticks > NAV_ROT_UNSTICK_MAX:
-                    # 多次解除仍卡死：重置继续尝试旋转，由上层超时/重试兜底
-                    self._rot_stall_unsticks = 0
-                    self._rot_stall_anchor_yaw = float(self.base_yaw)
-                    self._rot_stall_anchor_t = now
-                    self._rot_stall_anchor_xy = self.base_xy.copy()
-                    self.get_logger().warn(
-                        "[rotate-unstick] still stuck after multiple "
-                        "attempts; continuing rotation")
-                    return False
+                if self._rot_stall_unsticks >= NAV_ROT_UNSTICK_MAX:
+                    # Most callers are pre-grasp.  Integrated post-delivery
+                    # refinement overrides the hook so an already completed
+                    # order is never converted back into a failed grasp.
+                    self.set_twist(0.0, 0.0)
+                    self.get_logger().error(
+                        "[rotate-unstick] recovery budget exhausted after "
+                        f"{NAV_ROT_UNSTICK_MAX} attempts; ending this motion")
+                    self._on_rotation_recovery_exhausted()
+                    return True
                 self.get_logger().warn(
                     f"[rotate-unstick] rotation stalled for "
                     f"{now - self._rot_stall_anchor_t:.1f}s "
@@ -3629,8 +3697,9 @@ class ShelfPickController(Node):
 
         On the top shelf the slide is already pinned at SLIDE_MIN to reach the
         shelf height, so the slide-based lift is a no-op and the retreat would
-        drag the box across the board.  Instead solve a +DUAL_TISSUE_LIFT_M
-        TCP pose plus a raised horizontal retreat for both arms.
+        drag the box across the board.  Build short, branch-continuous vertical
+        and horizontal waypoints.  This prevents a redundant wrist solution
+        from sweeping one loaded arm through the tissue or the opposite arm.
         """
         left_tcp = self.arm_tcp_world("left")
         right_tcp = self.arm_tcp_world("right")
@@ -3638,42 +3707,161 @@ class ShelfPickController(Node):
             self.get_logger().error(
                 "[dual-tissue-arm-lift] measured TCP unavailable")
             return False
-        lift_z = 0.5 * (left_tcp[2] + right_tcp[2]) + DUAL_TISSUE_LIFT_M
-        lift_left = np.array([left_tcp[0], left_tcp[1], lift_z])
-        lift_right = np.array([right_tcp[0], right_tcp[1], lift_z])
+        start_z = 0.5 * (left_tcp[2] + right_tcp[2])
         retreat_y = (
             self.target_world[1] - DUAL_TISSUE_PREGRASP_BACKOFF_M)
-        retreat_left = np.array([left_tcp[0], retreat_y, lift_z])
-        retreat_right = np.array([right_tcp[0], retreat_y, lift_z])
         left_reference = self.arm_positions("left")
         right_reference = self.arm_positions("right")
-        try:
-            # 手背 outward 滚转姿态贯穿抬升/撤退，不回到手侧面。
-            lift_left_joints, lift_right_joints = (
-                self.solve_kdl_both_world(
+        self.dual_lift_arm_waypoints = []
+        self.dual_lift_retreat_waypoints = []
+        achieved_lift = 0.0
+
+        def solve_guarded(
+                left_world: np.ndarray, right_world: np.ndarray,
+                left_ref: np.ndarray, right_ref: np.ndarray,
+                label: str) -> tuple[np.ndarray, np.ndarray]:
+            left_joints, right_joints = self.solve_kdl_both_world(
+                left_world, right_world, left_ref, right_ref)
+            left_delta = float(np.max(np.abs(left_joints - left_ref)))
+            right_delta = float(np.max(np.abs(right_joints - right_ref)))
+            largest_delta = max(left_delta, right_delta)
+            if largest_delta > DUAL_TISSUE_ARM_SEGMENT_MAX_JOINT_DELTA_RAD:
+                raise ValueError(
+                    f"{label} selected a discontinuous IK branch: "
+                    f"left_delta={left_delta:.3f}rad "
+                    f"right_delta={right_delta:.3f}rad limit="
+                    f"{DUAL_TISSUE_ARM_SEGMENT_MAX_JOINT_DELTA_RAD:.3f}rad")
+            return left_joints, right_joints
+
+        # Plan upward from the measured clamped pose.  If only the highest
+        # waypoint changes branch, retaining a lower but >=25 mm lift is safer
+        # and faster than aborting or dragging the box at shelf height.
+        lift_steps = int(math.ceil(
+            DUAL_TISSUE_LIFT_M / DUAL_TISSUE_ARM_LIFT_STEP_M))
+        for index in range(1, lift_steps + 1):
+            amount = min(
+                DUAL_TISSUE_LIFT_M,
+                index * DUAL_TISSUE_ARM_LIFT_STEP_M)
+            lift_z = start_z + amount
+            lift_left = np.array([left_tcp[0], left_tcp[1], lift_z])
+            lift_right = np.array([right_tcp[0], right_tcp[1], lift_z])
+            try:
+                left_joints, right_joints = solve_guarded(
                     lift_left, lift_right,
-                    left_reference, right_reference))
-            retreat_left_joints, retreat_right_joints = (
-                self.solve_kdl_both_world(
+                    left_reference, right_reference,
+                    f"lift waypoint {index}/{lift_steps}")
+            except ValueError as exc:
+                if achieved_lift < DUAL_TISSUE_ARM_LIFT_MIN_CLEARANCE_M:
+                    self.get_logger().error(
+                        f"[dual-tissue-arm-lift] no safe lift clearance: "
+                        f"{exc}; achieved={achieved_lift:.3f}m")
+                    self.dual_lift_arm_waypoints = []
+                    return False
+                self.get_logger().warn(
+                    f"[dual-tissue-arm-lift] high waypoint rejected: "
+                    f"{exc}; using verified {achieved_lift:.3f}m lift")
+                break
+            self.dual_lift_arm_waypoints.append((
+                amount, left_joints.copy(), right_joints.copy()))
+            left_reference = left_joints
+            right_reference = right_joints
+            achieved_lift = amount
+
+        if achieved_lift < DUAL_TISSUE_ARM_LIFT_MIN_CLEARANCE_M:
+            self.get_logger().error(
+                f"[dual-tissue-arm-lift] planned lift {achieved_lift:.3f}m "
+                f"is below safe clearance "
+                f"{DUAL_TISSUE_ARM_LIFT_MIN_CLEARANCE_M:.3f}m")
+            self.dual_lift_arm_waypoints = []
+            return False
+
+        # Pre-plan the complete raised retreat before moving either loaded arm.
+        # If any segment has no continuous IK solution the robot remains in the
+        # symmetric clamp pose and enters the existing safe abort path.
+        retreat_distance = abs(float(left_tcp[1] - retreat_y))
+        retreat_steps = max(1, int(math.ceil(
+            retreat_distance / DUAL_TISSUE_ARM_RETREAT_STEP_M)))
+        lift_z = start_z + achieved_lift
+        try:
+            for index in range(1, retreat_steps + 1):
+                progress = index / retreat_steps
+                waypoint_y = float(
+                    left_tcp[1] + progress * (retreat_y - left_tcp[1]))
+                retreat_left = np.array([
+                    left_tcp[0], waypoint_y, lift_z])
+                retreat_right = np.array([
+                    right_tcp[0], waypoint_y, lift_z])
+                left_joints, right_joints = solve_guarded(
                     retreat_left, retreat_right,
-                    lift_left_joints, lift_right_joints))
+                    left_reference, right_reference,
+                    f"retreat waypoint {index}/{retreat_steps}")
+                self.dual_lift_retreat_waypoints.append((
+                    abs(float(left_tcp[1] - waypoint_y)),
+                    left_joints.copy(), right_joints.copy()))
+                left_reference = left_joints
+                right_reference = right_joints
         except ValueError as exc:
             self.get_logger().error(
-                f"[dual-tissue-arm-lift] IK failed: {exc}")
+                f"[dual-tissue-arm-lift] raised retreat is unsafe: {exc}")
+            self.dual_lift_arm_waypoints = []
+            self.dual_lift_retreat_waypoints = []
             return False
-        self.dual_lift_left_joints = lift_left_joints.copy()
-        self.dual_lift_right_joints = lift_right_joints.copy()
-        self.dual_lift_retreat_left_joints = retreat_left_joints.copy()
-        self.dual_lift_retreat_right_joints = retreat_right_joints.copy()
+
+        self.dual_lift_arm_stage = 0
+        self.dual_lift_retreat_stage = 0
+        self.dual_lift_arm_achieved_m = achieved_lift
+        self.dual_lift_left_joints = (
+            self.dual_lift_arm_waypoints[-1][1].copy())
+        self.dual_lift_right_joints = (
+            self.dual_lift_arm_waypoints[-1][2].copy())
+        self.dual_lift_retreat_left_joints = (
+            self.dual_lift_retreat_waypoints[-1][1].copy())
+        self.dual_lift_retreat_right_joints = (
+            self.dual_lift_retreat_waypoints[-1][2].copy())
         self.get_logger().info(
             f"[dual-tissue-arm-lift] slide pinned at SLIDE_MIN; "
-            f"lift={DUAL_TISSUE_LIFT_M:.3f}m via arm joints "
+            f"planned_lift={achieved_lift:.3f}m/"
+            f"{DUAL_TISSUE_LIFT_M:.3f}m via "
+            f"{len(self.dual_lift_arm_waypoints)} guarded arm segments; "
+            f"retreat={retreat_distance:.3f}m via "
+            f"{len(self.dual_lift_retreat_waypoints)} guarded segments "
             f"left_start={np.round(left_tcp, 4)} "
             f"right_start={np.round(right_tcp, 4)} "
-            f"lift_left={np.round(lift_left, 4)} "
-            f"lift_right={np.round(lift_right, 4)} "
             f"retreat_y={retreat_y:.3f}")
         return True
+
+    def start_dual_tissue_arm_lift_stage(self, stage: int) -> None:
+        """Start one branch-checked top-tissue vertical waypoint."""
+        amount, left_target, right_target = self.dual_lift_arm_waypoints[stage]
+        previous_amount = (
+            0.0 if stage == 0
+            else self.dual_lift_arm_waypoints[stage - 1][0])
+        self.dual_lift_arm_stage = stage
+        self.start_dual_tissue_motion(
+            f"arm_lift_{stage + 1}_of_"
+            f"{len(self.dual_lift_arm_waypoints)}",
+            left_target, right_target,
+            max(0.001, amount - previous_amount),
+            DUAL_TISSUE_ARM_LIFT_SPEED_MPS,
+            STATE_LIFT,
+            require_convergence=True)
+
+    def start_dual_tissue_arm_retreat_stage(self, stage: int) -> None:
+        """Start one branch-checked raised horizontal retreat waypoint."""
+        distance, left_target, right_target = (
+            self.dual_lift_retreat_waypoints[stage])
+        previous_distance = (
+            0.0 if stage == 0
+            else self.dual_lift_retreat_waypoints[stage - 1][0])
+        self.dual_lift_retreat_stage = stage
+        self.start_dual_tissue_motion(
+            f"raised_retreat_{stage + 1}_of_"
+            f"{len(self.dual_lift_retreat_waypoints)}",
+            left_target, right_target,
+            max(0.001, distance - previous_distance),
+            DUAL_TISSUE_RETREAT_SPEED_MPS,
+            STATE_RETREAT,
+            require_convergence=True)
 
     def configure_dual_tissue_top_fork(self) -> bool:
         """Build a right-wrist fork below a shelf-supported front overhang.
@@ -4006,7 +4194,8 @@ class ShelfPickController(Node):
             pregrasp_world[2] + GRASP_TCP_Z_RAISE_M
             + GRASP_TCP_Z_OFFSET_BY_KIND.get(self.target_kind, 0.0),
             SHELF_SURFACE_Z_M[self.shelf_level]
-            + GENERIC_TCP_FINGER_CLEARANCE_M))
+            + GENERIC_TCP_FINGER_CLEARANCE_BY_KIND_M.get(
+                self.target_kind, GENERIC_TCP_FINGER_CLEARANCE_M)))
 
         nominal_contact_world = pregrasp_world.copy()
         # The 30 mm fixed overshoot can push the wrist past the widest part of
@@ -4117,7 +4306,8 @@ class ShelfPickController(Node):
             nominal_contact_world[2] + GRASP_TCP_Z_RAISE_M
             + GRASP_TCP_Z_OFFSET_BY_KIND.get(self.target_kind, 0.0),
             SHELF_SURFACE_Z_M[self.shelf_level]
-            + GENERIC_TCP_FINGER_CLEARANCE_M))
+            + GENERIC_TCP_FINGER_CLEARANCE_BY_KIND_M.get(
+                self.target_kind, GENERIC_TCP_FINGER_CLEARANCE_M)))
         # This is a wrist-to-inner-finger geometry transform, not a perception
         # correction, so it remains active in fixed-layout diagnostic mode.
         nominal_contact_world[1] += LOWER_GRASP_TCP_FORWARD_M
@@ -4503,11 +4693,17 @@ class ShelfPickController(Node):
         self.des_left_arm = self.dual_motion_start_left.copy()
         self.des_right_arm = self.dual_motion_start_right.copy()
         self.commands_ready_since = None
+        left_joint_delta = float(np.max(np.abs(
+            self.dual_motion_target_left - self.dual_motion_start_left)))
+        right_joint_delta = float(np.max(np.abs(
+            self.dual_motion_target_right - self.dual_motion_start_right)))
         self.get_logger().info(
             f"[dual-tissue-{label}] fixed synchronized segment armed; "
             f"path={path_length:.3f}m "
             f"duration={self.dual_motion_duration_s:.2f}s "
             f"speed={speed:.3f}m/s "
+            f"joint_delta=({left_joint_delta:.3f},"
+            f"{right_joint_delta:.3f})rad "
             f"convergence_gate={int(require_convergence)} replanning=0")
         self.set_state(state)
         # The post-band dogleg re-enters STATE_ARM_FORWARD for each segment;
@@ -5847,6 +6043,27 @@ class ShelfPickController(Node):
 
         self.set_twist(0.0, 0.0)
 
+        # Navigation and final base alignment are pre-grasp operations, so a
+        # hard wall-clock ceiling can safely route them through STATE_ABORT.
+        # Use a monotonic clock: ROS time can jump when the simulator restarts.
+        state_elapsed = self.state_elapsed_monotonic()
+        if (self.state == STATE_GO_SCAN
+                and state_elapsed >= GO_SCAN_HARD_TIMEOUT_S):
+            self.get_logger().error(
+                "[go-scan] navigation/camera setup exceeded "
+                f"{GO_SCAN_HARD_TIMEOUT_S:.0f}s; aborting this attempt")
+            self.abort_reason = (
+                f"go-scan timeout after {GO_SCAN_HARD_TIMEOUT_S:.0f}s")
+            self.set_state(STATE_ABORT)
+        elif (self.state == STATE_ALIGN
+              and state_elapsed >= ALIGN_HARD_TIMEOUT_S):
+            self.get_logger().error(
+                "[align] base did not converge within "
+                f"{ALIGN_HARD_TIMEOUT_S:.0f}s; aborting this attempt")
+            self.abort_reason = (
+                f"align timeout after {ALIGN_HARD_TIMEOUT_S:.0f}s")
+            self.set_state(STATE_ABORT)
+
         if self.state == STATE_GO_SCAN:
             pose_name, slide_target, yaw_target, pitch_target = (
                 self.current_scan_camera_pose())
@@ -5924,17 +6141,32 @@ class ShelfPickController(Node):
                             else REVISIT_DWELL_S)):
                     self.revisit_pose_index += 1
                     self.scan_camera_ready_since = None
+                    self.revisit_pose_monotonic_t0 = time.monotonic()
                     if self.revisit_pose_index >= len(self.revisit_poses):
                         self._revisit_fail()
             else:
                 self.scan_camera_ready_since = None
+                if (time.monotonic() - self.revisit_pose_monotonic_t0
+                        >= REVISIT_POSE_COMMAND_TIMEOUT_S):
+                    self.get_logger().warn(
+                        "[revisit] camera pose did not converge within "
+                        f"{REVISIT_POSE_COMMAND_TIMEOUT_S:.1f}s; skipping pose "
+                        f"{self.revisit_pose_index + 1}/{len(self.revisit_poses)}")
+                    self.revisit_pose_index += 1
+                    self.revisit_pose_monotonic_t0 = time.monotonic()
+                    if self.revisit_pose_index >= len(self.revisit_poses):
+                        self._revisit_fail()
 
         elif self.state == STATE_ALIGN:
             align_x_tolerance = 0.025
             if self.drive_to(
                     [self.align_base_x, self.align_base_y],
                     YAW_NORTH, align_x_tolerance,
-                    linear_min_mps=NAV_ALIGN_LINEAR_MIN_MPS):
+                    linear_min_mps=NAV_ALIGN_LINEAR_MIN_MPS,
+                    linear_gain=NAV_ALIGN_LINEAR_GAIN,
+                    rotate_gate_rad=NAV_ALIGN_ROTATE_GATE_RAD,
+                    translate_angular_max_rps=(
+                        NAV_ALIGN_TRANSLATE_ANGULAR_MAX_RADPS)):
                 if self.close_recheck and not self._recheck_passed:
                     self.set_state(STATE_RECHECK)
                     self._start_close_recheck()
@@ -6203,14 +6435,7 @@ class ShelfPickController(Node):
                             f"[dual-tissue-clamp] lateral squeeze held for "
                             f"{close_elapsed:.2f}s; top shelf has no overhead "
                             "board, performing the established arm lift")
-                        self.start_dual_tissue_motion(
-                            "arm_lift",
-                            self.dual_lift_left_joints,
-                            self.dual_lift_right_joints,
-                            DUAL_TISSUE_LIFT_M,
-                            DUAL_TISSUE_ARM_LIFT_SPEED_MPS,
-                            STATE_LIFT,
-                            require_convergence=True)
+                        self.start_dual_tissue_arm_lift_stage(0)
                     else:
                         self.get_logger().error(
                             "[dual-tissue] top-shelf arm lift IK failed; "
@@ -6272,18 +6497,17 @@ class ShelfPickController(Node):
                             f"position={gripper:.3f} "
                             f"range={spread:.3f} over {span:.2f}s")
                         if self.shelf_level == "middle":
-                            # Match wxj: a middle-shelf sphere withdraws at
-                            # the exact grasp height; top spheres retain the
-                            # established trial/full arm-lift sequence.
-                            self.des_slide = self.sphere_slide_command
-                            self.sphere_retreat_arm_joints = (
-                                self.pregrasp_arm_joints.copy())
-                            self.set_selected_arm_target(
-                                self.sphere_retreat_arm_joints)
-                            self.get_logger().info(
-                                "[middle-sphere-retreat] retracting at "
-                                "grasp height before any vertical motion")
-                            self.set_state(STATE_RETREAT)
+                            # A same-height withdrawal repeatedly let oranges
+                            # roll out within the first 3--8 cm.  Preserve the
+                            # required LIFT stage, but use only the existing
+                            # 10 mm slide trial before retreat; this clears the
+                            # shelf surface without approaching the board
+                            # above.  Full height restoration still happens
+                            # only after the TCP is outside the shelf.
+                            if self.configure_middle_sphere_lift_from_measured():
+                                self.set_state(STATE_TRIAL_LIFT)
+                            else:
+                                self.set_state(STATE_ABORT)
                         elif self.configure_sphere_lift_from_measured():
                             self.set_state(STATE_TRIAL_LIFT)
                         else:
@@ -6430,19 +6654,17 @@ class ShelfPickController(Node):
                 # 顶层双臂抬升（slide 已 pin 在最高位，只能靠臂关节）。
                 self.des_slide = self.slide_grasp
                 if self.advance_dual_tissue_motion() == "reached":
-                    self.get_logger().info(
-                        f"[dual-tissue-arm-lift] raised "
-                        f"{DUAL_TISSUE_LIFT_M:.3f}m via a slow "
-                        "synchronized arm trajectory; retracting "
-                        "horizontally at the raised height")
-                    self.start_dual_tissue_motion(
-                        "retreat",
-                        self.dual_lift_retreat_left_joints,
-                        self.dual_lift_retreat_right_joints,
-                        DUAL_TISSUE_PREGRASP_BACKOFF_M
-                        + self.dual_insert_forward_m,
-                        DUAL_TISSUE_RETREAT_SPEED_MPS,
-                        STATE_RETREAT)
+                    next_stage = self.dual_lift_arm_stage + 1
+                    if next_stage < len(self.dual_lift_arm_waypoints):
+                        self.start_dual_tissue_arm_lift_stage(next_stage)
+                    else:
+                        self.get_logger().info(
+                            f"[dual-tissue-arm-lift] raised "
+                            f"{self.dual_lift_arm_achieved_m:.3f}m via "
+                            f"{len(self.dual_lift_arm_waypoints)} slow "
+                            "branch-checked segments; retracting "
+                            "horizontally at the raised height")
+                        self.start_dual_tissue_arm_retreat_stage(0)
             else:
                 # 中层/下层 slide 抬升：纸盒整体离开板面后被手指夹托着。
                 self.des_left_arm = self.dual_clamp_left_joints.copy()
@@ -6489,7 +6711,7 @@ class ShelfPickController(Node):
                         "lift motion did not converge; aborting")
                     self.set_state(STATE_ABORT)
             else:
-                lift_elapsed = self.now() - self.state_t0
+                lift_elapsed = self.state_elapsed_monotonic()
                 if (self.is_top_shelf
                         and self.generic_top_lift_arm_joints is not None):
                     self.des_slide = self.slide_grasp
@@ -6529,7 +6751,8 @@ class ShelfPickController(Node):
                             self.pregrasp_arm_joints)
                         self.set_state(STATE_RETREAT)
                 else:
-                    # Established middle-layer generic lift remains unchanged.
+                    # Middle-layer generic lift: wait generously for normal
+                    # convergence, then degrade to a guarded horizontal exit.
                     self.des_slide = max(
                         SLIDE_MIN, self.slide_grasp - LIFT_AMOUNT_M)
                     slide = self.joints.get(
@@ -6538,6 +6761,21 @@ class ShelfPickController(Node):
                             and abs(slide - self.des_slide) < 0.025):
                         # Pull the grasped product horizontally clear of the
                         # shelf at the lifted height.
+                        self.set_selected_arm_target(
+                            self.pregrasp_arm_joints)
+                        self.set_state(STATE_RETREAT)
+                    elif lift_elapsed >= GENERIC_MIDDLE_LIFT_TIMEOUT_S:
+                        # The item is already grasped.  A slightly incomplete
+                        # lift is safer to resolve by withdrawing horizontally
+                        # at the measured height than by waiting forever or
+                        # entering STATE_ABORT, whose recovery opens the grip.
+                        error = abs(float(slide) - self.des_slide)
+                        self.get_logger().warn(
+                            "[generic-middle-lift] slide did not reach the "
+                            f"normal 0.025m tolerance within "
+                            f"{GENERIC_MIDDLE_LIFT_TIMEOUT_S:.1f}s "
+                            f"(error={error:.3f}m); continuing with a guarded "
+                            "horizontal retreat at the measured height")
                         self.set_selected_arm_target(
                             self.pregrasp_arm_joints)
                         self.set_state(STATE_RETREAT)
@@ -6558,6 +6796,13 @@ class ShelfPickController(Node):
                 self.set_twist(lateral, 0.0)
             if self.advance_dual_tissue_motion() == "reached":
                 if (self.shelf_level == "top"
+                        and self.dual_lift_use_arm
+                        and self.dual_lift_retreat_waypoints):
+                    next_stage = self.dual_lift_retreat_stage + 1
+                    if next_stage < len(self.dual_lift_retreat_waypoints):
+                        self.start_dual_tissue_arm_retreat_stage(next_stage)
+                        return
+                if (self.shelf_level == "top"
                         and self.dual_top_extract_stage == 1):
                     # 旧流程残留的 stage-1 分支：纸盒在抬升前被拉到板缘。
                     # 该流程已被 STATE_CLOSE 的直接抬升取代（stage 恒为 0），
@@ -6565,14 +6810,7 @@ class ShelfPickController(Node):
                     if self.configure_dual_tissue_arm_lift():
                         self.dual_lift_use_arm = True
                         self.dual_top_extract_stage = 0
-                        self.start_dual_tissue_motion(
-                            "arm_lift",
-                            self.dual_lift_left_joints,
-                            self.dual_lift_right_joints,
-                            DUAL_TISSUE_LIFT_M,
-                            DUAL_TISSUE_ARM_LIFT_SPEED_MPS,
-                            STATE_LIFT,
-                            require_convergence=True)
+                        self.start_dual_tissue_arm_lift_stage(0)
                     else:
                         self.get_logger().error(
                             "[dual-tissue-arm-lift] IK failed; aborting")
