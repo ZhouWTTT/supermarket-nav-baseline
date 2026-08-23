@@ -829,7 +829,7 @@ class NavigationController:
         self._reverse_recovery_trigger_s = 1.0
         self._reverse_recovery_no_progress_m = 0.03
         self._reverse_recovery_distance_m = 0.20
-        self._reverse_recovery_speed = 0.10
+        self._reverse_recovery_speed = 0.20
         self._reverse_recovery_timeout_s = 10.0
         # The lidar is about 0.09 m ahead of base_link while the chassis rear
         # is roughly 0.22 m behind it.  A 0.45 m laser clearance therefore

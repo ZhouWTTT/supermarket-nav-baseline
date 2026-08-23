@@ -265,14 +265,14 @@ BACKUP_TIMEOUT_S = 8.0
 # every other product and all later delivery/return turns retain the normal
 # navigator limits.
 POST_GRAB_SLOW_TURN_WATCHDOG_GRACE_S = 10.0
-HEWEIDAO_LOADED_TURN_MAX_RPS = 0.35
+HEWEIDAO_LOADED_TURN_MAX_RPS = 0.55
 # Product-specific loaded transit limits.  These are not blanket navigation
 # slowdowns: they apply only after a successful grasp and before delivery.
 # Kouxiangtang slipped in two independent runs exactly as the route requested
 # 1.0--2.0 rad/s turns; limiting yaw removes that lateral impulse while the
 # 0.75 m/s straight cap keeps the match-time cost modest.
 LOADED_TRANSPORT_LIMITS = {
-    "kouxiangtang": (0.75, 0.35),
+    "kouxiangtang": (0.75, 0.55),
     "heweidao": (None, HEWEIDAO_LOADED_TURN_MAX_RPS),
     "chengzi": (0.80, 0.55),
     "pingguo": (0.80, 0.55),
