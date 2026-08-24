@@ -857,6 +857,18 @@ class NavigationController:
         self._lateral_escape_backoff_m = 0.08
         self._last_lateral_escape_sign = 0
         self._recovery_action = None
+        # Rotate-first local recovery: turn toward a safe heading before
+        # falling back to straight reverse.  A locked turn changes the facing
+        # so a fresh replan can detour around the obstacle that blocked the
+        # straight-line approach.
+        self._rotate_recovery_target_yaw = None
+        self._rotate_recovery_started_at = 0.0
+        self._rotate_recovery_attempts = 0
+        self._rotate_recovery_max_attempts = 2
+        self._rotate_recovery_search_exhausted = False
+        self._rotate_recovery_speed = 0.30
+        self._rotate_recovery_tolerance = math.radians(3.0)
+        self._rotate_recovery_timeout_s = 8.0
 
         # Replanning/progress state
         self._last_replan_time = float('-inf')
@@ -919,6 +931,10 @@ class NavigationController:
         self._reverse_recovery_goal_dist = None
         self._lateral_escape_attempts = 0
         self._last_lateral_escape_sign = 0
+        self._rotate_recovery_target_yaw = None
+        self._rotate_recovery_started_at = 0.0
+        self._rotate_recovery_attempts = 0
+        self._rotate_recovery_search_exhausted = False
         self._recovery_action = None
         self._last_replan_time = float('-inf')
         self._replan_hold_until = float('-inf')
@@ -970,6 +986,9 @@ class NavigationController:
         if self.goal_x is None:
             return 0.0, 0.0, True
 
+        if self._reverse_recovery_phase == "rotate":
+            return self._rotate_recovery_tick(
+                base_x, base_y, base_yaw, now)
         if self._reverse_recovery_phase == "backup":
             return self._reverse_recovery_tick(
                 base_x, base_y, base_yaw, laser_msg, now)
@@ -1364,6 +1383,124 @@ class NavigationController:
         span = abs(float(laser_msg.angle_increment)) * len(laser_msg.ranges)
         return span >= 1.5 * math.pi
 
+    def _rotation_is_free(self, bx, by, byaw, target_yaw):
+        """原地旋转全程是否安全：静态 + 动态 + 配送台禁区。
+
+        原地旋转的中心 (bx, by) 不变，扫过的是以该中心为圆心、约
+        ``static_inflation_radius_m``(0.50m) 为半径的圆盘。因此用运动半径
+        clearance 检查一次即可覆盖整个扇形足迹，无需按角度步进。``byaw``
+        与 ``target_yaw`` 仅保留为诊断/未来矩形足迹扩展的接口。
+        """
+        if not self.cm.is_static_motion_free_world(bx, by):
+            return False
+        if not self.cm.is_dynamic_free_world(bx, by):
+            return False
+        if not self._table_rotation_is_free(bx, by):
+            return False
+        return True
+
+    def _recovery_heading_target(self, bx, by, byaw):
+        """返回一个稳定有用的恢复朝向：优先朝路径 lookahead，其次朝目标。"""
+        if self.path:
+            target = self._lookahead_point(
+                bx, by, max(self.lookahead_min, 0.30))
+            if math.hypot(target[0] - bx, target[1] - by) > 0.03:
+                return math.atan2(target[1] - by, target[0] - bx)
+        if self.goal_x is not None and self.goal_y is not None:
+            return math.atan2(self.goal_y - by, self.goal_x - bx)
+        return byaw
+
+    def _start_rotate_recovery(self, bx, by, byaw, now):
+        """先旋转：搜索一个能安全转过去的角度，选中则进入 rotate 阶段。
+
+        返回 True 表示已启动旋转（phase="rotate"）；返回 False 表示旋转
+        搜索耗尽或次数用尽，交回给倒车逻辑。候选角度优先朝目标方向，再
+        按 45°/30°/20°/10° 正反方向递减搜索，选第一个足迹安全的。
+        """
+        if (self._rotate_recovery_attempts
+                >= self._rotate_recovery_max_attempts
+                or self._rotate_recovery_search_exhausted):
+            return False
+        desired = self._recovery_heading_target(bx, by, byaw)
+        desired_delta = angdist(byaw, desired)
+        desired_delta = max(
+            -math.radians(60.0),
+            min(math.radians(60.0), desired_delta))
+        if abs(desired_delta) <= self._rotate_recovery_tolerance:
+            self._rotate_recovery_search_exhausted = True
+            return False
+
+        preferred_sign = 1.0 if desired_delta > 0.0 else -1.0
+        raw_candidates = [
+            desired_delta,
+            preferred_sign * math.radians(45.0),
+            preferred_sign * math.radians(30.0),
+            preferred_sign * math.radians(20.0),
+            preferred_sign * math.radians(10.0),
+            -preferred_sign * math.radians(10.0),
+            -preferred_sign * math.radians(20.0),
+        ]
+        candidate_deltas = []
+        for delta in raw_candidates:
+            delta = max(
+                -math.radians(60.0),
+                min(math.radians(60.0), delta))
+            if (abs(delta) <= self._rotate_recovery_tolerance
+                    or any(abs(angdist(existing, delta)) < 1e-6
+                           for existing in candidate_deltas)):
+                continue
+            candidate_deltas.append(delta)
+
+        target = None
+        for delta in candidate_deltas:
+            candidate = wrap_to_pi(byaw + delta)
+            if self._rotation_is_free(bx, by, byaw, candidate):
+                target = candidate
+                break
+        if target is None:
+            self._rotate_recovery_search_exhausted = True
+            return False
+
+        self._rotate_recovery_attempts += 1
+        self._reverse_recovery_phase = "rotate"
+        self._rotate_recovery_target_yaw = target
+        self._rotate_recovery_started_at = float(now)
+        self._reverse_recovery_blocked_time = 0.0
+        self.cur_lin = 0.0
+        self.cur_ang = 0.0
+        self._recovery_action = "rotate_recovery_start"
+        return True
+
+    def _rotate_recovery_tick(self, bx, by, byaw, now):
+        """执行锁定方向的原地旋转，完成后重新规划。"""
+        if self._rotate_recovery_target_yaw is None:
+            self._finish_reverse_recovery(bx, by, byaw, now)
+            self.stop_reason = "rotate_recovery_invalid"
+            return 0.0, 0.0, False
+        error = angdist(byaw, self._rotate_recovery_target_yaw)
+        elapsed = float(now) - self._rotate_recovery_started_at
+        if abs(error) <= self._rotate_recovery_tolerance:
+            self._finish_reverse_recovery(bx, by, byaw, now)
+            self.stop_reason = "rotate_recovery_complete"
+            return 0.0, 0.0, False
+        if elapsed >= self._rotate_recovery_timeout_s:
+            self._finish_reverse_recovery(bx, by, byaw, now)
+            self.stop_reason = "rotate_recovery_timeout"
+            return 0.0, 0.0, False
+        if not self._rotation_is_free(
+                bx, by, byaw, self._rotate_recovery_target_yaw):
+            self._finish_reverse_recovery(bx, by, byaw, now)
+            self.stop_reason = "rotate_recovery_blocked"
+            return 0.0, 0.0, False
+        angular = math.copysign(
+            min(self._rotate_recovery_speed,
+                max(0.12, 1.5 * abs(error))),
+            error)
+        self.cur_lin = 0.0
+        self.cur_ang = angular
+        self.stop_reason = "rotate_recovery"
+        return 0.0, angular, False
+
     def _maybe_start_reverse_recovery(
             self, reason, bx, by, byaw, laser_msg, now):
         """Enter measured straight backup after a persistent local block."""
@@ -1414,6 +1551,9 @@ class NavigationController:
             return False
         if now < self._reverse_recovery_cooldown_until:
             return False
+        # 先旋转改变朝向找安全方向；旋转搜索耗尽/次数用尽再走倒车。
+        if self._start_rotate_recovery(bx, by, byaw, now):
+            return True
         if (self._reverse_recovery_attempts
                 >= self._reverse_recovery_max_attempts):
             if (self._lateral_escape_attempts
@@ -2162,7 +2302,9 @@ class SupermarketNavigator:
         """Whether local translational recovery has spent its full budget."""
         ctrl = self.controller
         return bool(
-            ctrl._reverse_recovery_attempts
+            ctrl._rotate_recovery_attempts
+            >= ctrl._rotate_recovery_max_attempts
+            and ctrl._reverse_recovery_attempts
             >= ctrl._reverse_recovery_max_attempts
             and ctrl._lateral_escape_attempts
             >= ctrl._lateral_escape_max_attempts)

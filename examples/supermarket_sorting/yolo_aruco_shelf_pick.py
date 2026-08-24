@@ -607,6 +607,17 @@ DUAL_TISSUE_POST_SIDE_SPAN_M = 0.140
 # Near a side-column box, keep the rolled wrists slow enough that position
 # tracking cannot overshoot the roughly 29 mm lateral clearance.
 DUAL_TISSUE_SIDE_ROLLED_MAX_STEP_RAD = 0.005
+# 侧滚腕专用探入深度：固定板（TCP 前 55~85mm）的接触带中心在
+# insert_y-0.07 处，insert=0.025 时接触带中心落在盒心附近（约前 2.5mm），
+# 从"抓前端"改为"抓中间"，固定板对盒侧整面贴合（85mm 深）。该值只
+# 作用于侧滚腕路径，中列手侧面路径保持原 5mm。
+DUAL_TISSUE_SIDE_ROLLED_INSERT_FORWARD_M = 0.025
+# 场景边缘墙壁（x=±2.47）避让：目标列贴近墙壁时，把对齐基座向货架中心
+# 平移，避免双臂部署/预抓路径扫墙（实测 A C1 左臂扫西墙 21mm，东移
+# 0.06m 后干净；E C3 右臂扫东墙 91mm，西移 0.12m 后干净）。
+DUAL_TISSUE_WALL_CLEAR_X_THRESHOLD_M = 1.90
+DUAL_TISSUE_WEST_WALL_SHIFT_M = 0.06
+DUAL_TISSUE_EAST_WALL_SHIFT_M = 0.12
 # 最终夹持半跨度（侧面大面夹持，过盈约 27mm/侧）。
 DUAL_TISSUE_CLAMP_HALF_SPAN_M = 0.090
 # Default tissue TCP shelf clearance; top and lower levels have additional
@@ -642,7 +653,7 @@ DUAL_TISSUE_ENDPOINT_TCP_TOLERANCE_M = 0.018
 # the same orientation is retained through insertion, clamp, lift and retreat.
 DUAL_TISSUE_SIDE_ROLLED_ENABLED = True
 DUAL_TISSUE_SIDE_ROLLED_TCP_CLEARANCE_M = 0.100
-DUAL_TISSUE_SIDE_ROLLED_SQUEEZE_M = 0.015
+DUAL_TISSUE_SIDE_ROLLED_SQUEEZE_M = 0.020
 DUAL_TISSUE_SIDE_ROLLED_MAX_SEGMENT_JOINT_DELTA_RAD = 0.90
 # 手背（outward）探入到位后，旋转 90° 到“手侧面”夹持姿态的路径长度
 # 与速度。旋转点位于纸盒后侧之外，不会扫到立柱/邻货。
@@ -731,7 +742,10 @@ DUAL_TISSUE_ARM_LIFT_MIN_CLEARANCE_M = 0.025
 DUAL_TISSUE_ARM_RETREAT_STEP_M = 0.055
 DUAL_TISSUE_ARM_SEGMENT_MAX_JOINT_DELTA_RAD = 0.45
 DUAL_TISSUE_TOP_MIDDLE_LIFT_INWARD_PRELOAD_M = 0.002
-DUAL_TISSUE_TOP_ARM_RETREAT_SPEED_MPS = 0.030
+# 顶层侧滚腕抬升撤退限速 0.018（与中层/下层手侧面撤退同速）。实测 0.030
+# 下带载撤退时双侧手臂差约 0.07 rad 不收敛（左臂 TCP 差 50mm），10s 超时
+# 中止丢盒；放慢后跟踪误差显著减小（2026-08-24 顶层 A C1 现场复现）。
+DUAL_TISSUE_TOP_ARM_RETREAT_SPEED_MPS = 0.018
 DUAL_TISSUE_ARM_LIFT_Z_TOLERANCE_M = 0.006
 DUAL_TISSUE_LIFT_DWELL_S = 2.5
 DUAL_TISSUE_SLIDE_LIFT_TOLERANCE_M = 0.015
@@ -814,7 +828,7 @@ GRASP_TCP_Z_OFFSET_BY_KIND = {"kele": -0.010, "heweidao": -0.010}
 # KDL/仿真运动学的 X 方向执行偏差：普通货物右臂 TCP 实测比指令偏东约
 # 1-2cm（用户视角为偏左），把指令目标再往西（-x）10mm，右臂合计 -20mm；
 # 左臂不再往东补偿，保持目标点居中。球体与纸巾不走该补偿，不受影响。
-GRASP_TCP_X_OFFSET_BY_ARM = {"r": -0.000, "l": 0.000}
+GRASP_TCP_X_OFFSET_BY_ARM = {"r": 0.005, "l": 0.000}
 GRIPPER_MAX_OPENING_M = 0.080
 GRIP_PRESHAPE_CLEARANCE_M = 0.012
 GRIP_PRESHAPE_REACHED_TOLERANCE = 0.04
@@ -1653,6 +1667,15 @@ class ShelfPickController(Node):
         if self.use_dual_tissue_grasp:
             self.grasp_arm = "r"
             desired_base_x = self.target_world[0]
+            # 场景边缘墙壁避让：A 货架 C1（最西列）与 E 货架 C3（最东列）
+            # 的双臂部署/预抓路径会扫到 x=±2.47 的墙壁（实测 A C1 左臂
+            # 扫西墙 21mm、E C3 右臂扫东墙 91mm）。把对齐基座向货架中心
+            # 平移，使部署路径全程留在墙内（A C1 东移 0.06m、E C3 西移
+            # 0.12m 后实测干净），手臂仍可达目标两侧。
+            if desired_base_x < -DUAL_TISSUE_WALL_CLEAR_X_THRESHOLD_M:
+                desired_base_x += DUAL_TISSUE_WEST_WALL_SHIFT_M
+            elif desired_base_x > DUAL_TISSUE_WALL_CLEAR_X_THRESHOLD_M:
+                desired_base_x -= DUAL_TISSUE_EAST_WALL_SHIFT_M
         else:
             # 恢复“A 货架用左臂、其他货架用右臂”的统一臂选择：
             # 顶层不再强制左臂，避免非 A 货架也走左臂导致抓取偏左。
@@ -3568,7 +3591,11 @@ class ShelfPickController(Node):
         self.dual_clamp_half_span = (
             TISSUE_ROTATED_CLAMP_HALF_SPAN_M
             if rotated else DUAL_TISSUE_CLAMP_HALF_SPAN_M)
-        self.dual_insert_forward_m = DUAL_TISSUE_INSERT_FORWARD_M
+        # 侧滚腕路径加深探入（抓盒中段），中列手侧面保持原 5mm。
+        self.dual_insert_forward_m = (
+            DUAL_TISSUE_SIDE_ROLLED_INSERT_FORWARD_M
+            if self.dual_side_rolled
+            else DUAL_TISSUE_INSERT_FORWARD_M)
         self.dual_top_wrist_rolled = self.dual_side_rolled
         self.dual_top_wrist_inward = False
         self.dual_contact_push_side = (
@@ -5535,26 +5562,47 @@ class ShelfPickController(Node):
 
         if (self.dual_motion_require_convergence
                 and not endpoint_stable):
-            left_error_vector = (
-                self.arm_positions("left") - self.des_left_arm)
-            right_error_vector = (
-                self.arm_positions("right") - self.des_right_arm)
-            left_error = float(np.max(np.abs(left_error_vector)))
-            right_error = float(np.max(np.abs(right_error_vector)))
-            self.get_logger().error(
-                f"[dual-tissue-{self.dual_motion_label}] endpoint did not "
-                f"converge; elapsed={elapsed:.2f}s "
-                f"left_arm_error={left_error:.4f}rad "
-                f"right_arm_error={right_error:.4f}rad "
-                f"left_tcp_error={left_tcp_error:.4f}m "
-                f"right_tcp_error={right_tcp_error:.4f}m "
-                f"left_joint_errors={np.round(left_error_vector, 4)} "
-                f"right_joint_errors={np.round(right_error_vector, 4)} "
-                f"left_tcp={None if left_tcp is None else np.round(left_tcp, 4)} "
-                f"right_tcp={None if right_tcp is None else np.round(right_tcp, 4)}; "
-                "aborting before contact search")
-            self.set_state(STATE_ABORT)
-            return "failed"
+            # 顶层抬升撤退：盒子已横向移出货架前缘时，残余关节误差只是
+            # 夹持预压/负载的静态偏差，不代表撤退未完成。实测 0.030 速下
+            # 差 0.07 rad 即被误判中止丢盒；此时双侧 TCP y 已 < clear_y，
+            # 直接按完成放行，避免打开夹爪。
+            retreat_clear = False
+            if self.dual_motion_label.startswith("raised_retreat_"):
+                clear_y = (
+                    self.target_world[1]
+                    - PRODUCT_BEHIND_MARKER_M
+                    - GENERIC_RETREAT_CLEAR_MARGIN_M)
+                retreat_clear = (
+                    left_tcp is not None
+                    and right_tcp is not None
+                    and left_tcp[1] < clear_y
+                    and right_tcp[1] < clear_y)
+            if not retreat_clear:
+                left_error_vector = (
+                    self.arm_positions("left") - self.des_left_arm)
+                right_error_vector = (
+                    self.arm_positions("right") - self.des_right_arm)
+                left_error = float(np.max(np.abs(left_error_vector)))
+                right_error = float(np.max(np.abs(right_error_vector)))
+                self.get_logger().error(
+                    f"[dual-tissue-{self.dual_motion_label}] endpoint did "
+                    f"not converge; elapsed={elapsed:.2f}s "
+                    f"left_arm_error={left_error:.4f}rad "
+                    f"right_arm_error={right_error:.4f}rad "
+                    f"left_tcp_error={left_tcp_error:.4f}m "
+                    f"right_tcp_error={right_tcp_error:.4f}m "
+                    f"left_joint_errors={np.round(left_error_vector, 4)} "
+                    f"right_joint_errors={np.round(right_error_vector, 4)} "
+                    f"left_tcp={None if left_tcp is None else np.round(left_tcp, 4)} "
+                    f"right_tcp={None if right_tcp is None else np.round(right_tcp, 4)}; "
+                    "aborting before contact search")
+                self.set_state(STATE_ABORT)
+                return "failed"
+            self.get_logger().warn(
+                f"[dual-tissue-{self.dual_motion_label}] endpoint did "
+                f"not converge but both TCPs are clear of the shelf "
+                f"(left_y={left_tcp[1]:.3f} right_y={right_tcp[1]:.3f} < "
+                f"{clear_y:.3f}); treating the raised retreat as complete")
         self.get_logger().info(
             f"[dual-tissue-{self.dual_motion_label}] segment complete; "
             f"elapsed={elapsed:.2f}s "

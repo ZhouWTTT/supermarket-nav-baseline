@@ -135,13 +135,14 @@ DELIVERY_TABLE_TOP_Z_M = 0.767
 # depth-only row would leave less than 90 mm between centres on this 440 mm
 # deep table and would overlap the larger products.  All slots are shifted
 # 50 mm south from the original layout so the fourth and fifth products are
-# not released at the north edge of the tabletop.
+# not released at the north edge of the tabletop; shifted a further 50 mm
+# south on request so every product lands deeper on the table.
 DELIVERY_PLACE_SLOTS_XY = (
-    (-2.20, -3.50),  # 1: deepest, inner-left
-    (-1.94, -3.48),  # 2: inner-centre
-    (-1.68, -3.46),  # 3: inner-right
-    (-2.07, -3.34),  # 4: outer-left
-    (-1.81, -3.32),  # 5: outer-right / nearest
+    (-2.20, -3.55),  # 1: deepest, inner-left
+    (-1.94, -3.53),  # 2: inner-centre
+    (-1.68, -3.51),  # 3: inner-right
+    (-2.07, -3.39),  # 4: outer-left
+    (-1.81, -3.37),  # 5: outer-right / nearest
 )
 PLACE_SLOT_IK_NUDGE_M = 0.020
 PLACE_SLOT_XY_TOLERANCE_M = 0.020
@@ -276,6 +277,10 @@ ROUTE_LEG_STALL_TIMEOUT_S = 35.0
 # ceiling for slow-but-progressing legs; 150 s at the observed slowest real
 # sim rate still covers every route leg in this arena.
 ROUTE_LEG_HARD_TIMEOUT_S = 150.0
+
+# 运行中"动态直达"（go_scan 途中改道到具体槽位）与订单开始直达一致的
+# 置信度下限：拦截不可能成为矩阵主证据的病理记录（wxj v2 语义）。
+DYNAMIC_DIRECT_CONF_MIN = 0.70
 
 # Keep the held product clear of the shelf before delivery navigation starts
 # turning the base.  The arms and product still protrude toward the shelf at
@@ -897,8 +902,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self, hint: dict, reason: str) -> bool:
         hint_x = float(hint["x"])
         column = str(hint.get("column", ""))
+        confidence = float(hint.get("confidence", 0.0) or 0.0)
         if (self.close_recheck
                 and column in {"1", "2", "3"}
+                and confidence >= DYNAMIC_DIRECT_CONF_MIN
                 and self.configure_direct_slot_target(
                     str(hint["shelf"]), str(hint["level"]), column,
                     product_y=hint.get("world_y"),
@@ -1157,7 +1164,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         # robot is not stalled.  Keep the replan budget for an actual obstacle
         # stop later in the route.
         active_heading_alignment = (
-            stop_reason == "heading_alignment" and abs(float(w)) >= 0.05)
+            (stop_reason == "heading_alignment" and abs(float(w)) >= 0.05)
+            or stop_reason == "rotate_recovery")
         if active_heading_alignment:
             self._route_leg_last_progress_at = now
             stalled = 0.0
