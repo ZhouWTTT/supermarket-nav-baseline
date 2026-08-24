@@ -162,6 +162,17 @@ PRODUCT_HALF_HEIGHT_M = {
     "pingguo": 0.0350,
     "chengzi": 0.0370,
 }
+# Heweidao uses a tapered 105 mm-tall collision mesh.  Keep the shared table
+# above untouched because grasp/perception inherited its historical value;
+# placement alone needs the physical half-height to put the product bottom on
+# the delivery table and to validate contact there.
+HEWEIDAO_PLACE_HALF_HEIGHT_M = 0.0525
+# Command a few millimetres beyond the geometric table plane.  The product
+# stops on the tabletop first, leaving enough slide error for the existing
+# velocity/effort stall detector to prove that it is supported before release.
+HEWEIDAO_PLACE_CONTACT_OVERTRAVEL_M = 0.006
+HEWEIDAO_PLACE_DESCENT_SLIDE_STEP_M = 0.0004
+HEWEIDAO_PLACE_DESCENT_TIMEOUT_S = 20.0
 # Product bottom clearance above the delivery table top at release: the arm
 # lowers until the held product bottom is 1 cm above the table, then opens the
 # gripper.  The product drops the remaining 1 cm onto the table, then the arm
@@ -170,6 +181,7 @@ PLACE_PRODUCT_BOTTOM_CLEARANCE_M = 0.010
 # Spheres can roll after even a short free fall.  Lower them to 3 mm above the
 # measured tabletop while boxes retain the original 10 mm clearance.
 PLACE_PRODUCT_BOTTOM_CLEARANCE_BY_KIND_M = {
+    "heweidao": -HEWEIDAO_PLACE_CONTACT_OVERTRAVEL_M,
     "chengzi": 0.003,
     "pingguo": 0.003,
 }
@@ -204,6 +216,16 @@ PLACE_XY_TIMEOUT_FALLBACK_TOLERANCE_M = 0.080
 PLACE_DESCENT_TIMEOUT_S = 10.0
 PLACE_VERTICAL_CLEARANCE_M = 0.070
 PLACE_VERTICAL_CLEAR_TIMEOUT_S = 5.0
+# Heweidao is wider at its top (95 mm) than the gripper's nominal maximum
+# opening (80 mm).  Gravity release through the open fingers is therefore not
+# reliable: after table contact, open the fingers, keep the arm fixed and back
+# the chassis straight away from the table before any vertical lift.
+HEWEIDAO_RELEASE_OPEN_MIN_S = 1.0
+HEWEIDAO_RELEASE_OPEN_TIMEOUT_S = 3.0
+HEWEIDAO_RELEASE_GRIP_OPEN_MIN = 0.85
+HEWEIDAO_RELEASE_BASE_BACKUP_DISTANCE_M = 0.100
+HEWEIDAO_RELEASE_BASE_BACKUP_SPEED_MPS = 0.10
+HEWEIDAO_RELEASE_BASE_BACKUP_TIMEOUT_S = 5.0
 # 下降接触检测：长商品/夹持偏低导致商品底部先触桌时，slide 被桌面顶住、
 # 反馈不再跟随命令（实测卡死时 slide 力矩饱和 ≈ -306 N·m，正常运动时 ≈ 0）。
 # 检测到"slide 力矩饱和 + 位置停滞"后停止下压并就地释放（商品底部已在桌面，
@@ -525,6 +547,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._place_refine_stable_since = None
         self._place_refine_iterations = 0
         self._place_release_started_at = None
+        self._heweidao_release_phase = None
+        self._heweidao_release_phase_started_at = 0.0
+        self._heweidao_release_base_start_xy = None
         self._place_slide_stall_snapshot = None
         self._place_stall_warn_log = 0.0
         self._place_retreat_sent = False
@@ -2267,7 +2292,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         shelf.  Preserve that grasp-time vertical offset so the product bottom
         -- rather than the wrist -- receives the configured table clearance.
         """
-        half_height = PRODUCT_HALF_HEIGHT_M[self.target_kind]
+        half_height = self._placement_product_half_height()
         bottom_clearance = PLACE_PRODUCT_BOTTOM_CLEARANCE_BY_KIND_M.get(
             self.target_kind, PLACE_PRODUCT_BOTTOM_CLEARANCE_M)
         return (
@@ -2275,6 +2300,12 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             + half_height
             + bottom_clearance
             + self._tcp_above_product_center())
+
+    def _placement_product_half_height(self) -> float:
+        """Return geometry used only by the delivery-table placement flow."""
+        if self.target_kind == "heweidao":
+            return HEWEIDAO_PLACE_HALF_HEIGHT_M
+        return PRODUCT_HALF_HEIGHT_M[self.target_kind]
 
     def _product_bottom_at_table(self, tcp: np.ndarray | None) -> bool:
         """True when the held product's bottom is at/near the table surface.
@@ -2290,7 +2321,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             return False
         if not np.all(np.isfinite(tcp)):
             return False
-        half_height = PRODUCT_HALF_HEIGHT_M[self.target_kind]
+        half_height = self._placement_product_half_height()
         bottom_z = (
             float(tcp[2])
             - self._tcp_above_product_center()
@@ -2913,6 +2944,98 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             f"[place] goods released; raising vertically before retreat "
             f"slide={float(measured_slide):.3f}->{target_slide:.3f}")
 
+    def _start_heweidao_release_base_backup(self, now: float) -> None:
+        """Back the fixed arm and open fingers away from supported heweidao."""
+        measured_slide = self.joints.get("slide_joint")
+        measured_arm = self.selected_arm_positions()
+        if (measured_slide is None
+                or not math.isfinite(float(measured_slide))
+                or not np.all(np.isfinite(measured_arm))):
+            raise RuntimeError(
+                "heweidao release base backup lacks arm/slide feedback")
+
+        self.place_arm_joints = measured_arm.copy()
+        self.set_selected_arm_target(measured_arm)
+        self.des_slide = float(measured_slide)
+        self.commands_ready_since = None
+        self._heweidao_release_phase = "base_backing"
+        self._heweidao_release_phase_started_at = now
+        self._heweidao_release_base_start_xy = self.base_xy.copy()
+        self.get_logger().info(
+            "[place-heweidao] product supported and gripper open; "
+            "holding arm/slide fixed and backing chassis horizontally "
+            f"distance={HEWEIDAO_RELEASE_BASE_BACKUP_DISTANCE_M:.3f}m "
+            f"start_xy={np.round(self._heweidao_release_base_start_xy, 3)} "
+            f"measured_grip={self.selected_gripper_position()}")
+
+    def _heweidao_place_release_tick(self, now: float) -> None:
+        """Open, back the fixed arm with the chassis, then raise vertically."""
+        self._set_selected_grip(pick.GRIP_OPEN)
+        if self._heweidao_release_phase is None:
+            self._heweidao_release_phase = "opening"
+            self._heweidao_release_phase_started_at = now
+            self.get_logger().info(
+                "[place-heweidao] table support verified; opening gripper "
+                "before the fixed-arm chassis backup")
+            return
+
+        elapsed = now - self._heweidao_release_phase_started_at
+        measured_grip = self.selected_gripper_position()
+        grip_open = (
+            measured_grip is not None
+            and math.isfinite(float(measured_grip))
+            and float(measured_grip) >= HEWEIDAO_RELEASE_GRIP_OPEN_MIN)
+
+        if self._heweidao_release_phase == "opening":
+            if elapsed < HEWEIDAO_RELEASE_OPEN_MIN_S:
+                return
+            if not grip_open and elapsed < HEWEIDAO_RELEASE_OPEN_TIMEOUT_S:
+                return
+            if not grip_open:
+                self.get_logger().warn(
+                    "[place-heweidao] gripper did not reach the open "
+                    "threshold while stationary; starting the 100 mm chassis "
+                    f"backup to clear the tapered shoulder grip="
+                    f"{measured_grip}")
+            self._start_heweidao_release_base_backup(now)
+            return
+
+        if self._heweidao_release_phase != "base_backing":
+            raise RuntimeError(
+                "invalid heweidao release phase "
+                f"{self._heweidao_release_phase!r}")
+
+        if self._heweidao_release_base_start_xy is None:
+            raise RuntimeError(
+                "heweidao release base backup lacks its odometry start pose")
+        moved = float(np.linalg.norm(
+            self.base_xy - self._heweidao_release_base_start_xy))
+        if moved >= HEWEIDAO_RELEASE_BASE_BACKUP_DISTANCE_M:
+            self.set_twist(0.0, 0.0)
+            self.cmd_linear = 0.0
+            self.cmd_angular = 0.0
+            if not grip_open:
+                if elapsed < HEWEIDAO_RELEASE_BASE_BACKUP_TIMEOUT_S:
+                    return
+                raise RuntimeError(
+                    "heweidao gripper did not verify open after the 100 mm "
+                    f"chassis backup (measured_grip={measured_grip})")
+            self.get_logger().info(
+                "[place-heweidao] 100 mm chassis backup complete with "
+                "arm/slide fixed; "
+                f"moved={moved:.3f}m grip={float(measured_grip):.3f}; "
+                "starting vertical clearance")
+            self._start_place_vertical_clear(now)
+            return
+        if elapsed >= HEWEIDAO_RELEASE_BASE_BACKUP_TIMEOUT_S:
+            self.set_twist(0.0, 0.0)
+            raise RuntimeError(
+                "heweidao chassis release backup did not reach "
+                f"{HEWEIDAO_RELEASE_BASE_BACKUP_DISTANCE_M:.3f}m within "
+                f"{HEWEIDAO_RELEASE_BASE_BACKUP_TIMEOUT_S:.1f}s "
+                f"(moved={moved:.3f}m, measured_grip={measured_grip})")
+        self.set_twist(-HEWEIDAO_RELEASE_BASE_BACKUP_SPEED_MPS, 0.0)
+
     def _place_vertical_clear_tick(self, now: float) -> None:
         """Complete post-release vertical clearance with the base locked."""
         self.set_twist(0.0, 0.0)
@@ -3129,10 +3252,14 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 return
             if not self.commands_ready(
                     arm_tolerance=0.05, slide_tolerance=0.010):
-                if now - self.place_t0 >= PLACE_DESCENT_TIMEOUT_S:
+                descent_timeout = (
+                    HEWEIDAO_PLACE_DESCENT_TIMEOUT_S
+                    if self.target_kind == "heweidao"
+                    else PLACE_DESCENT_TIMEOUT_S)
+                if now - self.place_t0 >= descent_timeout:
                     raise RuntimeError(
                         "vertical place descent did not settle within "
-                        f"{PLACE_DESCENT_TIMEOUT_S:.1f}s")
+                        f"{descent_timeout:.1f}s")
                 return
             tcp = self.selected_tcp_world()
             self.get_logger().info(
@@ -3149,6 +3276,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self._place_slide_stall_snapshot = None
         elif self.place_stage == 3:
             # Keep arm and slide fixed while the gripper opens.
+            if self.target_kind == "heweidao":
+                self._heweidao_place_release_tick(now)
+                return
             self._set_selected_grip(pick.GRIP_OPEN)
             if (now - self._place_release_started_at
                     >= self.place_release_dwell_s):
@@ -3593,13 +3723,16 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         """Return whether the active placement stage intentionally moves the base.
 
         The refined table-placement flow performs its final creep in stage 0
-        and its post-release table retreat in stage 5; stages 1-4 run against
-        one fixed world-frame base.  Derived controllers that use different
-        stage meanings must override this hook; otherwise the fixed-base
-        safety gate below can silently cancel their intended motion.
+        and its post-release table retreat in stage 5.  Heweidao additionally
+        backs the chassis 100 mm with the released arm fixed during stage 3;
+        all other motion in stages 1-4 runs against one fixed world-frame base.
         """
         if self.place_stage == 0:
             return not self.place_creep_done
+        if (self.place_stage == 3
+                and self.target_kind == "heweidao"
+                and self._heweidao_release_phase == "base_backing"):
+            return True
         return self.place_stage == 5
 
     def smooth_commands(self) -> None:
@@ -3717,10 +3850,14 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         if (self.flow_phase == "place"
                 and (single_loaded_slide_positioning
                      or single_descent or dual_descent or vertical_clear)):
+            slide_step = (
+                HEWEIDAO_PLACE_DESCENT_SLIDE_STEP_M
+                if (single_descent and self.target_kind == "heweidao")
+                else PLACE_DESCENT_SLIDE_STEP_M)
             self.cmd_slide = float(self.slew(
                 previous_slide,
                 self.des_slide,
-                PLACE_DESCENT_SLIDE_STEP_M))
+                slide_step))
 
     # ------------------------------------------------------------------
     # main control loop

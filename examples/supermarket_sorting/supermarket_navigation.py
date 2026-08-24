@@ -828,6 +828,12 @@ class NavigationController:
         self._reverse_recovery_started_at = 0.0
         self._reverse_recovery_trigger_s = 1.0
         self._reverse_recovery_no_progress_m = 0.03
+        # Only a genuinely pinched heading_alignment should reverse: the base
+        # is stuck turning while obstacles are within ~0.30 m (measured with
+        # lidar≈0.30 m).  _slow_dist (0.50 m) is the *slowdown* band and is
+        # far too loose as a "stuck" test — it fires on every ordinary turn
+        # taken near a wall/shelf, causing constant backing up.
+        self._heading_alignment_recover_dist = 0.30
         self._reverse_recovery_distance_m = 0.20
         self._reverse_recovery_speed = 0.20
         self._reverse_recovery_timeout_s = 10.0
@@ -1105,6 +1111,14 @@ class NavigationController:
         if abs(heading_err) > self.translation_heading_gate:
             if composite < self._slow_dist:
                 v_des = min(v_des, 0.06)
+            elif self.cm.line_is_free(base_x, base_y, la_x, la_y):
+                # The straight line to the lookahead point is clear.  Rather
+                # than hard-stopping to rotate in place — which cannot reduce
+                # a lateral offset or resolve a lookahead point that wraps
+                # behind the base, so the heading error oscillates and the
+                # robot swings without progress — creep forward a little.
+                # The motion-arc prediction still vetoes an unsafe arc below.
+                v_des = 0.08
             else:
                 self.cur_lin = 0.0
                 v_des = 0.0
@@ -1362,7 +1376,7 @@ class NavigationController:
         if reason == "heading_alignment":
             composite = min(
                 self.lidar_clearance, self.depth_clearance_val)
-            if composite < self._slow_dist:
+            if composite < self._heading_alignment_recover_dist:
                 recoverable = recoverable | {"heading_alignment"}
         if reason not in recoverable:
             self._reverse_recovery_blocked_time = max(

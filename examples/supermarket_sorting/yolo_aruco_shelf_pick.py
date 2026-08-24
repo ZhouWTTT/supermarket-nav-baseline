@@ -4484,7 +4484,7 @@ class ShelfPickController(Node):
         return True
 
     def configure_top_grasp(self) -> bool:
-        """Raise to a front-facing top-shelf pregrasp, then extend horizontally."""
+        """Raise to a front-facing top-shelf pregrasp, then extend to close."""
         grasp_tcp_z = self.top_grasp_tcp_z()
         pregrasp_world = self.target_world.copy()
         pregrasp_world[2] = grasp_tcp_z
@@ -4494,6 +4494,9 @@ class ShelfPickController(Node):
         nominal_contact_world[1] += TOP_GRASP_TCP_FORWARD_M
         extended_contact_world = nominal_contact_world.copy()
         extended_contact_world[1] += GENERIC_POST_CONTACT_EXTENSION_M
+        top_post_extend_z_drop = GENERIC_POST_EXTEND_Z_DROP_M_BY_KIND.get(
+            self.target_kind, 0.0)
+        extended_contact_world[2] -= top_post_extend_z_drop
 
         reference = (self.cmd_right_arm.copy() if self.grasp_arm == "r"
                      else self.cmd_left_arm.copy())
@@ -4503,8 +4506,9 @@ class ShelfPickController(Node):
             else MMK2FIK.TMat_chest2lft_base[:3, :3])
         # Identity in the footprint frame points the gripper squarely toward
         # the shelf.  Pregrasp and contact have identical Z and orientation;
-        # after the high pose is reached there is no downward component and no
-        # intermediate correction target that could make the arm shake.
+        # after the high pose is reached there is no intermediate correction
+        # target that could make the arm shake.  Products with an explicit
+        # post-extension Z drop descend only during the final monotonic segment.
         top_grasp_rotation = arm_base_rotation.T
 
         solutions = []
@@ -4551,6 +4555,7 @@ class ShelfPickController(Node):
             f"nominal_close={np.round(nominal_contact_world, 3)} "
             f"extended_close={np.round(extended_contact_world, 3)} "
             f"post_extension={GENERIC_POST_CONTACT_EXTENSION_M:.3f}m "
+            f"z_drop={top_post_extend_z_drop:.3f}m "
             "wrist=front-upright "
             f"product_center_z={self.target_world[2]:.4f}m "
             f"tcp_target_z={grasp_tcp_z:.4f}m "
