@@ -135,15 +135,19 @@ DELIVERY_TABLE_TOP_Z_M = 0.767
 # depth-only row would leave less than 90 mm between centres on this 440 mm
 # deep table and would overlap the larger products.  All slots are shifted
 # 50 mm south from the original layout so the fourth and fifth products are
-# not released at the north edge of the tabletop; shifted a further 50 mm
-# south on request so every product lands deeper on the table.
+# not released at the north edge of the tabletop.  A further 50 mm south shift
+# pushed the deepest inner slot out of arm reach (IK no-solution), so the inner
+# slots are reverted to the original depth while the outer slots stay shifted.
 DELIVERY_PLACE_SLOTS_XY = (
-    (-2.20, -3.55),  # 1: deepest, inner-left
-    (-1.94, -3.53),  # 2: inner-centre
-    (-1.68, -3.51),  # 3: inner-right
+    (-2.20, -3.50),  # 1: deepest, inner-left
+    (-1.94, -3.48),  # 2: inner-centre
+    (-1.68, -3.46),  # 3: inner-right
     (-2.07, -3.39),  # 4: outer-left
     (-1.81, -3.37),  # 5: outer-right / nearest
 )
+# 纸巾专用放置位：桌子最东侧。最深内排槽位会超出双臂前伸可达范围
+# （IK 无解），故纸巾固定放东侧较浅处，机器人导航到对应 x 后直接下降。
+TISSUE_DEDICATED_PLACE_XY = (-1.55, -3.30)
 PLACE_SLOT_IK_NUDGE_M = 0.020
 PLACE_SLOT_XY_TOLERANCE_M = 0.020
 
@@ -360,10 +364,14 @@ PLACE_LOADED_ARM_STEP_RAMP_RAD = 0.00025
 PLACE_LOADED_ARM_MAX_STEP_BY_KIND_RAD = {
     "chengzi": 0.0030,
     "pingguo": 0.0030,
+    # 纸巾双臂在精校准 XY 平移时，左右臂关节路径不对称会撕扯纸盒导致
+    # 掉落；用半速上限压低每 tick 关节步长，减小双臂笛卡尔轨迹差异。
+    "zhijin": 0.0030,
 }
 PLACE_LOADED_ARM_STEP_RAMP_BY_KIND_RAD = {
     "chengzi": 0.00010,
     "pingguo": 0.00010,
+    "zhijin": 0.00010,
 }
 # The capture gate remains deliberately strict while lifting from the shelf.
 # After that capture has been verified, a sphere can settle deeper between the
@@ -474,6 +482,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_slot = place_slot
         self.place_world = np.array(
             [place_x, place_y, place_z], dtype=float)
+        if target_kind == "zhijin":
+            # 纸巾固定放东侧专用位，避免最深槽位双臂 IK 无解。
+            self.place_world[0] = TISSUE_DEDICATED_PLACE_XY[0]
+            self.place_world[1] = TISSUE_DEDICATED_PLACE_XY[1]
         self.place_min_approach_z = float(place_z)
         self.place_release_dwell_s = place_release_dwell_s
         self.place_retreat_dwell_s = place_retreat_dwell_s
@@ -566,6 +578,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._place_retreat_start_clearance = None
         self._dual_descent_sent = False
         self._dual_place_target_sent = False
+        self._dual_release_spread_sent = False
         self.dual_release_slide_cmd = None
         self.place_creep_start_y = None
         self.place_creep_done = False
@@ -2409,6 +2422,17 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     - float(self.target_world[2]))
         return 0.0
 
+    def _place_tcp_offset(self) -> float:
+        """放置时 TCP 高出商品中心的高度。
+
+        heweidao 在放置时把夹爪绕腕轴旋转 180°，TCP 相对商品中心的 z 偏移
+        随之符号反转（抓取时下移 1cm 夹窄处，旋转后变成上移 1cm）。
+        """
+        offset = self._tcp_above_product_center()
+        if self.target_kind == "heweidao":
+            offset = -offset
+        return offset
+
     def _product_release_z(self) -> float:
         """Return TCP height that leaves the product just above the table.
 
@@ -2424,7 +2448,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             DELIVERY_TABLE_TOP_Z_M
             + half_height
             + bottom_clearance
-            + self._tcp_above_product_center())
+            + self._place_tcp_offset())
 
     def _placement_product_half_height(self) -> float:
         """Return geometry used only by the delivery-table placement flow."""
@@ -2449,7 +2473,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         half_height = self._placement_product_half_height()
         bottom_z = (
             float(tcp[2])
-            - self._tcp_above_product_center()
+            - self._place_tcp_offset()
             - half_height)
         high_tolerance = PLACE_CONTACT_BOTTOM_HIGH_TOL_BY_KIND_M.get(
             self.target_kind, PLACE_CONTACT_BOTTOM_HIGH_TOL_M)
@@ -2704,6 +2728,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             slide: float) -> np.ndarray | None:
         """Solve the selected arm to ``world`` at a given slide height."""
         target = np.eye(4)
+        if self.target_kind == "heweidao":
+            # heweidao 放置：夹爪绕左右轴(x)旋转 180°，让锥形杯上下颠倒
+            # ——宽口朝下接触桌面，松爪后夹爪直接从窄底脱离，不再需要
+            # "开爪后底盘水平抽离"。(绕 y 轴腕轴翻滚会导致放置 IK 无解)
+            target[:3, :3] = pick.Rotation.from_euler("x", math.pi).as_matrix()
         target[:3, 3] = self.world_to_footprint(world)
         reference = np.asarray(reference, dtype=float)
         ref_with_slide = np.concatenate(([slide], reference))
@@ -3053,6 +3082,76 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             f"centre={np.round(release_world, 3)} "
             f"slide={float(measured_slide):.3f}->{target_slide:.3f}")
 
+    def _start_dual_place_release_spread(self, now: float) -> None:
+        """双臂横向分开，把闭合夹爪从纸巾盒两侧抽离（抓取合拢的取反）。
+
+        纸巾抓取时双臂从预抓半跨度(0.150m)向中间合拢到夹持半跨度(0.090m)；
+        放置取反：双臂横向向外分开回预抓半跨度，让闭合的夹爪离开盒侧，
+        再由 stage 4 垂直抬升，全程不先松爪。
+        """
+        left_tcp = self.arm_tcp_world("left")
+        right_tcp = self.arm_tcp_world("right")
+        left_reference = self.arm_positions("left")
+        right_reference = self.arm_positions("right")
+        measured_slide = self.joints.get("slide_joint")
+        if (left_tcp is None or right_tcp is None
+                or left_reference is None or right_reference is None
+                or measured_slide is None):
+            raise RuntimeError(
+                "dual release spread lacks arm/slide feedback")
+
+        centre = 0.5 * (np.asarray(left_tcp) + np.asarray(right_tcp))
+        release_half_span = float(pick.DUAL_TISSUE_PREGRASP_HALF_SPAN_M)
+        left_goal = np.asarray(left_tcp, dtype=float).copy()
+        right_goal = np.asarray(right_tcp, dtype=float).copy()
+        left_goal[0] = centre[0] - release_half_span
+        right_goal[0] = centre[0] + release_half_span
+        left_goal[1] = centre[1]
+        right_goal[1] = centre[1]
+        left_goal[2] = centre[2]
+        right_goal[2] = centre[2]
+
+        left_target = np.eye(4)
+        right_target = np.eye(4)
+        left_target[:3, 3] = self.world_to_footprint(left_goal)
+        right_target[:3, 3] = self.world_to_footprint(right_goal)
+        slide = float(measured_slide)
+        reference = np.concatenate((
+            [slide],
+            np.asarray(left_reference, dtype=float),
+            np.asarray(right_reference, dtype=float),
+        ))
+        try:
+            solutions = self.kdl.inverse_kinematics(
+                T_left=left_target,
+                T_right=right_target,
+                target_height=slide,
+                ref_pos=reference)
+        except Exception as exc:  # noqa: BLE001 - report a safe place failure
+            self.get_logger().error(
+                f"[place-dual] release-spread IK raised: {exc}")
+            raise RuntimeError("dual release spread IK failed") from exc
+        if solutions is None or len(solutions) == 0:
+            raise RuntimeError(
+                "no IK solution for dual release spread at "
+                f"{np.round(centre, 3)}")
+
+        candidates = [
+            np.asarray(item[1:], dtype=float) for item in solutions]
+        arms_reference = reference[1:]
+        best = min(
+            candidates,
+            key=lambda item: float(np.max(np.abs(item - arms_reference))))
+        self.des_left_arm = best[:6].copy()
+        self.des_right_arm = best[6:].copy()
+        self.commands_ready_since = None
+        self._dual_release_spread_sent = True
+        self.place_t0 = now
+        self.get_logger().info(
+            "[place-dual] spreading closed grippers apart to release tissue "
+            f"centre={np.round(centre, 3)} "
+            f"half_span={release_half_span:.3f}m")
+
     def _start_place_vertical_clear(self, now: float) -> None:
         """Raise vertically after release before arm or chassis retreat."""
         measured_slide = self.joints.get("slide_joint")
@@ -3401,9 +3500,6 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self._place_slide_stall_snapshot = None
         elif self.place_stage == 3:
             # Keep arm and slide fixed while the gripper opens.
-            if self.target_kind == "heweidao":
-                self._heweidao_place_release_tick(now)
-                return
             self._set_selected_grip(pick.GRIP_OPEN)
             if (now - self._place_release_started_at
                     >= self.place_release_dwell_s):
@@ -3559,6 +3655,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             release_world = self._dual_release_world()
             if release_world is None:
                 return
+            if self.target_kind == "zhijin":
+                # 纸巾专用位固定，overhead 到位后直接下降，跳过水平精调，
+                # 避免双臂 XY 平移不一致导致纸巾掉落。
+                self._begin_dual_place_descent(now, release_world)
+                return
             self.place_stage = 1
             self.place_t0 = now
             self._place_refine_started_at = now
@@ -3639,11 +3740,22 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                         "right_arm_eef_gripper_joint"),
                 }, ensure_ascii=False, separators=(",", ":")))
         elif self.place_stage == 3:
-            self.des_left_grip = pick.GRIP_OPEN
-            self.des_right_grip = pick.GRIP_OPEN
-            if (now - self._place_release_started_at
-                    >= self.place_release_dwell_s):
-                self._start_place_vertical_clear(now)
+            # 触桌后立即双臂向两侧分开（抓取合拢的取反），把闭合夹爪从
+            # 纸巾盒两侧抽离，分开到位后再垂直抬升，全程不松爪。
+            self.des_left_grip = pick.DUAL_TISSUE_GRIP_COMMAND
+            self.des_right_grip = pick.DUAL_TISSUE_GRIP_COMMAND
+            if not self._dual_release_spread_sent:
+                self._start_dual_place_release_spread(now)
+                return
+            if not self.dual_commands_ready(
+                    arm_tolerance=0.05, slide_tolerance=0.020):
+                if now - self.place_t0 >= PLACE_DESCENT_TIMEOUT_S:
+                    raise RuntimeError(
+                        "dual release spread did not settle within "
+                        f"{PLACE_DESCENT_TIMEOUT_S:.1f}s")
+                return
+            self._dual_release_spread_sent = False
+            self._start_place_vertical_clear(now)
         elif self.place_stage == 4:
             self._place_vertical_clear_tick(now)
 
@@ -3848,16 +3960,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         """Return whether the active placement stage intentionally moves the base.
 
         The refined table-placement flow performs its final creep in stage 0
-        and its post-release table retreat in stage 5.  Heweidao additionally
-        backs the chassis 100 mm with the released arm fixed during stage 3;
-        all other motion in stages 1-4 runs against one fixed world-frame base.
+        and its post-release table retreat in stage 5; all motion in stages 1-4
+        runs against one fixed world-frame base.
         """
         if self.place_stage == 0:
             return not self.place_creep_done
-        if (self.place_stage == 3
-                and self.target_kind == "heweidao"
-                and self._heweidao_release_phase == "base_backing"):
-            return True
         return self.place_stage == 5
 
     def smooth_commands(self) -> None:

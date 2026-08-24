@@ -653,7 +653,7 @@ DUAL_TISSUE_ENDPOINT_TCP_TOLERANCE_M = 0.018
 # the same orientation is retained through insertion, clamp, lift and retreat.
 DUAL_TISSUE_SIDE_ROLLED_ENABLED = True
 DUAL_TISSUE_SIDE_ROLLED_TCP_CLEARANCE_M = 0.100
-DUAL_TISSUE_SIDE_ROLLED_SQUEEZE_M = 0.020
+DUAL_TISSUE_SIDE_ROLLED_SQUEEZE_M = 0.025
 DUAL_TISSUE_SIDE_ROLLED_MAX_SEGMENT_JOINT_DELTA_RAD = 0.90
 # 手背（outward）探入到位后，旋转 90° 到“手侧面”夹持姿态的路径长度
 # 与速度。旋转点位于纸盒后侧之外，不会扫到立柱/邻货。
@@ -704,14 +704,14 @@ DUAL_TISSUE_CONTACT_ENDPOINT_TOLERANCE_M = 0.003
 # A closed unloaded gripper tracks 0.08 in prior runs; side contact in the
 # successful-but-unstable run forced both measured joints down near 0.012.
 DUAL_TISSUE_GRIP_CONTACT_MAX = 0.045
-# 侧夹预压拉到 20mm（接近压力上限）：双臂合拢后继续内压，纸盒挡住即由
+# 侧夹预压拉到 25mm（接近压力上限）：双臂合拢后继续内压，纸盒挡住即由
 # 位置控制器持续加压，扭矩到执行器上限封顶，不会导致物理发散。
 # 双臂闭合时的单侧预压量（米）：从实测接触位置再向内压入的量。加大后
 # 两侧钳爪对纸盒的夹紧力更强，纸盒不易在抬/撤过程中滑动。
 # The previous 30 mm/side position preload kept driving after contact and
-# toppled a tissue box.  Ten millimetres is enough to build a compliant hold;
+# toppled a tissue box.  25 mm keeps the clamp firm without toppling;
 # the following clamp pose retains roughly 4 mm/side geometric interference.
-DUAL_TISSUE_SQUEEZE_M = 0.020
+DUAL_TISSUE_SQUEEZE_M = 0.025
 DUAL_TISSUE_SQUEEZE_SPEED_MPS = 0.012
 DUAL_TISSUE_RETREAT_SPEED_MPS = 0.018
 DUAL_TISSUE_MIN_MOTION_DURATION_S = 2.0
