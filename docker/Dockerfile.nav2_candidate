@@ -1,0 +1,30 @@
+FROM crpi-1pzq998p9m7w0auy.cn-hangzhou.personal.cr.aliyuncs.com/challengecup/supermarket_sorting_final:client@sha256:dbe0bfd2c75e34af430e2e79f07c0ab9528d843e6fc6b8ce067216fd28168f0e
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-colcon-common-extensions \
+        ros-humble-navigation2 \
+        ros-humble-nav2-bringup \
+    && rm -rf /var/lib/apt/lists/*
+
+# The official runtime image intentionally does not ship a compiler toolchain.
+# Keep this in the derived image so all ROS interfaces and nodes are built at
+# image-build time; no package installation is performed during a match.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/baseline
+COPY . /workspace/baseline
+
+SHELL ["/bin/bash", "-lc"]
+RUN source /opt/ros/humble/setup.bash \
+    && cd /workspace/baseline/ros2_ws \
+    && colcon build --symlink-install --event-handlers console_direct+
+
+ENV PYTHONPATH=/workspace/baseline \
+    ROS_DOMAIN_ID=99 \
+    RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+    YOLO_CONFIG_DIR=/tmp/Ultralytics
+
+CMD ["./scripts/run_candidate.sh"]

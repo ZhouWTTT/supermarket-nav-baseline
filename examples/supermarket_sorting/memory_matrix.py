@@ -306,18 +306,25 @@ def primary_candidates_from_document(
 
 
 def grasp_eligible_candidates(
-        kind: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        kind: str, candidates: list[dict[str, Any]],
+        enable_zhijin_middle_column: bool = True) -> list[dict[str, Any]]:
     """Filter memory evidence by constraints that apply before ranking.
 
-    Tissue has a mirrored narrow-wrist dual-arm profile for side columns, so
-    every physical shelf column is eligible.  Keep the explicit column check
-    so malformed matrix entries never become direct targets.
+    Tissue has a mirrored narrow-wrist dual-arm profile for side columns.
+    Candidate missions may keep recording column 2 while disabling its grasp
+    profile; legacy callers retain the established all-column default.
     """
     if str(kind) != "zhijin":
         return list(candidates)
     return [
         candidate for candidate in candidates
-        if str(candidate.get("column", "")) in {"1", "2", "3"}
+        if (
+            str(candidate.get("column", "")) in {"1", "2", "3"}
+            and (
+                enable_zhijin_middle_column
+                or str(candidate.get("column", "")) != "2"
+            )
+        )
     ]
 
 

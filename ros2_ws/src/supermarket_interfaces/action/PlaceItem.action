@@ -1,0 +1,18 @@
+# Goal
+string order_id
+string kind
+uint8 place_slot
+---
+uint8 SUCCEEDED=0
+uint8 ALIGN_FAILED=1
+uint8 PLACE_FAILED=2
+uint8 SENSOR_STALE=3
+uint8 CANCELED=4
+uint8 INTERNAL_ERROR=5
+uint8 code
+string detail
+bool object_released
+---
+string state
+float32 progress
+string detail

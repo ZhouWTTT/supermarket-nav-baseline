@@ -1,0 +1,40 @@
+# Goal
+string session_id
+geometry_msgs/PoseStamped goal
+string route_profile
+string footprint_profile
+bool exact_goal_required
+float32 no_progress_timeout_s
+float32 total_timeout_s
+---
+# Result codes.  A relocated planner endpoint must never report SUCCEEDED.
+uint8 SUCCEEDED=0
+uint8 CANCELED=1
+uint8 NO_PATH=2
+uint8 NO_PROGRESS=3
+uint8 GOAL_BLOCKED=4
+uint8 SENSOR_STALE=5
+uint8 SAFETY_STOP=6
+uint8 TIMEOUT=7
+uint8 INTERNAL_ERROR=8
+uint8 code
+string detail
+geometry_msgs/PoseStamped final_pose
+bool exact_goal_reached
+uint32 recovery_count
+string selected_route
+---
+# Feedback states
+uint8 NEW=0
+uint8 SELECT_ROUTE=1
+uint8 PLAN=2
+uint8 TRACK=3
+uint8 APPROACH=4
+uint8 BLOCKED=5
+uint8 BACKUP_ONCE=6
+uint8 ALTERNATE_ROUTE=7
+uint8 state
+float32 remaining_path_m
+uint32 recovery_count
+string selected_route
+string block_reason

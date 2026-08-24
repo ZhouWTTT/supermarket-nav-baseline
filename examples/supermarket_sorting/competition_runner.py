@@ -140,7 +140,10 @@ class CompetitionRunner(Node):
         )
         self.create_subscription(
             String, "/supermarket_sorting/task", self._task_cb, qos)
-        self.stop_publisher = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.base_command_topic = os.environ.get(
+            "SUPERMARKET_BASE_CMD_TOPIC", "/cmd_vel")
+        self.stop_publisher = self.create_publisher(
+            Twist, self.base_command_topic, 10)
         self.perception_control_publisher = self.create_publisher(
             Bool, "/supermarket_sorting/perception_enable", 10)
         self.create_timer(0.20, self._tick)

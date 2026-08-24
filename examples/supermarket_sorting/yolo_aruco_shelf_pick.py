@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import threading
 import time
@@ -1058,6 +1059,10 @@ class ShelfPickController(Node):
         self.skipped_tissue_markers = set()
         self.skipped_tissue_slots = set()
         self.no_middle_tissue = False
+        # Legacy CLI workers retain the established three-column behavior.
+        # The candidate PickItem contract overrides this to false by default,
+        # separating all-column recognition/memory from grasp eligibility.
+        self.enable_zhijin_middle_column = True
         # Formal multi-order runs can blacklist a shelf marker after a failed
         # attempt, so a retry searches for another physical item of the same
         # kind instead of repeatedly selecting the same slot.
@@ -1244,7 +1249,14 @@ class ShelfPickController(Node):
         self.base_measured_linear = 0.0
         self.base_measured_angular = 0.0
 
-        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 5)
+        # The validated legacy chain keeps publishing directly to /cmd_vel.
+        # The candidate stack overrides this environment variable so every
+        # manipulation correction goes through MotionArbiter and the final
+        # collision monitor without changing grasp trajectories.
+        self.base_command_topic = os.environ.get(
+            "SUPERMARKET_BASE_CMD_TOPIC", "/cmd_vel")
+        self.cmd_vel_pub = self.create_publisher(
+            Twist, self.base_command_topic, 5)
         self.slide_pub = self.create_publisher(
             Float64MultiArray, "/spine_forward_position_controller/commands", 5)
         self.head_pub = self.create_publisher(
@@ -1520,6 +1532,16 @@ class ShelfPickController(Node):
         self.association_confirmation_count = 0
         self.last_association_pair = None
 
+    def _tissue_column_grasp_eligible(self, column: str) -> bool:
+        """Keep recognition broad while candidate grasp policy stays explicit."""
+
+        column = str(column)[-1:]
+        if column == "2":
+            return bool(self.enable_zhijin_middle_column)
+        if column in {"1", "3"}:
+            return bool(DUAL_TISSUE_SIDE_ROLLED_ENABLED)
+        return False
+
     def aruco_cb(self, message: String) -> None:
         records = [record for record in decode_list(message)
                    if record.get("camera", "head") == "head"]
@@ -1583,14 +1605,14 @@ class ShelfPickController(Node):
         if slot is None:
             return
         shelf, level, column = slot
-        if (self.target_kind == "zhijin" and column != "2"
-                and not DUAL_TISSUE_SIDE_ROLLED_ENABLED):
+        if (self.target_kind == "zhijin"
+                and not self._tissue_column_grasp_eligible(column)):
             key = f"{level}|{shelf}|{column}"
             if key not in self.skipped_tissue_slots:
                 self.skipped_tissue_slots.add(key)
                 self.get_logger().warn(
-                    "[tissue-filter] ignoring side-column tissue "
-                    f"slot={key}; only the middle column is eligible")
+                    "[tissue-filter] ignoring tissue in disabled grasp "
+                    f"column slot={key}")
             return
         if f"{level}|{shelf}|{column}" in self.excluded_slot_keys:
             return
@@ -1764,11 +1786,11 @@ class ShelfPickController(Node):
                 f"[direct-slot] invalid fixed slot "
                 f"shelf={shelf} level={level} column={column}")
             return False
-        if (self.target_kind == "zhijin" and column != "2"
-                and not DUAL_TISSUE_SIDE_ROLLED_ENABLED):
+        if (self.target_kind == "zhijin"
+                and not self._tissue_column_grasp_eligible(column)):
             self.get_logger().warn(
-                "[tissue-filter] direct slot rejected for tissue "
-                f"column={column}; only the middle column is eligible")
+                "[tissue-filter] direct slot rejected for disabled tissue "
+                f"grasp column={column}")
             return False
         slot_key = f"{level}|{shelf}|{column}"
         if slot_key in self.excluded_slot_keys:
@@ -1908,11 +1930,11 @@ class ShelfPickController(Node):
         marker_world = np.asarray(marker["position_world"], dtype=float)
         if marker_id in self.skipped_tissue_markers:
             return
-        if (self.target_kind == "zhijin"
-                and not DUAL_TISSUE_SIDE_ROLLED_ENABLED):
+        if self.target_kind == "zhijin":
             marker_slot = fixed_slot_from_world(
                 float(marker_world[0]), float(marker_world[2]))
-            if marker_slot is None or marker_slot[2] != "2":
+            if (marker_slot is None
+                    or not self._tissue_column_grasp_eligible(marker_slot[2])):
                 if marker_id not in self.skipped_tissue_markers:
                     self.skipped_tissue_markers.add(marker_id)
                     slot_text = (
@@ -1920,9 +1942,8 @@ class ShelfPickController(Node):
                         else f"{marker_slot[0]}-{marker_slot[1]}-"
                              f"{marker_slot[2]}")
                     self.get_logger().warn(
-                        "[tissue-filter] ignoring non-middle-column tissue "
-                        f"marker={marker_id} slot={slot_text}; only the "
-                        "middle column is eligible")
+                        "[tissue-filter] ignoring tissue in disabled grasp "
+                        f"column marker={marker_id} slot={slot_text}")
                 return
         physical_marker_id = None
         fixed_slot = None
@@ -3023,14 +3044,13 @@ class ShelfPickController(Node):
         inferred_slot_key = (
             f"{slot['level']}|{slot['shelf']}|{str(slot['column'])[-1]}")
         if (self.target_kind == "zhijin"
-                and str(slot["column"])[-1] != "2"
-                and not DUAL_TISSUE_SIDE_ROLLED_ENABLED):
+                and not self._tissue_column_grasp_eligible(
+                    str(slot["column"])[-1])):
             if inferred_slot_key not in self.skipped_tissue_slots:
                 self.skipped_tissue_slots.add(inferred_slot_key)
                 self.get_logger().warn(
-                    "[tissue-filter] position fallback rejected side-column "
-                    f"tissue slot={inferred_slot_key}; only the middle "
-                    "column is eligible")
+                    "[tissue-filter] position fallback rejected disabled "
+                    f"tissue grasp column slot={inferred_slot_key}")
             return False
         if inferred_slot_key in self.excluded_slot_keys:
             return False
@@ -3561,6 +3581,10 @@ class ShelfPickController(Node):
         rotated = bool(getattr(self, "tissue_rotated_90", False))
         slot = self.target_slot()
         column = slot[2] if slot is not None else "2"
+        if not self._tissue_column_grasp_eligible(column):
+            self.get_logger().error(
+                f"[tissue-filter] refusing disabled tissue grasp column={column}")
+            return False
         self.dual_side_rolled = bool(
             DUAL_TISSUE_SIDE_ROLLED_ENABLED
             and column in ("1", "3")
@@ -7156,6 +7180,17 @@ class ShelfPickController(Node):
             if self._abort_recovery_ready():
                 self.get_logger().error(
                     "abort motion settled; shutting down client cleanly")
+                if getattr(self, "managed_lifecycle", False):
+                    # Candidate PickItem/PlaceItem adaptation keeps the ROS
+                    # process alive across orders.  This changes only context
+                    # ownership; the verified abort recovery above is
+                    # unchanged.
+                    self.managed_terminal = True
+                    self.managed_terminal_reason = (
+                        self.abort_reason or "pick abort recovery complete")
+                    self.set_twist(0.0, 0.0)
+                    self.publish_commands()
+                    return
                 rclpy.shutdown()
                 return
 

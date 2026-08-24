@@ -1,0 +1,36 @@
+# Goal.  The existing product-specific grasp implementation consumes this
+# contract; it is intentionally not redefined by the navigation refactor.
+string order_id
+string kind
+string slot_key
+string shelf
+string level
+string column
+float32 world_x
+float32 world_y
+float32 world_z
+int32[] excluded_marker_ids
+string[] excluded_slot_keys
+string memory_file
+float32 memory_confidence_threshold
+bool dynamic_direct
+bool scan_start_west
+bool enable_zhijin_middle_column
+---
+uint8 SUCCEEDED=0
+uint8 NOT_FOUND=1
+uint8 VERIFY_FAILED=2
+uint8 GRASP_FAILED=3
+uint8 SENSOR_STALE=4
+uint8 CANCELED=5
+uint8 INTERNAL_ERROR=6
+uint8 code
+string detail
+bool object_held
+int32 marker_id
+string resolved_kind
+string resolved_slot_key
+---
+string state
+float32 progress
+string detail

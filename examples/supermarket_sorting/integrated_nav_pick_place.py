@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import pathlib
 import sys
 import threading
@@ -447,7 +448,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             backup_after_grab_m: float = 0.20,
             place_creep_m: float = PLACE_CREEP_DISTANCE_M,
             close_recheck: bool = True,
-            return_west_after_place: bool = False):
+            return_west_after_place: bool = False,
+            managed_lifecycle: bool = False,
+            pause_after_grab: bool = False):
         super().__init__(
             target_kind, max_scan_cycles,
             tcp_diagnostic_ground_truth, scan_skip_lower,
@@ -473,6 +476,13 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_release_dwell_s = place_release_dwell_s
         self.place_retreat_dwell_s = place_retreat_dwell_s
         self.return_west_after_place = bool(return_west_after_place)
+        # The normal CLI worker still owns the ROS context.  The candidate
+        # manipulation action adapter instead keeps one controller alive
+        # across PickItem -> PlaceItem and must never shut down the process.
+        self.managed_lifecycle = bool(managed_lifecycle)
+        self.pause_after_grab = bool(pause_after_grab)
+        self.managed_terminal = False
+        self.managed_terminal_reason = ""
         self.placement_completed = False
         self.post_delivery_warnings: list[str] = []
         self.delivery_completed_by_drop = False
@@ -504,11 +514,30 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._perception_request_last_at = float("-inf")
 
         # ── baseline navigator (same interface as the demo) ──
+        self.nav_backend = os.environ.get(
+            "SUPERMARKET_NAV_BACKEND", "legacy").strip().lower()
+        if self.nav_backend not in {"legacy", "nav2"}:
+            raise ValueError(
+                "SUPERMARKET_NAV_BACKEND must be 'legacy' or 'nav2', got "
+                f"{self.nav_backend!r}")
         self.nav = SupermarketNavigator()
-        self.get_logger().info(
-            "path_memory="
-            + json.dumps(self.nav.path_memory_status(), ensure_ascii=False)
-        )
+        self.semantic_nav = None
+        self.motion_lease = None
+        self._semantic_session_counter = 0
+        if self.nav_backend == "nav2":
+            from semantic_navigation_client import SemanticNavigationClient
+            from motion_lease_client import ManipulationMotionLease
+
+            self.semantic_nav = SemanticNavigationClient(self)
+            self.motion_lease = ManipulationMotionLease(self)
+            self.get_logger().info(
+                "candidate nav2 backend enabled; NavigationSession owns all "
+                "long-range recovery and legacy path memory is bypassed")
+        else:
+            self.get_logger().info(
+                "path_memory="
+                + json.dumps(self.nav.path_memory_status(), ensure_ascii=False)
+            )
 
         # ── our flow state ──
         self.flow_phase = "grab"
@@ -699,7 +728,24 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     "[loaded-turn] limiting heweidao delivery turn "
                     f"w={requested_angular:.2f}->{angular:.2f}rad/s "
                     "until delivery arrival")
+        if (
+            getattr(self, "nav_backend", "legacy") == "nav2"
+            and (abs(float(linear)) > 1e-9 or abs(float(angular)) > 1e-9)
+        ):
+            if not self.motion_lease.ready(self._manipulation_footprint_profile()):
+                linear = 0.0
+                angular = 0.0
         super().set_twist(linear, angular)
+
+    def _manipulation_footprint_profile(self) -> str:
+        """Select the conservative profile for non-Nav2 base fine motion."""
+        if getattr(self, "_table_escape_started_at", None) is not None:
+            return "DELIVERY_APPROACH"
+        if self.flow_phase in {"place", "nav_to_delivery"}:
+            return "DELIVERY_APPROACH"
+        if self.flow_phase == "backup":
+            return "MANIPULATION_EXTENDED"
+        return "SHELF_APPROACH"
 
     def _set_flow_phase(self, new_phase: str) -> None:
         """Change the outer phase and account for elapsed wall-clock time."""
@@ -1073,6 +1119,30 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._last_nav_reason = None
         self._nav_memory_logged = False
         self._nav_goal = None
+        if self.nav_backend == "nav2":
+            self._semantic_session_counter += 1
+            loaded = self.flow_phase == "nav_to_delivery"
+            route_profile = "LOADED_TRANSIT" if loaded else "SHELF_SCAN"
+            footprint_profile = (
+                "LOADED_TRANSIT" if loaded else "COMPACT_TRANSIT")
+            total_timeout_s = 120.0 if loaded else 90.0
+            session_id = (
+                f"worker-{os.getpid()}-{self._semantic_session_counter}-"
+                f"{self._route_leg_name}")
+            self.semantic_nav.start(
+                session_id=session_id,
+                goal=goal,
+                route_profile=route_profile,
+                footprint_profile=footprint_profile,
+                no_progress_timeout_s=5.0,
+                total_timeout_s=total_timeout_s,
+            )
+            self.get_logger().info(
+                f"[route] nav2 session={session_id} leg={name} goal="
+                f"({goal[0]:.2f},{goal[1]:.2f},"
+                f"{math.degrees(goal[2]):.0f}deg) profile={route_profile} "
+                f"footprint={footprint_profile}; legacy_memory_ignored=1")
+            return
         self.nav.set_goal(
             *goal,
             cached_start_offset_limit=(
@@ -1094,6 +1164,26 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         now = self.now()
         if self._route_leg_goal is None or self._route_leg_name is None:
             return False, "route_leg_not_configured"
+        if self.nav_backend == "nav2":
+            snapshot = self.semantic_nav.poll()
+            if now - self._nav_last_log >= NAV_PROGRESS_LOG_S:
+                self._nav_last_log = now
+                self.get_logger().info(
+                    f"[route:{self._route_leg_name}] nav2_state="
+                    f"{snapshot.state} remaining={snapshot.remaining_path_m:.2f}m "
+                    f"recoveries={snapshot.recovery_count} "
+                    f"route={snapshot.selected_route!r} "
+                    f"block={snapshot.block_reason!r}")
+            if not snapshot.done:
+                return False, None
+            self.set_twist(0.0, 0.0)
+            self.cmd_linear = 0.0
+            self.cmd_angular = 0.0
+            if snapshot.succeeded:
+                return True, None
+            return False, (
+                f"nav2_terminal:code={snapshot.code}:"
+                f"{snapshot.detail or snapshot.state}")
         if self._laser_stale(now):
             self.set_twist(0.0, 0.0)
             if now - self._laser_warn_log > 1.0:
@@ -1348,66 +1438,82 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                                    + NAV_PRECISE_HANDOFF_MARGIN_M)):
             now = self.now()
             goal = (float(target[0]), float(target[1]), float(final_yaw))
-            if self._nav_goal != goal:
-                self._nav_goal = goal
-                self.nav.set_goal(
-                    *goal,
-                    use_path_memory=not self._is_shelf_scan_transit(target))
-                self._nav_last_log = 0.0
-                self._nav_memory_logged = False
-                self.get_logger().info(
-                    "[nav] new_goal="
-                    + json.dumps(
-                        {
-                            "goal": [round(goal[0], 3), round(goal[1], 3), round(goal[2], 3)],
-                            "path_memory": self.nav.path_memory_status(),
-                        },
-                        ensure_ascii=False,
+            if self.nav_backend == "nav2":
+                if self._nav_goal != goal:
+                    self._start_route_leg(
+                        "drive_to_transit", goal, use_memory=False)
+                    # _start_route_leg clears this legacy sentinel before it
+                    # starts the action; restore it after submission.
+                    self._nav_goal = goal
+                reached, failure = self._route_leg_tick()
+                if failure is not None:
+                    raise RuntimeError(
+                        "semantic drive_to transit failed: " + failure)
+                if not reached:
+                    return False
+                self.cmd_linear = 0.0
+                self.cmd_angular = 0.0
+            else:
+                if self._nav_goal != goal:
+                    self._nav_goal = goal
+                    self.nav.set_goal(
+                        *goal,
+                        use_path_memory=not self._is_shelf_scan_transit(target))
+                    self._nav_last_log = 0.0
+                    self._nav_memory_logged = False
+                    self.get_logger().info(
+                        "[nav] new_goal="
+                        + json.dumps(
+                            {
+                                "goal": [round(goal[0], 3), round(goal[1], 3), round(goal[2], 3)],
+                                "path_memory": self.nav.path_memory_status(),
+                            },
+                            ensure_ascii=False,
+                        )
                     )
-                )
 
-            if self._laser_stale(now):
-                self.set_twist(0.0, 0.0)
-                if now - self._laser_warn_log > 1.0:
-                    self.get_logger().warn(
-                        "waiting for fresh laser scan during transit "
-                        f"(last={self.last_scan_time})")
-                    self._laser_warn_log = now
-                return False
+                if self._laser_stale(now):
+                    self.set_twist(0.0, 0.0)
+                    if now - self._laser_warn_log > 1.0:
+                        self.get_logger().warn(
+                            "waiting for fresh laser scan during transit "
+                            f"(last={self.last_scan_time})")
+                        self._laser_warn_log = now
+                    return False
 
-            v, w, reached = self.nav.update(
-                self.base_xy[0], self.base_xy[1], self.base_yaw,
-                laser_msg=self.laser_msg, time_now=now)
-            self.set_twist(v, w)
-            if not self._nav_memory_logged:
-                self._nav_memory_logged = True
-                self.get_logger().info(
-                    "[nav] path_memory_runtime="
-                    + json.dumps(self.nav.path_memory_status(), ensure_ascii=False)
-                )
+                v, w, reached = self.nav.update(
+                    self.base_xy[0], self.base_xy[1], self.base_yaw,
+                    laser_msg=self.laser_msg, time_now=now)
+                self.set_twist(v, w)
+                if not self._nav_memory_logged:
+                    self._nav_memory_logged = True
+                    self.get_logger().info(
+                        "[nav] path_memory_runtime="
+                        + json.dumps(self.nav.path_memory_status(), ensure_ascii=False)
+                    )
 
-            ctrl = self.nav.controller
-            if (ctrl.stop_reason is not None
-                    and ctrl.stop_reason != self._last_nav_reason):
-                self._last_nav_reason = ctrl.stop_reason
-                self.get_logger().info(
-                    f"[nav] stop_reason={ctrl.stop_reason} "
-                    f"lidar={ctrl.lidar_clearance:.2f}m "
-                    f"rear={ctrl.rear_clearance:.2f}m "
-                    f"v={v:.2f} w={w:.2f}")
+                ctrl = self.nav.controller
+                if (ctrl.stop_reason is not None
+                        and ctrl.stop_reason != self._last_nav_reason):
+                    self._last_nav_reason = ctrl.stop_reason
+                    self.get_logger().info(
+                        f"[nav] stop_reason={ctrl.stop_reason} "
+                        f"lidar={ctrl.lidar_clearance:.2f}m "
+                        f"rear={ctrl.rear_clearance:.2f}m "
+                        f"v={v:.2f} w={w:.2f}")
 
-            if now - self._nav_last_log >= NAV_PROGRESS_LOG_S:
-                self._nav_last_log = now
-                self.get_logger().info(
-                    f"[nav] to=({goal[0]:.2f},{goal[1]:.2f},"
-                    f"{math.degrees(goal[2]):.0f}°) "
-                    f"pos=({self.base_xy[0]:.2f},{self.base_xy[1]:.2f}) "
-                    f"yaw={math.degrees(self.base_yaw):.0f}° "
-                    f"dist={distance:.2f}m v={v:.2f} w={w:.2f} "
-                    f"reached={reached}")
+                if now - self._nav_last_log >= NAV_PROGRESS_LOG_S:
+                    self._nav_last_log = now
+                    self.get_logger().info(
+                        f"[nav] to=({goal[0]:.2f},{goal[1]:.2f},"
+                        f"{math.degrees(goal[2]):.0f}°) "
+                        f"pos=({self.base_xy[0]:.2f},{self.base_xy[1]:.2f}) "
+                        f"yaw={math.degrees(self.base_yaw):.0f}° "
+                        f"dist={distance:.2f}m v={v:.2f} w={w:.2f} "
+                        f"reached={reached}")
 
-            if not reached:
-                return False
+                if not reached:
+                    return False
             # Navigator coarse arrival → fall through to precise alignment.
             # Discard the transit command before the centimetre-scale parent
             # controller takes over; otherwise its second velocity ramp can
@@ -1473,6 +1579,16 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             f"[flow] goods grabbed (marker={self.target_marker_id}, "
             f"kind={self.target_kind}, state={self.state}); "
             "preparing delivery transit")
+        if self.pause_after_grab:
+            self._set_flow_phase("pick_complete_hold")
+            self.set_twist(0.0, 0.0)
+            self.get_logger().info(
+                "[flow] PickItem complete; holding the verified grasp until "
+                "the matching PlaceItem goal arrives")
+            return
+        self._begin_delivery_after_pick()
+
+    def _begin_delivery_after_pick(self) -> None:
         if self.backup_after_grab_m > 1e-4:
             self._set_flow_phase("backup")
             self._backup_start_xy = self.base_xy.copy()
@@ -1484,6 +1600,39 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 "before delivery rotation")
             return
         self._start_height_restore()
+
+    def resume_managed_place(self, place_slot: int) -> None:
+        """Resume the same controller instance for its matching PlaceItem."""
+
+        if not self.managed_lifecycle:
+            raise RuntimeError("managed place resume requires managed_lifecycle")
+        if self.flow_phase != "pick_complete_hold":
+            raise RuntimeError(
+                f"cannot resume place from flow phase {self.flow_phase!r}")
+        if not 0 <= int(place_slot) < len(DELIVERY_PLACE_SLOTS_XY):
+            raise ValueError(f"invalid delivery place slot {place_slot}")
+        self.place_slot = int(place_slot)
+        place_x, place_y = DELIVERY_PLACE_SLOTS_XY[self.place_slot]
+        self.place_world[0] = float(place_x)
+        self.place_world[1] = float(place_y)
+        self.pause_after_grab = False
+        self.get_logger().info(
+            f"[flow] matching PlaceItem accepted; resuming held order at "
+            f"delivery slot={self.place_slot + 1}")
+        self._begin_delivery_after_pick()
+
+    def _request_lifecycle_stop(self, reason: str) -> None:
+        self.set_twist(0.0, 0.0)
+        try:
+            self.cmd_vel_pub.publish(pick.Twist())
+        except Exception:
+            pass
+        if self.managed_lifecycle:
+            self.managed_terminal = True
+            self.managed_terminal_reason = str(reason)
+            return
+        import rclpy
+        rclpy.shutdown()
 
     def _start_height_restore(self) -> None:
         self._set_flow_phase("restore_height")
@@ -2036,7 +2185,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         """Debounce gripper feedback and handle a confirmed product loss."""
         active = (
             self.flow_phase in {
-                "backup", "restore_height", "nav_to_delivery"}
+                "pick_complete_hold", "backup", "restore_height",
+                "nav_to_delivery"}
             or (self.flow_phase == "place" and self.place_stage in {0, 1, 2}))
         if not active:
             self._drop_signature_since = None
@@ -3924,7 +4074,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         # motion for roughly 0.6 s after a lidar/trajectory stop.  Angular
         # motion is cancelled only for reasons that require the complete base
         # to hold; obstacle stops may still rotate in place to find a route.
-        nav_reason = self.nav.controller.stop_reason
+        nav_reason = (
+            None if self.nav_backend == "nav2"
+            else self.nav.controller.stop_reason)
         if (self.flow_phase in {
                 "grab", "nav_to_delivery", "return_to_west"}
                 and abs(self.des_linear) <= 1e-9
@@ -4015,10 +4167,15 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             "[feedback-watchdog] persistent robot feedback loss; stopping "
             "the match without starting another motion worker: "
             f"{self.terminal_error}")
-        import rclpy
-        rclpy.shutdown()
+        self._request_lifecycle_stop("persistent robot feedback loss")
 
     def tick(self) -> None:
+        if self.managed_terminal:
+            try:
+                self.cmd_vel_pub.publish(pick.Twist())
+            except Exception:
+                pass
+            return
         if self.base_xy is None or not self.joints:
             self._publish_perception_request(False)
             self._stop_for_stale_feedback(
@@ -4115,14 +4272,14 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             and self.use_dual_tissue_grasp
             and self.place_stage in {0, 1, 2})
         if (self.flow_phase in {
-                "backup", "restore_height", "nav_to_delivery"}
+                "pick_complete_hold", "backup", "restore_height", "nav_to_delivery"}
                 or single_place_hold or dual_place_hold):
             self._hold_grasp_during_transport()
         drop_paused = self._monitor_held_product(now)
         drop_candidate_hold = (
             drop_paused
             and (self.flow_phase in {
-                "backup", "restore_height", "nav_to_delivery"}
+                "pick_complete_hold", "backup", "restore_height", "nav_to_delivery"}
                  or (self.flow_phase == "place"
                      and self.place_stage in {0, 1, 2})))
         if self.flow_phase == "fatal_recover":
@@ -4131,8 +4288,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             # would stay parked mid-motion until the runner kills it.  Restore
             # the neutral posture, then shut down with the error recorded.
             if self._fatal_recovery_tick(now):
-                import rclpy
-                rclpy.shutdown()
+                self._request_lifecycle_stop("fatal recovery complete")
                 return
         else:
             try:
@@ -4141,6 +4297,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     # after debounce the monitor may also have selected a
                     # recovery phase.  In either case, do not run one more
                     # tick of the old phase.
+                    pass
+                elif self.flow_phase == "pick_complete_hold":
+                    # Continue publishing the captured grip and a zero base
+                    # command.  PlaceItem resumes this same object/controller.
                     pass
                 elif self.flow_phase == "backup":
                     self._backup_tick()
@@ -4170,8 +4330,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         if (self.flow_phase == "done"
                 and self.now() - self.place_t0 > FLOW_DONE_SETTLE_S):
             self.get_logger().info("[flow] flow finished; shutting down")
-            import rclpy
-            rclpy.shutdown()
+            self._request_lifecycle_stop("place complete")
             return
         if (self.flow_phase == "drop_failed"
                 and self.now() - self.place_t0
@@ -4179,8 +4338,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self.get_logger().error(
                 "[drop-monitor] transport-drop worker finished; requesting "
                 "runner restart")
-            import rclpy
-            rclpy.shutdown()
+            self._request_lifecycle_stop("transport drop failure")
             return
 
         if drop_candidate_hold:

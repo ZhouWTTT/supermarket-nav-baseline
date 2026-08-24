@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>supermarket_navigation</name>
+  <version>0.1.0</version>
+  <description>Single-owner navigation and motion safety for the supermarket task.</description>
+  <maintainer email="team@example.invalid">Supermarket Team</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>supermarket_interfaces</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
+  <test_depend>ament_pytest</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
