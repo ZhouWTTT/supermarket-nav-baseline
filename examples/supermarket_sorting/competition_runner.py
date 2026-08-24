@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -145,10 +146,16 @@ class CompetitionRunner(Node):
         self.create_timer(0.20, self._tick)
         self.memory_tracker = MemoryMatrixTracker(
             confirmations=self.args.memory_confirmations,
-            output_path=self.memory_path)
+            output_path=self.memory_path,
+            record_everywhere=self.args.record_everywhere)
         self.get_logger().info(
             "competition runner ready; waiting for transient task on "
-            "/supermarket_sorting/task")
+            "/supermarket_sorting/task; "
+            f"grab_policy={self.args.grab_policy} "
+            f"record_everywhere={int(self.args.record_everywhere)} "
+            f"dynamic_direct={int(self.args.dynamic_direct)} "
+            "perception_always_on="
+            f"{int(self.args.perception_always_on)}")
         self._publish_perception_enabled(False)
         self._ensure_persistent_perception()
 
@@ -188,6 +195,7 @@ class CompetitionRunner(Node):
         self.order_active_elapsed_s.clear()
         self.order_timings.clear()
         self.attempt_timings.clear()
+        self._publish_perception_enabled(True)
         self.get_logger().info(
             f"accepted task run={incoming.run_prefix} "
             f"count={len(incoming.orders)} kinds="
@@ -274,9 +282,10 @@ class CompetitionRunner(Node):
 
         same_order_drop_retry = (
             self.immediate_retry_order_id == order.id)
-        candidate_kinds = (
-            [order.kind] if same_order_drop_retry
-            else self._candidate_kinds_for(order))
+        # Nearest/sequence selection belongs to the runner.  Letting a worker
+        # opportunistically change class after dispatch would invalidate the
+        # selected memory hint, retry bookkeeping and failed-slot ownership.
+        candidate_kinds = [order.kind]
         self.immediate_retry_order_id = None
         command = [
             sys.executable,
@@ -315,6 +324,10 @@ class CompetitionRunner(Node):
             "--memory-confidence-threshold",
             str(self.args.memory_confidence_threshold),
         ])
+        if self.args.dynamic_direct:
+            command.append("--dynamic-direct")
+        if self.args.perception_always_on:
+            command.append("--perception-always-on")
         # The first physically delivered item always occupies slot zero.
         # Keep that worker alive after placement so it returns to shelf A and
         # records a stationary inventory sweep before the next order starts.
@@ -323,6 +336,7 @@ class CompetitionRunner(Node):
             command.append("--return-west-after-place")
         scan_hint_x = None
         scan_marker_z = None
+        direct_hint = None
         if self.selected_memory_hint is not None:
             try:
                 scan_hint_x = float(self.selected_memory_hint["x"])
@@ -330,10 +344,46 @@ class CompetitionRunner(Node):
             except (KeyError, TypeError, ValueError):
                 scan_hint_x = None
                 scan_marker_z = None
+            try:
+                shelf = str(self.selected_memory_hint["shelf"])
+                level = str(self.selected_memory_hint["level"])
+                column = str(self.selected_memory_hint["column"])
+                slot_key = str(self.selected_memory_hint["slot_key"])
+                expected_slot_key = f"{level}|{shelf}|{column}"
+                if (shelf in {"A", "B", "C", "D", "E"}
+                        and level in {"L1", "L2", "L3"}
+                        and column in {"1", "2", "3"}
+                        and slot_key == expected_slot_key
+                        and slot_key not in excluded_slots):
+                    raw_y = self.selected_memory_hint.get("world_y")
+                    raw_z = self.selected_memory_hint.get("world_z")
+                    world_y = (
+                        float(raw_y) if raw_y is not None else None)
+                    world_z = (
+                        float(raw_z) if raw_z is not None else None)
+                    if ((world_y is None or math.isfinite(world_y))
+                            and (world_z is None or math.isfinite(world_z))):
+                        direct_hint = (
+                            shelf, level, column, world_y, world_z)
+            except (KeyError, TypeError, ValueError):
+                direct_hint = None
         if scan_hint_x is not None:
             command.extend(["--scan-start-x", str(scan_hint_x)])
             if scan_marker_z is not None:
                 command.extend(["--scan-marker-z", str(scan_marker_z)])
+        if direct_hint is not None and self.args.dynamic_direct:
+            shelf, level, column, world_y, world_z = direct_hint
+            command.extend([
+                "--memory-initial-shelf", shelf,
+                "--memory-initial-level", level,
+                "--memory-initial-column", column,
+            ])
+            if world_y is not None:
+                command.extend([
+                    "--memory-initial-product-y", str(world_y)])
+            if world_z is not None:
+                command.extend([
+                    "--memory-initial-product-z", str(world_z)])
         # wxj snapshot semantics: the first logical order starts from E,
         # including all of its retries.  Once a different order starts, every
         # later no-hint full scan starts from the westmost shelf A.  A memory
@@ -370,6 +420,7 @@ class CompetitionRunner(Node):
             f"{int(return_west_after_place)} "
             f"same_order_drop_retry={int(same_order_drop_retry)} "
             f"memory_hint={self.selected_memory_hint} "
+            f"direct_hint={direct_hint} "
             f"persistent_perception={int(external_perception)} "
             f"single_item_candidates={candidate_kinds} "
             f"excluded_markers={excluded_markers} "
@@ -802,7 +853,13 @@ class CompetitionRunner(Node):
         except Exception:  # noqa: BLE001 - ROS context may already be closed
             pass
 
-    def _publish_perception_enabled(self, enabled: bool) -> None:
+    def _publish_perception_enabled(
+        self, enabled: bool, *, force: bool = False) -> None:
+        if (not force
+                and self.args.perception_always_on
+                and self.task is not None
+                and not self.finished):
+            enabled = True
         try:
             self.perception_control_publisher.publish(
                 Bool(data=bool(enabled)))
@@ -831,7 +888,7 @@ class CompetitionRunner(Node):
             else:
                 self.immediate_retry_order_id = None
 
-        ranked = []
+        evaluated = []
         for order in candidates:
             memory_candidates, observer_xy = (
                 self.memory_tracker.routing_snapshot(order.kind))
@@ -848,17 +905,28 @@ class CompetitionRunner(Node):
             travel = (
                 float("inf") if hint is None
                 else float(hint.get("travel", float("inf"))))
-            ranked.append((
-                (order.attempts, hint is None, travel,
-                 GRASP_COST.get(order.kind, 10.0), order.source_index),
-                order, hint))
-        _, order, hint = min(ranked, key=lambda item: item[0])
+            evaluated.append((order, hint, travel))
+        if self.args.grab_policy == "sequence":
+            order, hint, _travel = min(
+                evaluated, key=lambda item: item[0].source_index)
+        else:
+            order, hint, _travel = min(
+                evaluated,
+                key=lambda item: (
+                    item[1] is None,
+                    item[2],
+                    item[0].source_index))
         self.selected_memory_hint = (
             None if hint is None else dict(hint))
+        self.get_logger().info(
+            f"[orders] policy={self.args.grab_policy} selected "
+            f"id={order.id} kind={order.kind} "
+            f"travel={None if hint is None else _travel} "
+            f"hint={self.selected_memory_hint}")
         return order
 
     def stop(self) -> None:
-        self._publish_perception_enabled(False)
+        self._publish_perception_enabled(False, force=True)
         self._publish_stop()
         if self.worker is not None and self.worker.poll() is None:
             self.worker.terminate()
@@ -905,6 +973,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--memory-confidence-threshold", type=float, default=0.90,
         help="minimum confidence for normal memory-directed shelf routing")
+    parser.add_argument(
+        "--grab-policy", choices=["nearest", "sequence"],
+        default="nearest",
+        help="select pending orders by memory travel distance (nearest) or "
+             "original task order (sequence)")
+    parser.add_argument(
+        "--record-everywhere", action="store_true",
+        help="record every geometrically valid YOLO world observation for "
+             "the entire match, including transit and delivery")
+    parser.add_argument(
+        "--dynamic-direct", action="store_true",
+        help="allow a worker to use a fresh in-run memory candidate for one "
+             "guarded direct-slot reroute")
+    parser.add_argument(
+        "--perception-always-on", action="store_true",
+        help="keep persistent or worker-local perception enabled throughout "
+             "the match")
     parser.add_argument(
         "--order-timeout", type=float, default=300.0,
         help="per-order timeout in seconds; 0 disables it (default: 300)")

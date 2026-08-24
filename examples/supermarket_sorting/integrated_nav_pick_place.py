@@ -495,6 +495,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             String, MEMORY_CONSUME_TOPIC, 10)
         self.manage_external_perception = False
         self.local_perception_nodes = ()
+        # Formal runners may keep one detector alive for the complete match so
+        # the matrix continues updating during navigation, placement and
+        # worker hand-off.  This flag turns every local disable request into
+        # an enable request without changing detector ownership.
+        self.perception_always_on = False
         self._perception_requested = None
         self._perception_request_last_at = float("-inf")
 
@@ -580,6 +585,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._drop_recovery_vertical_clear_started_at = 0.0
         self._flow_done_logged = False
         self._table_escape_logged = False
+        self._table_escape_started_at = None
         self._laser_warn_log = 0.0
         self._state_warn_log = 0.0
         self._feedback_stale_since = None
@@ -602,6 +608,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.memory_exhausted_shelves = set()
         self.memory_last_scan_station_x = None
         self.memory_rerouted = False
+        self.dynamic_direct_enabled = False
+        self.direct_transit_slot = None
+        self.direct_transit_started_at = None
         self.memory_reroute_not_before = time.time()
         self._memory_last_reroute_check = 0.0
         self._memory_consumed = False
@@ -804,8 +813,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         if self.memory_file is None:
             return None
         document = read_memory_document(self.memory_file)
-        # zhijin 双夹只在货架中列有效：在排序前先过滤非中列候选，
-        # 避免 reject 掉选中候选后意外隐藏有效的中列候选。
+        # Tissue side columns are eligible when the narrow rolled-wrist dual
+        # profile is enabled; the shared helper still rejects malformed slots.
         candidates = grasp_eligible_candidates(
             self.target_kind,
             primary_candidates_from_document(
@@ -819,9 +828,74 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             min_last_seen=min_last_seen,
             reliable_only=reliable_only)
 
-    def _apply_memory_hint(self, hint: dict, reason: str) -> None:
+    def configure_direct_slot_target(
+            self, shelf: str, level: str, column: str,
+            marker_id: int | None = None,
+            product_y: float | None = None,
+            product_z: float | None = None) -> bool:
+        """Resolve a remembered slot, then navigate before precision align.
+
+        ``ShelfPickController.configure_direct_slot_target`` historically
+        entered ``STATE_ALIGN`` immediately.  That made ALIGN's 45 second
+        precision watchdog include the entire cross-store transit.  Keep the
+        resolved grasp geometry, but defer ALIGN until the obstacle-aware
+        navigator reaches the shelf-side handoff pose.
+        """
+        accepted = super().configure_direct_slot_target(
+            shelf, level, column,
+            marker_id=marker_id,
+            product_y=product_y,
+            product_z=product_z,
+            defer_align=True)
+        if not accepted:
+            return False
+
+        self.direct_transit_slot = (
+            str(shelf).upper(), str(level).upper(), str(column)[-1:])
+        self.direct_transit_started_at = time.monotonic()
+        self.scan_trunk_route_stage = None
+        self.scan_trunk_route_done = False
+        self.scan_route_final_goal = None
+        self._route_leg_name = None
+        self._route_leg_goal = None
+        self._nav_goal = None
+        self.set_state(pick.STATE_DIRECT_TRANSIT)
+        self.get_logger().info(
+            "[direct-transit] queued slot="
+            f"{self.direct_transit_slot} handoff="
+            f"({self.align_base_x:.3f},{self.align_base_y:.3f},"
+            f"{math.degrees(pick.YAW_NORTH):.0f}deg)")
+        return True
+
+    def advance_direct_transit(self) -> None:
+        """Navigate to a remembered slot before starting ALIGN's watchdog."""
+        if self.target_world is None or self.direct_transit_slot is None:
+            raise RuntimeError(
+                "direct transit entered without a resolved slot target")
+
+        arrived = self.drive_to(
+            [self.align_base_x, self.align_base_y],
+            pick.YAW_NORTH, 0.08)
+        if not arrived:
+            return
+
+        elapsed = (
+            0.0 if self.direct_transit_started_at is None
+            else max(0.0, time.monotonic() - self.direct_transit_started_at))
+        slot = self.direct_transit_slot
+        self.direct_transit_slot = None
+        self.direct_transit_started_at = None
+        self.set_twist(0.0, 0.0)
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
+        self.set_state(pick.STATE_ALIGN)
+        self.get_logger().info(
+            f"[direct-transit] arrived slot={slot} after {elapsed:.1f}s; "
+            "starting precision ALIGN with a fresh watchdog")
+
+    def _try_apply_direct_memory_hint(
+            self, hint: dict, reason: str) -> bool:
         hint_x = float(hint["x"])
-        hint_z = float(hint["z"])
         column = str(hint.get("column", ""))
         if (self.close_recheck
                 and column in {"1", "2", "3"}
@@ -837,7 +911,14 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 f"[memory] {reason} -> direct slot "
                 f"{hint['shelf']}-{hint['level']}-{column} "
                 f"x={hint_x:.3f} conf={float(hint['confidence']):.3f}")
-            return
+            return True
+        return False
+
+    def _apply_memory_hint(self, hint: dict, reason: str) -> str:
+        if self._try_apply_direct_memory_hint(hint, reason):
+            return "direct"
+        hint_x = float(hint["x"])
+        hint_z = float(hint["z"])
         self.configure_inventory_scan_hint(hint_x, hint_z)
         self.memory_active_hint = (
             str(hint["shelf"]), str(hint["level"]))
@@ -851,6 +932,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             f"x={hint_x:.3f} travel={float(hint['travel']):.2f}m "
             f"observed={float(hint['observed_distance']):.2f}m "
             f"conf={float(hint['confidence']):.3f}")
+        return "scan"
 
     def _update_memory_scan_progress(self) -> None:
         if self.scan_station_order is None:
@@ -896,7 +978,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             return
         self._memory_last_reroute_check = now
         refreshed = self._select_live_memory_hint(
-            reliable_only=True,
+            reliable_only=not self.dynamic_direct_enabled,
             min_last_seen=self.memory_reroute_not_before)
         if refreshed is None:
             return
@@ -905,18 +987,32 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             if self.scan_station_order is None
             and self.scan_preferred_x is not None
             else float(self.current_scan_station_x()))
-        current_travel = math.hypot(
-            float(self.base_xy[0]) - current_x,
-            float(self.base_xy[1]) - pick.SCAN_Y)
-        new_travel = float(refreshed["travel"])
-        if (abs(float(refreshed["x"]) - current_x) <= 0.40
-                or new_travel + MEMORY_REROUTE_SAVING_M
-                >= current_travel):
+        if (self.dynamic_direct_enabled
+                and self._try_apply_direct_memory_hint(
+                    refreshed, "dynamic reroute")):
+            self.memory_rerouted = True
+            self.memory_reroute_not_before = time.time()
             return
+
+        hint_shelf = str(refreshed.get("shelf", ""))
+        current_shelf = shelf_for_scan_x(current_x)
+        if (not hint_shelf
+                or hint_shelf == current_shelf
+                or hint_shelf in self.memory_exhausted_shelves
+                or abs(float(refreshed["x"]) - current_x) <= 0.40):
+            return
+        if not self.dynamic_direct_enabled:
+            current_travel = math.hypot(
+                float(self.base_xy[0]) - current_x,
+                float(self.base_xy[1]) - pick.SCAN_Y)
+            new_travel = float(refreshed["travel"])
+            if new_travel + MEMORY_REROUTE_SAVING_M >= current_travel:
+                return
         self._apply_memory_hint(
             refreshed,
             f"dynamic reroute {current_x:.3f}->{float(refreshed['x']):.3f}")
         self.memory_rerouted = True
+        self.memory_reroute_not_before = time.time()
 
     def _restore_full_scan_after_inventory_hint(self) -> None:
         """Expose a failed matrix shelf/level to immediate route failover."""
@@ -933,6 +1029,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 and not self.local_perception_nodes):
             return
         enabled = bool(enabled)
+        if self.perception_always_on:
+            enabled = True
         now = self.now()
         if (not force
                 and enabled == self._perception_requested
@@ -1111,7 +1209,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
     def _is_shelf_scan_transit(self, target: np.ndarray) -> bool:
         return bool(
             self.flow_phase == "grab"
-            and self.state == pick.STATE_GO_SCAN
+            and self.state in {
+                pick.STATE_GO_SCAN, pick.STATE_DIRECT_TRANSIT}
             and abs(float(target[1]) - pick.SCAN_Y) <= 0.20)
 
     def _scan_trunk_route_tick(
@@ -1197,15 +1296,32 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             # arms and the neutral head posture; reassert it on every tick
             # until the chassis is outside the whole-body keep-out.
             self._command_initial_arm_posture()
+            if self._table_escape_started_at is None:
+                self._table_escape_started_at = self.now()
+            escape_elapsed = self.now() - self._table_escape_started_at
+            if escape_elapsed >= PLACE_CLEAR_TABLE_TIMEOUT_S:
+                self.set_twist(0.0, 0.0)
+                raise RuntimeError(
+                    "delivery-table startup escape timed out after "
+                    f"{escape_elapsed:.1f}s clearance={table_clearance:.3f}m "
+                    f"required={safe_clearance:.3f}m")
             yaw_error = pick.wrap_to_pi(-math.pi / 2.0 - self.base_yaw)
-            if abs(yaw_error) <= 0.20:
+            posture_ready = (
+                self.dual_commands_ready(
+                    arm_tolerance=0.08, slide_tolerance=0.05)
+                and self._initial_head_posture_ready())
+            if not posture_ready:
+                # Never rotate a deployed whole body beside the table.  First
+                # make the inherited/failed-worker posture compact, then use
+                # wxj's rotate-into-gate escape below.
+                self.set_twist(0.0, 0.0)
+            elif abs(yaw_error) <= 0.20:
                 self.set_twist(
                     -PLACE_CLEAR_TABLE_SPEED_MPS,
                     float(np.clip(2.0 * yaw_error, -0.25, 0.25)))
             else:
-                # Do not rotate a deployed whole body beside the table.  This
-                # should only occur after an external pose disturbance.
-                self.set_twist(0.0, 0.0)
+                self.set_twist(
+                    0.0, float(np.clip(2.0 * yaw_error, -0.25, 0.25)))
             if not self._table_escape_logged:
                 self._table_escape_logged = True
                 self.get_logger().warn(
@@ -1217,6 +1333,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             return False
         if self._table_escape_logged:
             self._table_escape_logged = False
+            self._table_escape_started_at = None
             self.get_logger().info(
                 f"delivery-table startup escape complete; "
                 f"clearance={table_clearance:.3f}m")
@@ -3959,7 +4076,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         # the joint feedback.  Restore the neutral posture once at startup,
         # before any shelf motion begins.
         if (not self._startup_posture_recovered
-                and self.state == pick.STATE_GO_SCAN
+                and self.state in {
+                    pick.STATE_GO_SCAN, pick.STATE_DIRECT_TRANSIT}
                 and self.flow_phase == "grab"):
             self._command_initial_arm_posture()
             if self._neutral_posture_ready():
@@ -3970,10 +4088,12 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         try:
             if self.flow_phase == "grab":
                 self._memory_route_tick()
-                prev_state = self.state
                 super().tick()
-                if (prev_state != pick.STATE_DONE
-                        and self.state == pick.STATE_DONE):
+                # STATE_DONE is terminal for the pick FSM but not for the
+                # integrated delivery flow.  Gate on flow_phase so a missed
+                # transition is repaired exactly once on the next tick.
+                if (self.state == pick.STATE_DONE
+                        and self.flow_phase == "grab"):
                     self._on_grab_complete()
                 return
         except Exception as exc:  # noqa: BLE001 - report, recover, exit
@@ -4116,6 +4236,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--memory-confidence-threshold", type=float, default=0.90)
     parser.add_argument(
+        "--dynamic-direct", action="store_true",
+        help="allow one fresh memory candidate to redirect this worker "
+             "directly to a guarded fixed slot")
+    parser.add_argument(
+        "--perception-always-on", action="store_true",
+        help="ignore state-level perception disable requests so a formal "
+             "run can record the matrix during every phase")
+    parser.add_argument("--memory-initial-shelf", choices=list("ABCDE"))
+    parser.add_argument(
+        "--memory-initial-level", choices=["L1", "L2", "L3"])
+    parser.add_argument(
+        "--memory-initial-column", choices=["1", "2", "3"])
+    parser.add_argument("--memory-initial-product-y", type=float)
+    parser.add_argument("--memory-initial-product-z", type=float)
+    parser.add_argument(
         "--formal-mode", action="store_true",
         help="disable all fixed-layout diagnostic shortcuts")
     parser.add_argument(
@@ -4207,6 +4342,25 @@ def parse_args() -> argparse.Namespace:
         parser.error("--scan-marker-z must be finite")
     if args.scan_marker_z is not None and args.scan_start_x is None:
         parser.error("--scan-marker-z requires --scan-start-x")
+    initial_direct_slot = (
+        args.memory_initial_shelf,
+        args.memory_initial_level,
+        args.memory_initial_column,
+    )
+    if any(value is not None for value in initial_direct_slot):
+        if not all(value is not None for value in initial_direct_slot):
+            parser.error(
+                "initial memory shelf/level/column must be supplied "
+                "together")
+    elif (args.memory_initial_product_y is not None
+          or args.memory_initial_product_z is not None):
+        parser.error(
+            "initial memory product coordinates require a direct slot")
+    for value in (
+            args.memory_initial_product_y,
+            args.memory_initial_product_z):
+        if value is not None and not math.isfinite(value):
+            parser.error("initial memory product coordinates must be finite")
     if args.formal_mode and (
             args.tcp_diagnostic_ground_truth or args.scan_skip_lower):
         parser.error(
@@ -4284,6 +4438,8 @@ def main() -> int:
             place_creep_m=args.place_creep_distance,
             close_recheck=not args.no_close_recheck,
             return_west_after_place=args.return_west_after_place)
+        controller.perception_always_on = bool(args.perception_always_on)
+        controller.dynamic_direct_enabled = bool(args.dynamic_direct)
         controller.configure_external_perception(args.external_perception)
         controller.configure_opportunistic_targets(args.candidate_kind)
         controller.scan_prefer_west_start = args.scan_start_west
@@ -4297,6 +4453,28 @@ def main() -> int:
             args.memory_confidence_threshold,
             initial_x=args.scan_start_x,
             initial_z=args.scan_marker_z)
+        if args.memory_initial_shelf is not None:
+            accepted = controller.configure_direct_slot_target(
+                args.memory_initial_shelf,
+                args.memory_initial_level,
+                args.memory_initial_column,
+                product_y=args.memory_initial_product_y,
+                product_z=args.memory_initial_product_z)
+            if accepted:
+                controller.memory_active_hint = (
+                    args.memory_initial_shelf,
+                    args.memory_initial_level)
+                controller.memory_last_scan_station_x = args.scan_start_x
+                controller.memory_reroute_not_before = time.time()
+                controller.get_logger().info(
+                    "[memory] runner initial direct slot accepted: "
+                    f"{args.memory_initial_shelf}-"
+                    f"{args.memory_initial_level}-"
+                    f"{args.memory_initial_column}")
+            else:
+                controller.get_logger().warn(
+                    "[memory] runner initial direct slot rejected; "
+                    "keeping shelf-level scan hint fallback")
         if controller.excluded_marker_ids:
             controller.get_logger().info(
                 "excluding markers from earlier attempts: "

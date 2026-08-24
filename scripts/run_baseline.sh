@@ -24,12 +24,25 @@ runner=(
     --max-attempts "${SUPERMARKET_MAX_ATTEMPTS:-2}"
     --memory-confirmations "${SUPERMARKET_MEMORY_CONFIRMATIONS:-${SUPERMARKET_INVENTORY_CONFIRMATIONS:-3}}"
     --memory-confidence-threshold "${SUPERMARKET_MEMORY_CONFIDENCE:-0.90}"
+    --grab-policy "${SUPERMARKET_GRAB_POLICY:-nearest}"
     --inference-hz "${SUPERMARKET_INFERENCE_HZ:-12}"
     --device "${SUPERMARKET_DEVICE:-cpu}"
     --order-timeout "${SUPERMARKET_ORDER_TIMEOUT:-300}"
     --match-timeout "${SUPERMARKET_MATCH_TIMEOUT:-570}"
     --target-time "${SUPERMARKET_TARGET_TIME:-400}"
 )
+
+if [ "${SUPERMARKET_RECORD_EVERYWHERE:-1}" = "1" ]; then
+    runner+=(--record-everywhere)
+fi
+
+if [ "${SUPERMARKET_DYNAMIC_DIRECT:-1}" = "1" ]; then
+    runner+=(--dynamic-direct)
+fi
+
+if [ "${SUPERMARKET_PERCEPTION_ALWAYS_ON:-1}" = "1" ]; then
+    runner+=(--perception-always-on)
+fi
 
 if [ "${SUPERMARKET_SHOW:-0}" = "1" ]; then
     runner+=(--show)

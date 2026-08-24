@@ -257,7 +257,9 @@ def select_memory_hint(
             "close_relaxed": False,
             "reliable": False,
         }
-        fallback_key = (-confidence, observed_distance, travel, x, z)
+        # wxj nearest-policy semantics: even an unconfirmed fallback remains
+        # route-nearest; confidence and observed distance only break ties.
+        fallback_key = (travel, -confidence, observed_distance, x, z)
         if fallback is None or fallback_key < fallback[0]:
             fallback = (fallback_key, item)
         close_reliable = (
@@ -307,16 +309,15 @@ def grasp_eligible_candidates(
         kind: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filter memory evidence by constraints that apply before ranking.
 
-    The dual-arm tissue grasp is only valid in a shelf's middle column.  Side
-    column tissue detections must therefore be removed before nearest-candidate
-    selection; rejecting them afterwards can discard the chosen B candidate
-    and accidentally hide a valid C middle-column candidate.
+    Tissue has a mirrored narrow-wrist dual-arm profile for side columns, so
+    every physical shelf column is eligible.  Keep the explicit column check
+    so malformed matrix entries never become direct targets.
     """
     if str(kind) != "zhijin":
         return list(candidates)
     return [
         candidate for candidate in candidates
-        if str(candidate.get("column", "")) == "2"
+        if str(candidate.get("column", "")) in {"1", "2", "3"}
     ]
 
 
@@ -655,7 +656,8 @@ class MemoryMatrixTracker(Node):
     def __init__(
             self, confirmations: int = 2,
             output_path: Path | None = None,
-            write_interval_s: float = 0.5) -> None:
+            write_interval_s: float = 0.5,
+            record_everywhere: bool = False) -> None:
         super().__init__("memory_matrix_tracker")
         # The formal runner and this tracker are spun by separate executor
         # threads.  Keep tracker lifecycle state atomic across runner-owned
@@ -663,6 +665,10 @@ class MemoryMatrixTracker(Node):
         self._tracker_lock = threading.RLock()
         self.matrix = MemoryMatrix()
         self.confirmations = max(1, int(confirmations))
+        # Formal runs keep the shared detector alive for the whole match.
+        # When requested, accept every geometrically valid world-space
+        # observation instead of restricting recording to the shelf aisle.
+        self.record_everywhere = bool(record_everywhere)
         self.output_path = Path(
             output_path or DEFAULT_OUTPUT_PATH)
         self.write_interval_s = float(write_interval_s)
@@ -688,7 +694,8 @@ class MemoryMatrixTracker(Node):
         self.get_logger().info(
             "memory matrix tracker ready; yolo-only (no ArUco); output="
             f"{self.output_path} confirmations={self.confirmations} "
-            f"depth_min_samples={DEPTH_MIN_SAMPLES}")
+            f"depth_min_samples={DEPTH_MIN_SAMPLES} "
+            f"record_everywhere={int(self.record_everywhere)}")
 
     def _consume_cb(self, message: String) -> None:
         """Immediately invalidate a slot after a worker confirms shelf exit."""
@@ -749,13 +756,15 @@ class MemoryMatrixTracker(Node):
     def _record_yolo_only(self, detection: dict) -> None:
         """纯 YOLO 录制：每个检测的世界坐标独立映射到全局固定网格。
 
-        marker 完全不参与。机器人只需位于货架观察走廊，不需要停在被检测
-        货架的标准站点；因此同一帧可以同时给多个货架累积样本。
+        marker 完全不参与。默认只需位于货架观察走廊，不需要停在被检测
+        货架的标准站点；因此同一帧可以同时给多个货架累积样本。开启
+        ``record_everywhere`` 后只取消机器人位置门控，其他几何和深度校验保持不变。
         """
         kind = detection.get("class")
         if not isinstance(kind, str):
             return
-        if not self._in_shelf_observation_corridor():
+        if (not self.record_everywhere
+                and not self._in_shelf_observation_corridor()):
             return
         # ``world`` 是 YOLO 框中心的同步深度点，保持为主来源以延续现有
         # 层高标定；中心深度缺失时再使用 ROI 前景中位点。
@@ -858,10 +867,14 @@ class MemoryMatrixTracker(Node):
             distance_text = (
                 f"{distance_med:.3f}m"
                 if distance_med is not None else "?")
+            observer_text = (
+                "?"
+                if self.base_xy is None
+                else f"{self.base_xy[0]:.3f}")
             self.get_logger().info(
                 f"[memory] observed kind={kind} "
                 f"slot=({shelf_name}, {level}, {column}) "
-                f"[yolo-only global-map observer_x={self.base_xy[0]:.3f} "
+                f"[yolo-only global-map observer_x={observer_text} "
                 f"xyz_med=({x_med:.3f},{y_med:.3f},{z_med:.3f}) "
                 f"distance={distance_text} conf={acc['conf']:.3f}; "
                 f"primary={primary.get('kind')} "

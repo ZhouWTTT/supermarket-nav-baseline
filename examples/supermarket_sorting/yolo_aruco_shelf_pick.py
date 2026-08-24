@@ -600,10 +600,13 @@ DUAL_TISSUE_PREGRASP_HALF_SPAN_M = 0.150
 DUAL_TISSUE_DIRECT_PROBE_SPAN_M = 0.105
 DUAL_TISSUE_SURROUND_HALF_SPAN_M = 0.105
 # 侧列的邻侧探入半跨度（与立柱侧一致：0.105，link6 横条立柱余量 5mm）。
-DUAL_TISSUE_NEIGHBOUR_PROBE_SPAN_M = 0.110
+DUAL_TISSUE_NEIGHBOUR_PROBE_SPAN_M = 0.140
 # 侧列立柱侧探入半跨度：比总跨度的一半收 5mm，使左/右臂横条整体远离
 # 前立柱（横条外缘从贴柱变为约 5mm 余量），同时邻货侧放 5mm。
-DUAL_TISSUE_POST_SIDE_SPAN_M = 0.100
+DUAL_TISSUE_POST_SIDE_SPAN_M = 0.140
+# Near a side-column box, keep the rolled wrists slow enough that position
+# tracking cannot overshoot the roughly 29 mm lateral clearance.
+DUAL_TISSUE_SIDE_ROLLED_MAX_STEP_RAD = 0.005
 # 最终夹持半跨度（侧面大面夹持，过盈约 27mm/侧）。
 DUAL_TISSUE_CLAMP_HALF_SPAN_M = 0.090
 # Default tissue TCP shelf clearance; top and lower levels have additional
@@ -634,6 +637,13 @@ DUAL_TISSUE_TOP_TCP_RAISE_M = 0.035
 DUAL_TISSUE_TOP_DIRECT_PROBE_SPAN_M = 0.105
 DUAL_TISSUE_TOP_WRIST_ROLL_RAD = math.pi / 2.0
 DUAL_TISSUE_ENDPOINT_TCP_TOLERANCE_M = 0.018
+# Side-column narrow-wrist profile.  Both wrists roll outside the shelf so the
+# fixed link6 plates present their narrow horizontal section to the front post;
+# the same orientation is retained through insertion, clamp, lift and retreat.
+DUAL_TISSUE_SIDE_ROLLED_ENABLED = True
+DUAL_TISSUE_SIDE_ROLLED_TCP_CLEARANCE_M = 0.100
+DUAL_TISSUE_SIDE_ROLLED_SQUEEZE_M = 0.015
+DUAL_TISSUE_SIDE_ROLLED_MAX_SEGMENT_JOINT_DELTA_RAD = 0.90
 # 手背（outward）探入到位后，旋转 90° 到“手侧面”夹持姿态的路径长度
 # 与速度。旋转点位于纸盒后侧之外，不会扫到立柱/邻货。
 DUAL_TISSUE_UNROLL_PATH_M = 0.120
@@ -704,6 +714,9 @@ DUAL_TISSUE_DEPLOY_DWELL_S = 2.0
 DUAL_TISSUE_DEPLOY_TIMEOUT_S = 5.0
 DUAL_TISSUE_CLAMP_DWELL_S = 4.0
 DUAL_TISSUE_LIFT_M = 0.060
+# The slide cannot raise a top-shelf grasp, so the arms perform a shorter
+# guarded lift before retreating at the raised height.
+DUAL_TISSUE_TOP_ARM_LIFT_M = 0.035
 # Lift a tissue slowly enough for the side friction contacts to carry its mass.
 # The old one-step 60 mm joint target completed in ~0.5 s and left the box on
 # the shelf even though both arms had established a symmetric side contact.
@@ -717,6 +730,9 @@ DUAL_TISSUE_ARM_LIFT_STEP_M = 0.015
 DUAL_TISSUE_ARM_LIFT_MIN_CLEARANCE_M = 0.025
 DUAL_TISSUE_ARM_RETREAT_STEP_M = 0.055
 DUAL_TISSUE_ARM_SEGMENT_MAX_JOINT_DELTA_RAD = 0.45
+DUAL_TISSUE_TOP_MIDDLE_LIFT_INWARD_PRELOAD_M = 0.002
+DUAL_TISSUE_TOP_ARM_RETREAT_SPEED_MPS = 0.030
+DUAL_TISSUE_ARM_LIFT_Z_TOLERANCE_M = 0.006
 DUAL_TISSUE_LIFT_DWELL_S = 2.5
 DUAL_TISSUE_SLIDE_LIFT_TOLERANCE_M = 0.015
 DUAL_TISSUE_SLIDE_LIFT_STABLE_S = 0.25
@@ -806,6 +822,7 @@ GRIP_PRESHAPE_REACHED_TOLERANCE = 0.04
 STATE_GO_SCAN = "go_scan"
 STATE_SCAN = "scan"
 STATE_REVISIT = "revisit"
+STATE_DIRECT_TRANSIT = "direct_transit"
 STATE_ALIGN = "align"
 STATE_RECHECK = "recheck"
 STATE_GRASP_SETTLE = "grasp_settle"
@@ -1142,6 +1159,8 @@ class ShelfPickController(Node):
         self.dual_direct_probe = False
         self.dual_top_wrist_rolled = False
         self.dual_top_wrist_inward = False
+        self.dual_side_rolled = False
+        self.dual_contact_push_side = "left"
         self.dual_pregrasp_half_span = DUAL_TISSUE_PREGRASP_HALF_SPAN_M
         self.dual_squeeze_m = DUAL_TISSUE_SQUEEZE_M
         self.dual_contact_tcp_z = None
@@ -1157,6 +1176,9 @@ class ShelfPickController(Node):
         self.dual_motion_label = "idle"
         self.dual_motion_require_convergence = False
         self.dual_motion_endpoint_ready_since = None
+        self.dual_motion_path_distances = None
+        self.dual_motion_path_left = None
+        self.dual_motion_path_right = None
         self.dual_contact_start_left_joints = None
         self.dual_contact_start_right_joints = None
         self.dual_contact_target_left_joints = None
@@ -1166,6 +1188,8 @@ class ShelfPickController(Node):
         self.dual_contact_goal_left_world = None
         self.dual_contact_goal_right_world = None
         self.dual_contact_duration_s = 0.0
+        self.dual_contact_left_duration_s = 0.0
+        self.dual_contact_right_duration_s = 0.0
         self.dual_left_contacted = False
         self.dual_right_contacted = False
         self.dual_left_contact_hold_joints = None
@@ -1559,7 +1583,8 @@ class ShelfPickController(Node):
         if slot is None:
             return
         shelf, level, column = slot
-        if self.target_kind == "zhijin" and column != "2":
+        if (self.target_kind == "zhijin" and column != "2"
+                and not DUAL_TISSUE_SIDE_ROLLED_ENABLED):
             key = f"{level}|{shelf}|{column}"
             if key not in self.skipped_tissue_slots:
                 self.skipped_tissue_slots.add(key)
@@ -1611,7 +1636,8 @@ class ShelfPickController(Node):
             marker_id: int | None, source: str,
             extra: str = "",
             physical_marker_id: int | None = None,
-            shelf: str | None = None) -> None:
+            shelf: str | None = None,
+            enter_align: bool = True) -> None:
         """本地化一致后提交：目标世界坐标、抓取臂、对齐位姿、层/列。
 
         marker 关联路径与 YOLO-only 路径共用；marker_id 为 None 表示无码
@@ -1703,7 +1729,8 @@ class ShelfPickController(Node):
         committed = fixed_slot_from_world(slot_x, slot_z)
         if committed is not None:
             self.committed_slot = committed
-        self.set_state(STATE_ALIGN)
+        if enter_align:
+            self.set_state(STATE_ALIGN)
         self.get_logger().info(
             f"[localised] source={source} marker={marker_id} "
             f"product_world={np.round(self.target_world, 3)} "
@@ -1716,13 +1743,15 @@ class ShelfPickController(Node):
             self, shelf: str, level: str, column: str,
             marker_id: int | None = None,
             product_y: float | None = None,
-            product_z: float | None = None) -> bool:
+            product_z: float | None = None,
+            defer_align: bool = False) -> bool:
         """用固定货架槽位直接生成抓取目标，跳过“先到架中心再扫描定位”。
 
         该路径完全复用 ``_commit_localised_target`` 的抓取位姿计算，只是把
-        YOLO/ArUco 锁定换成已确认的固定几何槽位。调用后仍会进入
-        ``STATE_ALIGN``，并继续执行原 close-recheck / grasp 流程，因此
-        不会削弱抓取前校验。
+        YOLO/ArUco 锁定换成已确认的固定几何槽位。默认仍会进入
+        ``STATE_ALIGN``；带长距离导航器的子类可用 ``defer_align`` 延迟
+        该状态，抵达货架后再继续原 close-recheck / grasp 流程，因此不会
+        削弱抓取前校验，也不会让精对齐超时覆盖跨场地运输。
         """
         shelf = str(shelf).upper()
         level = str(level).upper()
@@ -1735,7 +1764,8 @@ class ShelfPickController(Node):
                 f"[direct-slot] invalid fixed slot "
                 f"shelf={shelf} level={level} column={column}")
             return False
-        if self.target_kind == "zhijin" and column != "2":
+        if (self.target_kind == "zhijin" and column != "2"
+                and not DUAL_TISSUE_SIDE_ROLLED_ENABLED):
             self.get_logger().warn(
                 "[tissue-filter] direct slot rejected for tissue "
                 f"column={column}; only the middle column is eligible")
@@ -1775,8 +1805,22 @@ class ShelfPickController(Node):
             marker_id,
             "memory_direct",
             extra=f" slot={slot_key}",
-            shelf=shelf)
+            shelf=shelf,
+            enter_align=not defer_align)
         return True
+
+    def advance_direct_transit(self) -> None:
+        """Run a deferred direct-slot transit in navigation-aware subclasses.
+
+        The base pick controller has no obstacle-aware long-range navigator.
+        Subclasses that request ``defer_align=True`` must override this hook;
+        aborting here prevents an unknown state from silently publishing zero
+        velocity forever.
+        """
+        self.get_logger().error(
+            "direct-slot transit requested without a navigation handler")
+        self.abort_reason = "direct transit handler unavailable"
+        self.set_state(STATE_ABORT)
 
     @staticmethod
     def _detection_world(detection: dict) -> np.ndarray | None:
@@ -1864,7 +1908,8 @@ class ShelfPickController(Node):
         marker_world = np.asarray(marker["position_world"], dtype=float)
         if marker_id in self.skipped_tissue_markers:
             return
-        if self.target_kind == "zhijin":
+        if (self.target_kind == "zhijin"
+                and not DUAL_TISSUE_SIDE_ROLLED_ENABLED):
             marker_slot = fixed_slot_from_world(
                 float(marker_world[0]), float(marker_world[2]))
             if marker_slot is None or marker_slot[2] != "2":
@@ -2977,7 +3022,9 @@ class ShelfPickController(Node):
         inferred_slot_marker_id = int(slot["aruco_id"])
         inferred_slot_key = (
             f"{slot['level']}|{slot['shelf']}|{str(slot['column'])[-1]}")
-        if self.target_kind == "zhijin" and str(slot["column"])[-1] != "2":
+        if (self.target_kind == "zhijin"
+                and str(slot["column"])[-1] != "2"
+                and not DUAL_TISSUE_SIDE_ROLLED_ENABLED):
             if inferred_slot_key not in self.skipped_tissue_slots:
                 self.skipped_tissue_slots.add(inferred_slot_key)
                 self.get_logger().warn(
@@ -3051,7 +3098,8 @@ class ShelfPickController(Node):
                 self.scan_station_order = self._nearest_scan_stations()
                 self.scan_cycles += 1
                 if self.scan_cycles >= self.max_scan_cycles:
-                    if self.target_kind == "zhijin":
+                    if (self.target_kind == "zhijin"
+                            and not DUAL_TISSUE_SIDE_ROLLED_ENABLED):
                         self.no_middle_tissue = True
                         self.get_logger().error(
                             "[tissue-filter] no middle-column tissue found "
@@ -3277,7 +3325,10 @@ class ShelfPickController(Node):
     def grasp_profile_name(self) -> str:
         """Return the composed layer/geometry profile used by this target."""
         if self.use_dual_tissue_grasp:
-            return f"{self.shelf_level}_dual_tissue"
+            suffix = (
+                "_side_rolled_three_point"
+                if getattr(self, "dual_side_rolled", False) else "")
+            return f"{self.shelf_level}_dual_tissue{suffix}"
         if self.use_sphere_grasp:
             return f"{self.shelf_level}_sphere"
         if self.shelf_level == "top":
@@ -3482,6 +3533,12 @@ class ShelfPickController(Node):
                 "[tissue-rotate] middle-column direct close flow "
                 "selected; skipping 90-deg pre-rotation")
             return False
+        if (slot is not None and slot[2] in ("1", "3")
+                and DUAL_TISSUE_SIDE_ROLLED_ENABLED):
+            self.get_logger().info(
+                "[tissue-rotate] side-column narrow-wrist flow selected; "
+                "keeping the box square and skipping product rotation")
+            return False
         if self.configure_tissue_90_rotation():
             self.tissue_rotate_stage = 0
             self.start_tissue_rotate_stage(0)
@@ -3496,25 +3553,27 @@ class ShelfPickController(Node):
     def configure_dual_tissue_grasp(self) -> bool:
         """Prepare a symmetric side clamp for the tissue box at any level.
 
-        全部列统一使用"直接探入"动作（wxj v2 策略）：张开双臂宽跨度前探 →
-        到位后合拢到夹持跨度压紧纸盒两侧 → 保持夹持收回。直线前探不横向
-        扫掠，天然避开货架前立柱，无需再绕柱，也不再跳过墙侧列。
+        Middle columns retain the established hand-side direct clamp.  Side
+        columns pre-roll both wrists outside the shelf and retain that narrow
+        orientation through insertion, contact, lift and retreat.
         """
         surface_z = SHELF_SURFACE_Z_M[self.shelf_level]
-        # 手侧面（滚转 0°）姿态抓取：侧列使用非对称窄跨度直接探入；
-        # 中间列使用“宽间距伸出 → 横向合拢 → 夹持”的两段动作。
         rotated = bool(getattr(self, "tissue_rotated_90", False))
+        slot = self.target_slot()
+        column = slot[2] if slot is not None else "2"
+        self.dual_side_rolled = bool(
+            DUAL_TISSUE_SIDE_ROLLED_ENABLED
+            and column in ("1", "3")
+            and not rotated)
         self.dual_clamp_half_span = (
             TISSUE_ROTATED_CLAMP_HALF_SPAN_M
             if rotated else DUAL_TISSUE_CLAMP_HALF_SPAN_M)
         self.dual_insert_forward_m = DUAL_TISSUE_INSERT_FORWARD_M
-        self.dual_top_wrist_rolled = False
+        self.dual_top_wrist_rolled = self.dual_side_rolled
         self.dual_top_wrist_inward = False
-        # 侧列探入用非对称跨度：立柱侧收 5mm、邻货侧放 5mm，总跨度不变，
-        # 横条整体避开前立柱；平转 90° 后短边只有 85mm，探入半跨度收窄。
+        self.dual_contact_push_side = (
+            "right" if column == "3" else "left")
         self.dual_overhead_route = False
-        slot = self.target_slot()
-        column = slot[2] if slot is not None else "2"
         self.dual_middle_extend_close = (
             column == "2" and not rotated)
         self.dual_direct_probe = not self.dual_middle_extend_close
@@ -3544,11 +3603,15 @@ class ShelfPickController(Node):
             self.dual_pregrasp_half_span = DUAL_TISSUE_PREGRASP_HALF_SPAN_M
         else:
             self.dual_pregrasp_half_span = self.dual_surround_half_span
-        self.dual_squeeze_m = DUAL_TISSUE_SQUEEZE_M
+        self.dual_squeeze_m = (
+            DUAL_TISSUE_SIDE_ROLLED_SQUEEZE_M
+            if self.dual_side_rolled else DUAL_TISSUE_SQUEEZE_M)
         tcp_clearance = (
-            DUAL_TISSUE_LOWER_TCP_CLEARANCE_M
-            if self.shelf_level == "lower"
-            else DUAL_TISSUE_TCP_CLEARANCE_M)
+            DUAL_TISSUE_SIDE_ROLLED_TCP_CLEARANCE_M
+            if self.dual_side_rolled
+            else (DUAL_TISSUE_LOWER_TCP_CLEARANCE_M
+                  if self.shelf_level == "lower"
+                  else DUAL_TISSUE_TCP_CLEARANCE_M))
         target_raise = (
             DUAL_TISSUE_TOP_TCP_RAISE_M
             if self.shelf_level == "top"
@@ -3595,6 +3658,17 @@ class ShelfPickController(Node):
                     self.solve_kdl_both_world(
                         surround_left, surround_right,
                         pre_left_joints, pre_right_joints))
+                if self.dual_side_rolled:
+                    segment_delta = max(
+                        float(np.max(np.abs(
+                            surround_left_joints - pre_left_joints))),
+                        float(np.max(np.abs(
+                            surround_right_joints - pre_right_joints))))
+                    if (segment_delta
+                            > DUAL_TISSUE_SIDE_ROLLED_MAX_SEGMENT_JOINT_DELTA_RAD):
+                        raise ValueError(
+                            "side-column rolled approach changed one joint "
+                            f"by {segment_delta:.3f}rad")
                 self.dual_surround_pass_left_joints = None
                 self.dual_surround_pass_right_joints = None
                 self.dual_surround_unroll_left_joints = None
@@ -3654,8 +3728,8 @@ class ShelfPickController(Node):
         self.dual_pregrasp_right_joints = pre_right_joints
         self.dual_surround_left_joints = surround_left_joints
         self.dual_surround_right_joints = surround_right_joints
-        # 手背滚转探入 + 90° unroll：pass 保存滚转探入终点，unroll 保存
-        # 手侧面终点；forward/return 属于旧 overhead 路线，不再使用。
+        # Side columns retain their rolled wrist orientation; pass/unroll and
+        # forward/return belong only to the disabled legacy post route.
         self.dual_surround_forward_left_joints = None
         self.dual_surround_forward_right_joints = None
         self.dual_surround_return_left_joints = None
@@ -3685,7 +3759,9 @@ class ShelfPickController(Node):
             f"clamp_right={np.round(clamp_right, 3)} "
             f"retreat_left={np.round(retreat_left, 3)} "
             f"retreat_right={np.round(retreat_right, 3)} "
-            f"grippers=closed({DUAL_TISSUE_GRIP_COMMAND:.2f})")
+            f"grippers=closed({DUAL_TISSUE_GRIP_COMMAND:.2f}) "
+            f"side_rolled={int(self.dual_side_rolled)} "
+            f"contact_push={self.dual_contact_push_side}")
         if self.dual_direct_probe:
             self.get_logger().info(
                 "[dual-tissue-IK] direct probe defers clamp/retreat IK "
@@ -3708,6 +3784,26 @@ class ShelfPickController(Node):
                 "[dual-tissue-arm-lift] measured TCP unavailable")
             return False
         start_z = 0.5 * (left_tcp[2] + right_tcp[2])
+        inward_preload = (
+            DUAL_TISSUE_TOP_MIDDLE_LIFT_INWARD_PRELOAD_M
+            if getattr(self, "dual_middle_extend_close", False) else 0.0)
+        # Keep the commanded squeeze preload while lifting.  Anchoring the
+        # next IK samples only to the load-displaced measured TCPs relaxes the
+        # clamp for one frame and can release the box.
+        clamp_left_tcp = (
+            None if self.dual_clamp_left_joints is None
+            else self.arm_target_tcp_world(
+                "left", self.dual_clamp_left_joints))
+        clamp_right_tcp = (
+            None if self.dual_clamp_right_joints is None
+            else self.arm_target_tcp_world(
+                "right", self.dual_clamp_right_joints))
+        hold_left_x = float(
+            (left_tcp[0] if clamp_left_tcp is None else clamp_left_tcp[0])
+            + inward_preload)
+        hold_right_x = float(
+            (right_tcp[0] if clamp_right_tcp is None else clamp_right_tcp[0])
+            - inward_preload)
         retreat_y = (
             self.target_world[1] - DUAL_TISSUE_PREGRASP_BACKOFF_M)
         left_reference = self.arm_positions("left")
@@ -3737,14 +3833,15 @@ class ShelfPickController(Node):
         # waypoint changes branch, retaining a lower but >=25 mm lift is safer
         # and faster than aborting or dragging the box at shelf height.
         lift_steps = int(math.ceil(
-            DUAL_TISSUE_LIFT_M / DUAL_TISSUE_ARM_LIFT_STEP_M))
+            DUAL_TISSUE_TOP_ARM_LIFT_M
+            / DUAL_TISSUE_ARM_LIFT_STEP_M))
         for index in range(1, lift_steps + 1):
             amount = min(
-                DUAL_TISSUE_LIFT_M,
+                DUAL_TISSUE_TOP_ARM_LIFT_M,
                 index * DUAL_TISSUE_ARM_LIFT_STEP_M)
             lift_z = start_z + amount
-            lift_left = np.array([left_tcp[0], left_tcp[1], lift_z])
-            lift_right = np.array([right_tcp[0], right_tcp[1], lift_z])
+            lift_left = np.array([hold_left_x, left_tcp[1], lift_z])
+            lift_right = np.array([hold_right_x, right_tcp[1], lift_z])
             try:
                 left_joints, right_joints = solve_guarded(
                     lift_left, lift_right,
@@ -3788,9 +3885,9 @@ class ShelfPickController(Node):
                 waypoint_y = float(
                     left_tcp[1] + progress * (retreat_y - left_tcp[1]))
                 retreat_left = np.array([
-                    left_tcp[0], waypoint_y, lift_z])
+                    hold_left_x, waypoint_y, lift_z])
                 retreat_right = np.array([
-                    right_tcp[0], waypoint_y, lift_z])
+                    hold_right_x, waypoint_y, lift_z])
                 left_joints, right_joints = solve_guarded(
                     retreat_left, retreat_right,
                     left_reference, right_reference,
@@ -3821,45 +3918,34 @@ class ShelfPickController(Node):
         self.get_logger().info(
             f"[dual-tissue-arm-lift] slide pinned at SLIDE_MIN; "
             f"planned_lift={achieved_lift:.3f}m/"
-            f"{DUAL_TISSUE_LIFT_M:.3f}m via "
+            f"{DUAL_TISSUE_TOP_ARM_LIFT_M:.3f}m via "
             f"{len(self.dual_lift_arm_waypoints)} guarded arm segments; "
             f"retreat={retreat_distance:.3f}m via "
             f"{len(self.dual_lift_retreat_waypoints)} guarded segments "
             f"left_start={np.round(left_tcp, 4)} "
             f"right_start={np.round(right_tcp, 4)} "
+            f"loaded_hold_x=({hold_left_x:.4f},{hold_right_x:.4f}) "
             f"retreat_y={retreat_y:.3f}")
         return True
 
     def start_dual_tissue_arm_lift_stage(self, stage: int) -> None:
-        """Start one branch-checked top-tissue vertical waypoint."""
-        amount, left_target, right_target = self.dual_lift_arm_waypoints[stage]
-        previous_amount = (
-            0.0 if stage == 0
-            else self.dual_lift_arm_waypoints[stage - 1][0])
-        self.dual_lift_arm_stage = stage
-        self.start_dual_tissue_motion(
-            f"arm_lift_{stage + 1}_of_"
-            f"{len(self.dual_lift_arm_waypoints)}",
-            left_target, right_target,
-            max(0.001, amount - previous_amount),
+        """Play all guarded vertical waypoints without stop/start cycling."""
+        self.dual_lift_arm_stage = len(self.dual_lift_arm_waypoints) - 1
+        self.start_dual_tissue_waypoint_motion(
+            "arm_lift_continuous",
+            self.dual_lift_arm_waypoints,
             DUAL_TISSUE_ARM_LIFT_SPEED_MPS,
             STATE_LIFT,
             require_convergence=True)
 
     def start_dual_tissue_arm_retreat_stage(self, stage: int) -> None:
-        """Start one branch-checked raised horizontal retreat waypoint."""
-        distance, left_target, right_target = (
-            self.dual_lift_retreat_waypoints[stage])
-        previous_distance = (
-            0.0 if stage == 0
-            else self.dual_lift_retreat_waypoints[stage - 1][0])
-        self.dual_lift_retreat_stage = stage
-        self.start_dual_tissue_motion(
-            f"raised_retreat_{stage + 1}_of_"
-            f"{len(self.dual_lift_retreat_waypoints)}",
-            left_target, right_target,
-            max(0.001, distance - previous_distance),
-            DUAL_TISSUE_RETREAT_SPEED_MPS,
+        """Immediately play the complete raised retreat as one path."""
+        self.dual_lift_retreat_stage = (
+            len(self.dual_lift_retreat_waypoints) - 1)
+        self.start_dual_tissue_waypoint_motion(
+            "raised_retreat_continuous",
+            self.dual_lift_retreat_waypoints,
+            DUAL_TISSUE_TOP_ARM_RETREAT_SPEED_MPS,
             STATE_RETREAT,
             require_convergence=True)
 
@@ -4695,6 +4781,9 @@ class ShelfPickController(Node):
         self.dual_motion_label = label
         self.dual_motion_require_convergence = require_convergence
         self.dual_motion_endpoint_ready_since = None
+        self.dual_motion_path_distances = None
+        self.dual_motion_path_left = None
+        self.dual_motion_path_right = None
         self.des_left_arm = self.dual_motion_start_left.copy()
         self.des_right_arm = self.dual_motion_start_right.copy()
         self.commands_ready_since = None
@@ -4714,6 +4803,58 @@ class ShelfPickController(Node):
         # The post-band dogleg re-enters STATE_ARM_FORWARD for each segment;
         # set_state skips the timestamp on an unchanged state, so reset the
         # segment timer explicitly here.
+        self.state_t0 = self.now()
+
+    def start_dual_tissue_waypoint_motion(
+            self, label: str,
+            waypoints: list[tuple[float, np.ndarray, np.ndarray]],
+            speed: float, state: str,
+            require_convergence: bool = False) -> None:
+        """Play guarded IK samples as one uninterrupted loaded motion."""
+        if not waypoints:
+            raise ValueError(f"{label} requires at least one waypoint")
+        # Preserve the previously commanded clamp pose at the handoff.  Using
+        # measured joints here would momentarily remove useful position error.
+        start_left = (
+            self.arm_positions("left")
+            if self.des_left_arm is None
+            else np.asarray(self.des_left_arm, dtype=float).copy())
+        start_right = (
+            self.arm_positions("right")
+            if self.des_right_arm is None
+            else np.asarray(self.des_right_arm, dtype=float).copy())
+        distances = [0.0]
+        left_path = [start_left.copy()]
+        right_path = [start_right.copy()]
+        for distance, left_target, right_target in waypoints:
+            distances.append(float(distance))
+            left_path.append(np.asarray(left_target, dtype=float).copy())
+            right_path.append(np.asarray(right_target, dtype=float).copy())
+
+        total_path = max(0.001, distances[-1])
+        self.dual_motion_start_left = start_left
+        self.dual_motion_start_right = start_right
+        self.dual_motion_target_left = left_path[-1].copy()
+        self.dual_motion_target_right = right_path[-1].copy()
+        self.dual_motion_path_distances = np.asarray(distances, dtype=float)
+        self.dual_motion_path_left = np.asarray(left_path, dtype=float)
+        self.dual_motion_path_right = np.asarray(right_path, dtype=float)
+        self.dual_motion_duration_s = max(
+            DUAL_TISSUE_MIN_MOTION_DURATION_S,
+            1.5 * total_path / speed)
+        self.dual_motion_label = label
+        self.dual_motion_require_convergence = require_convergence
+        self.dual_motion_endpoint_ready_since = None
+        self.des_left_arm = start_left.copy()
+        self.des_right_arm = start_right.copy()
+        self.commands_ready_since = None
+        self.get_logger().info(
+            f"[dual-tissue-{label}] continuous guarded path armed; "
+            f"path={total_path:.3f}m waypoints={len(waypoints)} "
+            f"duration={self.dual_motion_duration_s:.2f}s "
+            f"speed={speed:.3f}m/s convergence_gate="
+            f"{int(require_convergence)} replanning=0")
+        self.set_state(state)
         self.state_t0 = self.now()
 
     def start_dual_tissue_surround(self) -> None:
@@ -4909,17 +5050,18 @@ class ShelfPickController(Node):
                 STATE_ARM_FORWARD,
                 require_convergence=True)
             return
+        if getattr(self, "dual_side_rolled", False):
+            # Confirm both side contacts before applying the final preload.
+            self.start_dual_tissue_contact_search()
+            return
         if not self.start_dual_tissue_squeeze():
             self.set_state(STATE_ABORT)
 
     def start_dual_tissue_contact_search(self) -> None:
         """Move each arm monotonically inward until its own contact.
 
-        方案 A2（一侧停靠、一侧慢推）：右臂合拢到停靠跨度
-        (DUAL_TISSUE_PARK_SPAN_M) 后停住（endpoint 即到位），左臂继续
-        慢速推进到深推上限 (DUAL_TISSUE_PUSH_SPAN_M)——左手指压住纸盒
-        左缘把纸盒推向右侧，纸盒顶到停靠的右手指后被双侧夹住，左臂
-        stall 即真实接触。squeeze 随后以实测双侧位置锚定夹持。
+        侧列按立柱方向镜像：立柱侧手臂慢推，另一侧停靠，
+        使纸盒始终离开立柱。squeeze 再以实测双侧位置锚定。
         """
         left_tcp = self.arm_tcp_world("left")
         right_tcp = self.arm_tcp_world("right")
@@ -4931,18 +5073,34 @@ class ShelfPickController(Node):
 
         common_y = 0.5 * (left_tcp[1] + right_tcp[1])
         common_z = 0.5 * (left_tcp[2] + right_tcp[2])
+        push_side = getattr(self, "dual_contact_push_side", "left")
+        left_span = (
+            DUAL_TISSUE_PARK_SPAN_M
+            if push_side == "right" else DUAL_TISSUE_PUSH_SPAN_M)
+        right_span = (
+            DUAL_TISSUE_PUSH_SPAN_M
+            if push_side == "right" else DUAL_TISSUE_PARK_SPAN_M)
         left_goal = np.array([
-            self.target_world[0] - DUAL_TISSUE_PUSH_SPAN_M,
-            common_y, common_z])
+            self.target_world[0] - left_span, common_y, common_z])
         right_goal = np.array([
-            self.target_world[0] + DUAL_TISSUE_PARK_SPAN_M,
-            common_y, common_z])
+            self.target_world[0] + right_span, common_y, common_z])
         left_start_joints = self.arm_positions("left")
         right_start_joints = self.arm_positions("right")
         try:
             left_goal_joints, right_goal_joints = self.solve_kdl_both_world(
                 left_goal, right_goal,
                 left_start_joints, right_start_joints)
+            if getattr(self, "dual_side_rolled", False):
+                segment_delta = max(
+                    float(np.max(np.abs(
+                        left_goal_joints - left_start_joints))),
+                    float(np.max(np.abs(
+                        right_goal_joints - right_start_joints))))
+                if (segment_delta
+                        > DUAL_TISSUE_SIDE_ROLLED_MAX_SEGMENT_JOINT_DELTA_RAD):
+                    raise ValueError(
+                        "side-column rolled contact search changed one "
+                        f"joint by {segment_delta:.3f}rad")
         except ValueError as exc:
             self.get_logger().error(
                 f"[dual-tissue-contact] search IK failed: {exc}")
@@ -4951,7 +5109,6 @@ class ShelfPickController(Node):
 
         left_path = max(0.0, left_goal[0] - left_tcp[0])
         right_path = max(0.0, right_tcp[0] - right_goal[0])
-        path_length = max(left_path, right_path)
         self.dual_contact_start_left_joints = left_start_joints
         self.dual_contact_start_right_joints = right_start_joints
         self.dual_contact_target_left_joints = left_goal_joints
@@ -4960,9 +5117,15 @@ class ShelfPickController(Node):
         self.dual_contact_start_right_world = right_tcp.copy()
         self.dual_contact_goal_left_world = left_goal
         self.dual_contact_goal_right_world = right_goal
-        self.dual_contact_duration_s = max(
+        self.dual_contact_left_duration_s = max(
             DUAL_TISSUE_MIN_MOTION_DURATION_S,
-            1.5 * path_length / DUAL_TISSUE_CONTACT_SEARCH_SPEED_MPS)
+            1.5 * left_path / DUAL_TISSUE_CONTACT_SEARCH_SPEED_MPS)
+        self.dual_contact_right_duration_s = max(
+            DUAL_TISSUE_MIN_MOTION_DURATION_S,
+            1.5 * right_path / DUAL_TISSUE_CONTACT_SEARCH_SPEED_MPS)
+        self.dual_contact_duration_s = max(
+            self.dual_contact_left_duration_s,
+            self.dual_contact_right_duration_s)
         self.dual_left_contacted = False
         self.dual_right_contacted = False
         self.dual_left_contact_hold_joints = None
@@ -4986,7 +5149,10 @@ class ShelfPickController(Node):
         self.get_logger().info(
             f"[dual-tissue-contact] independent monotonic search armed; "
             f"duration={self.dual_contact_duration_s:.2f}s "
+            f"side_durations=({self.dual_contact_left_duration_s:.2f},"
+            f"{self.dual_contact_right_duration_s:.2f})s "
             f"speed={DUAL_TISSUE_CONTACT_SEARCH_SPEED_MPS:.3f}m/s "
+            f"push_side={push_side} "
             f"start_line_angle={line_angle:.2f}deg "
             f"left_start={np.round(left_tcp, 4)} "
             f"right_start={np.round(right_tcp, 4)} "
@@ -5039,22 +5205,30 @@ class ShelfPickController(Node):
         """Advance both searches independently, never reversing either arm."""
         elapsed = self.now() - self.state_t0
         duration = max(self.dual_contact_duration_s, 1e-6)
-        progress = float(np.clip(elapsed / duration, 0.0, 1.0))
-        eased = progress * progress * (3.0 - 2.0 * progress)
+        left_duration = max(self.dual_contact_left_duration_s, 1e-6)
+        right_duration = max(self.dual_contact_right_duration_s, 1e-6)
+        left_progress = float(np.clip(
+            elapsed / left_duration, 0.0, 1.0))
+        right_progress = float(np.clip(
+            elapsed / right_duration, 0.0, 1.0))
+        left_eased = (
+            left_progress * left_progress * (3.0 - 2.0 * left_progress))
+        right_eased = (
+            right_progress * right_progress * (3.0 - 2.0 * right_progress))
         if self.dual_left_contacted:
             self.des_left_arm = self.dual_left_contact_hold_joints.copy()
         else:
             self.des_left_arm = (
                 self.dual_contact_start_left_joints
-                + eased * (self.dual_contact_target_left_joints
-                           - self.dual_contact_start_left_joints))
+                + left_eased * (self.dual_contact_target_left_joints
+                                - self.dual_contact_start_left_joints))
         if self.dual_right_contacted:
             self.des_right_arm = self.dual_right_contact_hold_joints.copy()
         else:
             self.des_right_arm = (
                 self.dual_contact_start_right_joints
-                + eased * (self.dual_contact_target_right_joints
-                           - self.dual_contact_start_right_joints))
+                + right_eased * (self.dual_contact_target_right_joints
+                                 - self.dual_contact_start_right_joints))
 
         left_tcp = self.arm_tcp_world("left")
         right_tcp = self.arm_tcp_world("right")
@@ -5065,7 +5239,7 @@ class ShelfPickController(Node):
                 0.0,
                 self.dual_contact_goal_left_world[0]
                 - self.dual_contact_start_left_world[0])
-            commanded = eased * total
+            commanded = left_eased * total
             # The closed gripper is used as a flat paddle; its tendon reading
             # is noisy (observed down to -0.000) and can fire "contact" after
             # only a few mm of travel, far from the box side.  Only trust the
@@ -5086,7 +5260,7 @@ class ShelfPickController(Node):
                 0.0,
                 self.dual_contact_start_right_world[0]
                 - self.dual_contact_goal_right_world[0])
-            commanded = eased * total
+            commanded = right_eased * total
             if self.dual_tissue_contact_stalled(
                     self.dual_right_contact_samples, actual, commanded):
                 self.mark_dual_tissue_contact("right", "stall", right_tcp)
@@ -5136,12 +5310,8 @@ class ShelfPickController(Node):
     def start_dual_tissue_squeeze(self) -> bool:
         """Close both arms onto the box with a measured-anchored clamp.
 
-        手侧面（0° 滚转，手指竖直）固定深压夹持：手指大面（mesh x 面，
-        62×96mm）在 TCP 纸盒侧 31mm 处——正常 clamp 半跨度约 0.09m 时
-        大面间距 = 2×(0.09-0.031) = 118mm，远小于纸盒 172mm，两侧大面
-        必然压住纸盒。合拢是肩关节的横向摆动（滚转腕姿态下会因腕关节
-        饱和到不了位，实测空夹；侧面姿态下无此问题——中间列成功局即此
-        姿态）。不依赖接触搜索的 stall 判定（滚转腕下会假接触）。
+        中列沿用手侧面夹持；侧列使用竖直固定侧板的滚腕三点夹持。
+        两种路径都以实测双侧接触位置为锚点，不盲推视觉中心。
 
         20260818：直接探入后不再按名义目标中心盲目深压——右臂在从探入
         跨度合拢到 0.09 名义跨度时会被纸巾提前顶住（实测右 TCP 停在
@@ -5153,15 +5323,14 @@ class ShelfPickController(Node):
         measured_left = self.arm_tcp_world("left")
         measured_right = self.arm_tcp_world("right")
         if measured_left is not None and measured_right is not None:
-            # 以实测位置为锚：只从当前探入位置向纸盒方向各压
-            # DUAL_TISSUE_SQUEEZE_M，避免长距离盲推撞到纸巾。
+            # 只施加当前姿态对应的小预压。
             common_y = 0.5 * (measured_left[1] + measured_right[1])
             common_z = 0.5 * (measured_left[2] + measured_right[2])
             box_centre_x = 0.5 * (measured_left[0] + measured_right[0])
             squeeze_left = measured_left.copy()
-            squeeze_left[0] += DUAL_TISSUE_SQUEEZE_M
+            squeeze_left[0] += self.dual_squeeze_m
             squeeze_right = measured_right.copy()
-            squeeze_right[0] -= DUAL_TISSUE_SQUEEZE_M
+            squeeze_right[0] -= self.dual_squeeze_m
             squeeze_left[1] = common_y
             squeeze_left[2] = common_z
             squeeze_right[1] = common_y
@@ -5205,6 +5374,22 @@ class ShelfPickController(Node):
                 self.solve_kdl_both_world(
                     retreat_left, retreat_right,
                     clamp_left_joints, clamp_right_joints))
+            if getattr(self, "dual_side_rolled", False):
+                squeeze_delta = max(
+                    float(np.max(np.abs(
+                        squeeze_left_joints - left_reference))),
+                    float(np.max(np.abs(
+                        squeeze_right_joints - right_reference))))
+                retreat_delta = max(
+                    float(np.max(np.abs(
+                        retreat_left_joints - clamp_left_joints))),
+                    float(np.max(np.abs(
+                        retreat_right_joints - clamp_right_joints))))
+                if max(squeeze_delta, retreat_delta) > (
+                        DUAL_TISSUE_SIDE_ROLLED_MAX_SEGMENT_JOINT_DELTA_RAD):
+                    raise ValueError(
+                        "side-column rolled squeeze/retreat changed one "
+                        f"joint by {max(squeeze_delta, retreat_delta):.3f}rad")
         except ValueError as exc:
             self.get_logger().error(
                 f"[dual-tissue-squeeze] IK failed: {exc}")
@@ -5224,7 +5409,9 @@ class ShelfPickController(Node):
              else 0.5 * (measured_right[0] - measured_left[0]))
             - final_half_span)
         self.get_logger().info(
-            f"[dual-tissue-squeeze] hand-side clamp span="
+            f"[dual-tissue-squeeze] "
+            f"{'rolled-three-point' if self.dual_side_rolled else 'hand-side'} "
+            f"clamp span="
             f"{final_half_span:.3f}m/side "
             f"big_face_gap={face_gap * 1000:.0f}mm "
             f"interference≈{interference * 1000:.0f}mm/side "
@@ -5246,14 +5433,37 @@ class ShelfPickController(Node):
         duration = max(self.dual_motion_duration_s, 1e-6)
         progress = float(np.clip(elapsed / duration, 0.0, 1.0))
         eased = progress * progress * (3.0 - 2.0 * progress)
-        self.des_left_arm = (
-            self.dual_motion_start_left
-            + eased * (self.dual_motion_target_left
-                       - self.dual_motion_start_left))
-        self.des_right_arm = (
-            self.dual_motion_start_right
-            + eased * (self.dual_motion_target_right
-                       - self.dual_motion_start_right))
+        if self.dual_motion_path_distances is not None:
+            path_distance = eased * self.dual_motion_path_distances[-1]
+            segment = int(np.searchsorted(
+                self.dual_motion_path_distances,
+                path_distance, side="right") - 1)
+            segment = max(0, min(
+                segment, len(self.dual_motion_path_distances) - 2))
+            segment_start = self.dual_motion_path_distances[segment]
+            segment_end = self.dual_motion_path_distances[segment + 1]
+            segment_progress = float(np.clip(
+                (path_distance - segment_start)
+                / max(segment_end - segment_start, 1e-6), 0.0, 1.0))
+            self.des_left_arm = (
+                self.dual_motion_path_left[segment]
+                + segment_progress
+                * (self.dual_motion_path_left[segment + 1]
+                   - self.dual_motion_path_left[segment]))
+            self.des_right_arm = (
+                self.dual_motion_path_right[segment]
+                + segment_progress
+                * (self.dual_motion_path_right[segment + 1]
+                   - self.dual_motion_path_right[segment]))
+        else:
+            self.des_left_arm = (
+                self.dual_motion_start_left
+                + eased * (self.dual_motion_target_left
+                           - self.dual_motion_start_left))
+            self.des_right_arm = (
+                self.dual_motion_start_right
+                + eased * (self.dual_motion_target_right
+                           - self.dual_motion_start_right))
         if elapsed < duration:
             return "moving"
 
@@ -5283,6 +5493,31 @@ class ShelfPickController(Node):
         # Accept either representation, while a genuinely blocked arm still
         # misses its TCP target by several centimetres and fails this gate.
         endpoint_ready = joint_endpoint_ready or tcp_endpoint_ready
+        if self.dual_motion_label.startswith("arm_lift_"):
+            lift_height_ready = (
+                left_tcp is not None and right_tcp is not None
+                and left_target_tcp is not None
+                and right_target_tcp is not None
+                and abs(float(left_tcp[2] - left_target_tcp[2]))
+                <= DUAL_TISSUE_ARM_LIFT_Z_TOLERANCE_M
+                and abs(float(right_tcp[2] - right_target_tcp[2]))
+                <= DUAL_TISSUE_ARM_LIFT_Z_TOLERANCE_M)
+            endpoint_ready = endpoint_ready and lift_height_ready
+        elif self.dual_motion_label.startswith("raised_retreat_"):
+            # Lateral position error is useful clamp preload.  Gate the loaded
+            # retreat on depth and height instead of rejecting that preload.
+            endpoint_ready = (
+                left_tcp is not None and right_tcp is not None
+                and left_target_tcp is not None
+                and right_target_tcp is not None
+                and abs(float(left_tcp[1] - left_target_tcp[1]))
+                <= DUAL_TISSUE_ENDPOINT_TCP_TOLERANCE_M
+                and abs(float(right_tcp[1] - right_target_tcp[1]))
+                <= DUAL_TISSUE_ENDPOINT_TCP_TOLERANCE_M
+                and abs(float(left_tcp[2] - left_target_tcp[2]))
+                <= DUAL_TISSUE_ENDPOINT_TCP_TOLERANCE_M
+                and abs(float(right_tcp[2] - right_target_tcp[2]))
+                <= DUAL_TISSUE_ENDPOINT_TCP_TOLERANCE_M)
         now = self.now()
         if endpoint_ready:
             if self.dual_motion_endpoint_ready_since is None:
@@ -5988,10 +6223,18 @@ class ShelfPickController(Node):
         if self.use_dual_tissue_grasp:
             # Scale one 12-joint vector so neither arm arrives early and
             # pushes the box sideways while the other arm is still moving.
+            # The first deployment is outside the shelf and must retain its
+            # normal speed; all following rolled-wrist phases are limited to
+            # suppress tracking overshoot beside the post and the box.
+            dual_step = (
+                DUAL_TISSUE_SIDE_ROLLED_MAX_STEP_RAD
+                if (getattr(self, "dual_side_rolled", False)
+                    and self.state != STATE_DEPLOY)
+                else ARM_COMMAND_MAX_STEP_RAD)
             combined = self.synchronized_slew(
                 np.concatenate((self.cmd_left_arm, self.cmd_right_arm)),
                 np.concatenate((self.des_left_arm, self.des_right_arm)),
-                ARM_COMMAND_MAX_STEP_RAD)
+                dual_step)
             self.cmd_left_arm = combined[:6]
             self.cmd_right_arm = combined[6:]
         else:
@@ -6161,6 +6404,9 @@ class ShelfPickController(Node):
                     self.revisit_pose_monotonic_t0 = time.monotonic()
                     if self.revisit_pose_index >= len(self.revisit_poses):
                         self._revisit_fail()
+
+        elif self.state == STATE_DIRECT_TRANSIT:
+            self.advance_direct_transit()
 
         elif self.state == STATE_ALIGN:
             align_x_tolerance = 0.025
@@ -6789,9 +7035,11 @@ class ShelfPickController(Node):
               and self.use_dual_tissue_grasp):
             self.des_left_grip = DUAL_TISSUE_GRIP_COMMAND
             self.des_right_grip = DUAL_TISSUE_GRIP_COMMAND
-            # 侧列取出：撤退前几秒横向漂移，避开前立柱。
+            # 旧手侧面姿态需横移避柱；窄腕姿态保持直退，
+            # 避免带货重新扫向立柱。
             slot = self.target_slot()
             if (slot is not None and slot[2] in ("1", "3")
+                    and not getattr(self, "dual_side_rolled", False)
                     and self.now() - self.state_t0
                     < TISSUE_POST_RETREAT_SHIFT_S):
                 lateral = (
