@@ -127,6 +127,17 @@ def _memory_direct_hint_ok(hint: dict) -> bool:
     return True
 
 
+# 运行中“动态直达”（go_scan 途中改道到具体槽位）与订单开始时直达一致：
+# 只要矩阵出现该品类的 primary 主证据，就直接生成槽位抓取目标，不再
+# “先到货架中心对位再扫描”。主证据本身已含多帧确认与样本数门槛（最少
+# 4 个深度样本、同槽位中位数一致），因此不再单独限制观测距离（恢复旧版
+# 从起点/途中/障碍区全程录入）；hidden_fallback（被同格其他品类盖住的
+# 历史候选）始终不直达，避免追着误检跑。抓取前的 close-recheck 仍是最后
+# 一道校验，失败会自动排除该槽位并回退全量扫描。只保留与矩阵近距候选
+# 一致的 0.70 置信度下限，拦截不可能成为主证据的病理记录。
+DYNAMIC_DIRECT_CONF_MIN = 0.70
+
+
 def _select_memory_hint(
         candidates, base_xy, conf_threshold: float,
         exclude_slots=(), exclude_shelves=(), exclude_shelf_levels=(),
@@ -393,11 +404,14 @@ def _select_nearest_pending_order(
     """Choose the pending order whose remembered shelf is nearest now.
 
     Orders without a usable memory hint remain eligible, but rank after every
-    order with a finite route estimate.  Source order is the deterministic
-    fallback and also keeps duplicate goods stable.
+    order with a finite route estimate.  When no pending order has any usable
+    memory (e.g. an empty matrix at the start of a run), fall back to a
+    random pending order instead of the first order-list slot, so the robot
+    never blindly commits to order list entry #1.
     """
     hint_cache = {}
     ranked = []
+    any_usable = False
     for source_index in pending_indices:
         kind = orders[source_index]
         if kind not in hint_cache:
@@ -408,10 +422,18 @@ def _select_nearest_pending_order(
         except (KeyError, TypeError, ValueError):
             travel = float("inf")
         usable_hint = hint is not None and math.isfinite(travel)
+        any_usable = any_usable or usable_hint
         if not usable_hint:
             travel = float("inf")
         ranked.append(((not usable_hint, travel, source_index), source_index))
-    return min(ranked, key=lambda item: item[0])[1] if ranked else None
+    if not ranked:
+        return None
+    if not any_usable:
+        # 矩阵为空/所有待办都无记忆：距离信息不存在，最近优先无从计算。
+        # 不固定抓订单第一格，随机选一单即可——商品通常分布在最近的
+        # E/D 货架，无论选哪单都能就近找到，避免每次都跑远路。
+        return random.choice(pending_indices)
+    return min(ranked, key=lambda item: item[0])[1]
 
 
 def _prefer_west_scan_start(order_index: int) -> bool:
@@ -980,7 +1002,13 @@ class ContinuousOrderController(IntegratedNavPickPlace):
                     -integrated.PLACE_CLEAR_TABLE_SPEED_MPS,
                     float(np.clip(2.0 * yaw_error, -0.25, 0.25)))
             else:
-                self.set_twist(0.0, 0.0)
+                # A drop/retreat can leave the base a little off the north-
+                # facing reverse heading.  Stopping both axes here leaves it
+                # outside the yaw gate forever: it can neither turn into the
+                # gate nor drive out of the table keep-out.  Rotate in place
+                # first, then the branch above performs the northward reverse.
+                self.set_twist(
+                    0.0, float(np.clip(2.0 * yaw_error, -0.25, 0.25)))
             if not self._table_escape_logged:
                 self._table_escape_logged = True
                 self.get_logger().warn(
@@ -1374,6 +1402,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-retries", type=int, default=2,
                         help="retries per order before skipping it")
     parser.add_argument(
+        "--grab-policy", choices=["nearest", "sequence"], default="nearest",
+        help="how pending orders are selected: 'nearest' (default) prefers "
+             "the goods closest to the current base position using the "
+             "memory matrix; 'sequence' follows the order list strictly")
+    parser.add_argument(
+        "--no-record-everywhere", action="store_true",
+        help="keep YOLO/memory recording gated to the shelf observation "
+             "corridor (default: YOLO stays on and the matrix records "
+             "everywhere, including transit and obstacle detours)")
+    parser.add_argument(
         "--record-first", action="store_true",
         help="开始抓取前先按正式行走流程逐架录入，记录记忆矩阵")
     parser.add_argument(
@@ -1458,7 +1496,12 @@ def main() -> None:
             "head", marker_size=pick.MARKER_SIZE_M, publish_tf=False,
             publish_result_image=True)
         matrix_tracker = MemoryMatrixTracker(
-            confirmations=args.matrix_confirmations)
+            confirmations=args.matrix_confirmations,
+            record_everywhere=not args.no_record_everywhere)
+        matrix_tracker.get_logger().info(
+            "[memory] YOLO 全程开启，矩阵不再限制在货架观察走廊：起点到"
+            "货架途中、绕障碍等位置只要有有效检测都会持续更新记忆矩阵"
+            f"（record_everywhere={not args.no_record_everywhere}）")
         nodes += [yolo_node, aruco_node, matrix_tracker]
         executor.add_node(yolo_node)
         executor.add_node(aruco_node)
@@ -1616,6 +1659,10 @@ def main() -> None:
             ctrl.memory_rerouted = False
             ctrl.memory_exhausted_shelves = set()
             ctrl.memory_last_scan_station_x = None
+            # 感知全程常开：YOLO 一直推理并喂给记忆矩阵，不受状态机
+            # "只在扫描时开感知"的限制。
+            ctrl.perception_always_on = not args.no_record_everywhere
+            ctrl.configure_local_perception(yolo_node, aruco_node)
             ctrl.memory_consume_callback = (
                 lambda completed: _consume_grabbed_memory(
                     completed, matrix_tracker))
@@ -1734,9 +1781,16 @@ def main() -> None:
         active_source_index = None
 
         def select_next_order() -> tuple[int, str] | None:
-            source_index = _select_nearest_pending_order(
-                pending_indices, orders,
-                lambda kind: _memory_hint_for(kind, log_decision=False))
+            if args.grab_policy == "sequence":
+                # 严格按订单表顺序：取剩余待办里 source_index 最小的一单。
+                source_index = (
+                    min(pending_indices) if pending_indices else None)
+            else:
+                # 最近优先：矩阵里哪个待办货物的已知货架离机器人最近，就先
+                # 抓哪单；矩阵里没记录的种类排在已知位置之后，用订单顺序兜底。
+                source_index = _select_nearest_pending_order(
+                    pending_indices, orders,
+                    lambda kind: _memory_hint_for(kind, log_decision=False))
             if source_index is None:
                 return None
             return source_index, orders[source_index]
@@ -1749,12 +1803,19 @@ def main() -> None:
                 return False
             active_source_index, kind = selected
             hint = _memory_hint_for(kind, log_decision=False)
-            hint_text = (
-                "no-memory/source-order fallback" if hint is None
-                else f"travel={float(hint['travel']):.2f}m "
-                     f"shelf={hint['shelf']}-{hint['level']}")
+            if args.grab_policy == "sequence":
+                hint_text = (
+                    "order-list policy" if hint is None
+                    else f"order-list policy; known "
+                         f"travel={float(hint['travel']):.2f}m "
+                         f"shelf={hint['shelf']}-{hint['level']}")
+            else:
+                hint_text = (
+                    "no-memory/random fallback" if hint is None
+                    else f"travel={float(hint['travel']):.2f}m "
+                         f"shelf={hint['shelf']}-{hint['level']}")
             matrix_tracker.get_logger().info(
-                f"[orders] nearest pending -> source="
+                f"[orders] {args.grab_policy} pending -> source="
                 f"{active_source_index + 1} kind={kind} {hint_text}")
             start_order(kind, order_idx, delivered_count)
             return True
@@ -1774,7 +1835,7 @@ def main() -> None:
 
         controller.get_logger().info(
             f"[orders] 本批订单({len(orders)}单): " + " -> ".join(orders) +
-            f"  seed={args.seed}")
+            f"  seed={args.seed}  grab_policy={args.grab_policy}")
 
         _ensure_spin()
 
@@ -1844,9 +1905,12 @@ def main() -> None:
             # 此时 A 必须立即进入本单禁止回访集合。
             _update_memory_scan_progress(controller)
 
-            # 去目标货架途中 YOLO 仍持续更新记忆。若新出现的近距可靠记录
-            # 指向一个明显更近的货架，则本单最多改道一次；目标一旦锁定或
-            # 已进入定点扫描便不再干预。这里只改货架+层导航提示。
+            # 去目标货架途中 YOLO 仍持续更新记忆。矩阵里一旦出现本单品类
+            # 的候选（不要求已达可靠置信度——首单派发时矩阵往往还是空的，
+            # 途中录到的第一手信息就应该立刻接管扫描顺序），就把货架+层
+            # 导航提示改到那个货架，避免按“最近站优先”把沿途空货架都扫
+            # 一遍。仍保留每单最多改道一次、跳过已扫完货架的保护；目标
+            # 一旦锁定或进入定点扫描便不再干预。
             now = time.monotonic()
             if (not memory_failover_applied
                     and not controller.memory_rerouted
@@ -1866,7 +1930,7 @@ def main() -> None:
                             controller.memory_failed_hint_levels),
                         min_last_seen=(
                             controller.memory_reroute_not_before),
-                        reliable_only=True)
+                        reliable_only=False)
                     current_x = (
                         float(controller.scan_preferred_x)
                         if (controller.scan_station_order is None
@@ -1875,15 +1939,60 @@ def main() -> None:
                     if refreshed_hint is not None:
                         hint_x = refreshed_hint["x"]
                         hint_z = refreshed_hint["z"]
-                        current_travel = math.hypot(
-                            matrix_tracker.base_xy[0] - current_x,
-                            matrix_tracker.base_xy[1] - pick.SCAN_Y)
-                        new_travel = math.hypot(
-                            matrix_tracker.base_xy[0] - hint_x,
-                            matrix_tracker.base_xy[1] - pick.SCAN_Y)
-                        if (abs(hint_x - current_x) > 0.40
-                                and new_travel + MEMORY_REROUTE_SAVING_M
-                                < current_travel):
+                        hint_shelf = str(refreshed_hint.get("shelf", ""))
+                        current_shelf = _shelf_for_scan_x(current_x)
+                        hint_exhausted = (
+                            hint_shelf in controller.memory_exhausted_shelves)
+                        # 首选“直接槽位”：矩阵出现该品类主证据且带列号时，
+                        # 直接生成该槽位的抓取目标并进入 ALIGN，跳过“先到
+                        # 货架中心对位再扫描”的步骤。抓取前的 close-recheck
+                        # 仍是最后一道校验；失败会自动排除该槽位并回退全量
+                        # 扫描。hidden_fallback（被同格其他品类盖住的历史
+                        # 候选）不直达，避免追着误检跑。纸巾保留 555 的
+                        # 中列限制（双臂托举只支持中列槽位）。
+                        if (hint_shelf
+                                and not refreshed_hint.get("hidden_fallback")
+                                and refreshed_hint.get("column") in {"1", "2", "3"}
+                                and (controller.target_kind != "zhijin"
+                                     or refreshed_hint.get("column") == "2")
+                                and float(refreshed_hint.get(
+                                    "confidence", 0.0) or 0.0)
+                                >= DYNAMIC_DIRECT_CONF_MIN
+                                and not args.no_close_recheck
+                                and not hint_exhausted):
+                            accepted = controller.configure_direct_slot_target(
+                                refreshed_hint["shelf"],
+                                refreshed_hint["level"],
+                                refreshed_hint["column"],
+                                product_y=refreshed_hint.get("world_y"),
+                                product_z=refreshed_hint.get("world_z"))
+                            if accepted:
+                                controller.memory_active_hint = (
+                                    refreshed_hint["shelf"],
+                                    refreshed_hint["level"])
+                                controller.memory_last_scan_station_x = hint_x
+                                controller.memory_rerouted = True
+                                controller.memory_reroute_not_before = (
+                                    time.time())
+                                controller.get_logger().info(
+                                    f"[memory] dynamic direct slot -> "
+                                    f"{refreshed_hint['shelf']}-"
+                                    f"{refreshed_hint['level']}-"
+                                    f"{refreshed_hint['column']} "
+                                    f"conf="
+                                    f"{refreshed_hint.get('confidence')} "
+                                    f"observed="
+                                    f"{refreshed_hint.get('observed_distance')}"
+                                    "m (once per order)")
+                                continue
+                        # 退回架级扫描提示：候选货架与当前正前往的货架不同、
+                        # 且还没被本单扫过时才改道；不再要求新货架“更近
+                        # 0.30m”，首单从出生点按最近站（E）出发时，目标
+                        # 货架可能并不比 E 近，但跳过沿途空货架仍然值得。
+                        if (hint_shelf
+                                and hint_shelf != current_shelf
+                                and not hint_exhausted
+                                and abs(hint_x - current_x) > 0.40):
                             controller.configure_inventory_scan_hint(
                                 hint_x, hint_z)
                             controller.memory_active_hint = (
@@ -1898,8 +2007,9 @@ def main() -> None:
                             controller.get_logger().info(
                                 f"[memory] dynamic reroute "
                                 f"{current_x:.3f}->{hint_x:.3f}; "
-                                f"travel {current_travel:.2f}->"
-                                f"{new_travel:.2f}m (once per order)")
+                                f"shelf {current_shelf}->{hint_shelf} "
+                                f"conf={refreshed_hint.get('confidence')} "
+                                "(once per order)")
                 except Exception as exc:  # 记忆改道失败不能影响抓取主流程
                     matrix_tracker.get_logger().warn(
                         f"[memory] dynamic reroute skipped: {exc}")

@@ -41,18 +41,18 @@ ground-truth diagnostic options.
 
 ## GUI launcher
 
-宿主机运行项目根目录的 `gui_launcher_continuous.py` 可一键启动 Server 与
-连续多单客户端（界面与主仓库 `gui_launcher_continuous.py` 完全一致，固定
-使用官方 final 镜像）：
+宿主机运行项目根目录的 `gui_snapshot_pick.py` 可一键启动 Server 与
+快照优先多单客户端（固定使用官方 final 镜像）：
 
 ```bash
-python3 gui_launcher_continuous.py
+python3 gui_snapshot_pick.py
 ```
 
 它会挂载本目录到客户端容器的 `/workspace/supermarket_sorting_task` 并执行
-`examples/supermarket_sorting/continuous_goods_client.py`：每单执行
-「抓货区抓取 → 导航到终点 → 直接扔货 → 返回抓货区」。GUI 在宿主机生成
-订单列表并通过 `--orders` 传给客户端。
+`examples/supermarket_sorting/snapshot_pick_client.py`：可选先正式行走逐架
+录入记忆矩阵，之后每单按记忆直达对应货架/层抓取，执行
+「抓货区抓取 → 终点直接扔货 → 返回抓货区」。GUI 在宿主机生成订单列表并
+通过 `--orders` 传给客户端，自动录像写入 `logs/`。
 
 正式比赛入口（任务话题驱动、带完整放桌流程）仍可通过 `scripts/run_baseline.sh`
 运行，两者互不影响。

@@ -79,15 +79,6 @@ LEVEL_Z_RANGES = {
 STATION_Y_MIN = 2.20
 STATION_Y_MAX = 2.75
 OBSERVATION_X_MARGIN_M = 0.55
-# 远距观测保护：超过该距离的 YOLO 深度直接不采信（距货架太远，投影
-# 误差会把商品错归到相邻货架/列/层，例如起点斜视角把 D 货架误记为
-# 纸巾 conf 0.515 / 6.177m）。
-MEMORY_MAX_OBSERVATION_DISTANCE_M = 2.20
-# 远距带（1.50~2.20m）：斜视角大，必须置信度足够高且样本足够多才允许
-# 进入记忆。
-MEMORY_FAR_OBSERVATION_DISTANCE_M = 1.50
-MEMORY_FAR_CONF_MIN = 0.95
-MEMORY_FAR_SAMPLE_MIN = 8
 # 货物都在货架平面 y≈3.24m 上。YOLO 深度得到的是可见前表面，因此给
 # 予较宽容差，但拒绝走廊、机器人和配送区中的同类物体污染矩阵。
 SHELF_OBSERVATION_Y_MIN = 2.95
@@ -675,8 +666,9 @@ class MemoryMatrixTracker(Node):
         self.matrix = MemoryMatrix()
         self.confirmations = max(1, int(confirmations))
         # Formal runs keep the shared detector alive for the whole match.
-        # When requested, accept every geometrically valid world-space
-        # observation instead of restricting recording to the shelf aisle.
+        # False: 只在货架观察走廊内录入。True: 只要 YOLO 给出带世界坐标的
+        # 有效检测就记录，机器人从起点到货架途中、绕障碍等任何位置都能
+        # 更新矩阵（与旧版全程录入一致，不再有远距观测距离上限）。
         self.record_everywhere = bool(record_everywhere)
         self.output_path = Path(
             output_path or DEFAULT_OUTPUT_PATH)
@@ -767,7 +759,9 @@ class MemoryMatrixTracker(Node):
 
         marker 完全不参与。默认只需位于货架观察走廊，不需要停在被检测
         货架的标准站点；因此同一帧可以同时给多个货架累积样本。开启
-        ``record_everywhere`` 后只取消机器人位置门控，其他几何和深度校验保持不变。
+        ``record_everywhere`` 后不再检查机器人位置，起点到货架途中、绕障碍
+        等任何位置只要 YOLO 给出带世界坐标的检测都会累积样本（与旧版
+        全程录入一致，没有远距观测距离上限）。
         """
         kind = detection.get("class")
         if not isinstance(kind, str):
@@ -835,10 +829,6 @@ class MemoryMatrixTracker(Node):
             observation_distance = math.hypot(
                 x - self.base_xy[0], y - self.base_xy[1])
         if observation_distance is not None:
-            # 配送区/起点斜视角距离货架太远时深度不可信：该帧直接不累计，
-            # 避免污染样本的近距离中位数。
-            if observation_distance > MEMORY_MAX_OBSERVATION_DISTANCE_M:
-                return
             acc["distance"].append(observation_distance)
         acc["last_stamp_ns"] = stamp_ns
         try:
@@ -846,24 +836,15 @@ class MemoryMatrixTracker(Node):
         except (TypeError, ValueError):
             confidence = 0.0
         acc["conf"] = max(acc["conf"], confidence)
-        distance_med = (
-            float(sorted(acc["distance"])[len(acc["distance"]) // 2])
-            if acc["distance"] else None)
-        required_samples = max(
-            self.confirmations, DEPTH_MIN_SAMPLES)
-        if (distance_med is not None
-                and distance_med > MEMORY_FAR_OBSERVATION_DISTANCE_M):
-            # 远距带（配送通道/斜视角）需要更多样本和更高置信度，防止
-            # 一次偶发高置信误检把商品记到错误槽位。
-            required_samples = max(
-                required_samples, MEMORY_FAR_SAMPLE_MIN)
-            if acc["conf"] < MEMORY_FAR_CONF_MIN:
-                return
-        if len(acc["x"]) < required_samples:
+        if len(acc["x"]) < max(
+                self.confirmations, DEPTH_MIN_SAMPLES):
             return
         z_med = float(sorted(acc["z"])[len(acc["z"]) // 2])
         x_med = float(sorted(acc["x"])[len(acc["x"]) // 2])
         y_med = float(sorted(acc["y"])[len(acc["y"]) // 2])
+        distance_med = (
+            float(sorted(acc["distance"])[len(acc["distance"]) // 2])
+            if acc["distance"] else None)
         sample_count = len(acc["x"])
         self._slot_acc[acc_key] = {
             "x": [], "y": [], "z": [], "distance": [], "conf": 0.0,

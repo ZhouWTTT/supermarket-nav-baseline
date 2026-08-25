@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+import random
 import re
 import subprocess
 import sys
@@ -920,18 +921,33 @@ class CompetitionRunner(Node):
             order, hint, _travel = min(
                 evaluated, key=lambda item: item[0].source_index)
         else:
-            order, hint, _travel = min(
-                evaluated,
-                key=lambda item: (
-                    item[1] is None,
-                    item[2],
-                    item[0].source_index))
+            any_usable = any(
+                item[1] is not None and math.isfinite(item[2])
+                for item in evaluated)
+            if not any_usable:
+                # 最近优先无法触发：矩阵为空或所有待办订单都没有可用记忆，
+                # 距离信息不存在。不固定抓订单表第一单，随机选一单即可——
+                # 商品通常分布在最近的 E/D 货架，无论选哪单都能就近找到。
+                order, hint, _travel = random.choice(evaluated)
+            else:
+                order, hint, _travel = min(
+                    evaluated,
+                    key=lambda item: (
+                        item[1] is None,
+                        item[2],
+                        item[0].source_index))
         self.selected_memory_hint = (
             None if hint is None else dict(hint))
+        fallback_note = (
+            "no-memory/random fallback"
+            if (self.args.grab_policy != "sequence"
+                and (hint is None or not math.isfinite(_travel)))
+            else None)
         self.get_logger().info(
             f"[orders] policy={self.args.grab_policy} selected "
             f"id={order.id} kind={order.kind} "
             f"travel={None if hint is None else _travel} "
+            f"{'fallback=' + fallback_note + ' ' if fallback_note else ''}"
             f"hint={self.selected_memory_hint}")
         return order
 
