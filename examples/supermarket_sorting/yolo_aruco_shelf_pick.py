@@ -2121,6 +2121,20 @@ class ShelfPickController(Node):
                 f"{np.round(vision_error, 4)}m")
         else:
             self.target_world = measured_target
+        # 商品与 ArUco 会在场景初始化时一起随机换位，marker ID 对应的是
+        # 商品身份，不再代表固定物理槽位。纸巾侧列动作必须以本次视觉定位
+        # 得到的世界坐标判列，否则 SLOT_BY_MARKER 的初始布局会把侧列误判
+        # 为中列。这里只修正纸巾的动作选择；其他品类保持原 marker 路径。
+        if self.target_kind == "zhijin":
+            physical_slot = fixed_slot_from_world(
+                float(self.target_world[0]), float(self.target_world[2]))
+            if physical_slot is not None:
+                marker_slot = SLOT_BY_MARKER.get(int(self.target_marker_id))
+                self.committed_slot = physical_slot
+                self.get_logger().info(
+                    "[tissue-slot] using localised physical slot "
+                    f"{physical_slot}; marker={self.target_marker_id} "
+                    f"initial_slot={marker_slot}")
         if self.use_dual_tissue_grasp:
             # Centre the chassis between both arms instead of biasing it for a
             # single selected arm.

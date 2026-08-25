@@ -455,9 +455,9 @@ class CompetitionRunner(Node):
 
         直达槽位必须重新从主证据（primary_candidates）选择，而不是沿用
         订单排序时的混合提示：被同格其他品类盖住的历史候选（hidden
-        fallback）绝不直达，避免追着误检/旧记录跑。zhijin 保留中列限制
-        （双臂托举只支持中列槽位）。与 snapshot 初始直达一致，不再额外
-        要求置信度门槛——primary 主证据本身已含多帧确认与样本数门槛。
+        fallback）绝不直达，避免追着误检/旧记录跑。纸巾三列均由双臂
+        抓取流程支持。与 snapshot 初始直达一致，不再额外要求置信度
+        门槛——primary 主证据本身已含多帧确认与样本数门槛。
         """
         memory_candidates, observer_xy = (
             self.memory_tracker.routing_snapshot(order.kind))
@@ -484,8 +484,6 @@ class CompetitionRunner(Node):
                 or column not in {"1", "2", "3"}
                 or str(hint.get("slot_key", "")) != expected_slot_key
                 or expected_slot_key in excluded_slots):
-            return None
-        if order.kind == "zhijin" and column != "2":
             return None
         raw_y = hint.get("world_y")
         raw_z = hint.get("world_z")

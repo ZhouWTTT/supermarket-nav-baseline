@@ -1568,8 +1568,7 @@ def main() -> None:
 
             返回含 x/z/shelf/level 的选择结果或 None。
             """
-            # 纸巾必须先排除侧列，再按距离选择。否则更近但不可抓的侧列
-            # 候选会先胜出、随后被作废，并遮住稍远但可抓的中列候选。
+            # 先按抓取能力过滤候选；纸巾的左、中、右三列均可抓取。
             primary_candidates = grasp_eligible_candidates(
                 kind, matrix_tracker.matrix.primary_candidates_for(kind))
             all_candidates = grasp_eligible_candidates(
@@ -1684,17 +1683,11 @@ def main() -> None:
                     kind, exclude_slots, require_direct=True)
             except Exception:  # noqa: BLE001 - 记忆提示失败不影响主流程
                 hint = None
-            direct_hint_ok = (
-                hint is not None
-                and (kind != "zhijin" or hint.get("column") == "2"))
+            direct_hint_ok = hint is not None
             if not direct_hint_ok:
                 try:
                     hint = _memory_hint_for(kind, exclude_slots)
                 except Exception:  # noqa: BLE001 - 记忆提示失败不影响主流程
-                    hint = None
-                if (kind == "zhijin"
-                        and hint is not None
-                        and hint.get("column") != "2"):
                     hint = None
             if hint is not None:
                 _hint_x, _hint_z = hint["x"], hint["z"]
@@ -1948,13 +1941,11 @@ def main() -> None:
                         # 货架中心对位再扫描”的步骤。抓取前的 close-recheck
                         # 仍是最后一道校验；失败会自动排除该槽位并回退全量
                         # 扫描。hidden_fallback（被同格其他品类盖住的历史
-                        # 候选）不直达，避免追着误检跑。纸巾保留 555 的
-                        # 中列限制（双臂托举只支持中列槽位）。
+                        # 候选）不直达，避免追着误检跑。纸巾三列均可直接
+                        # 进入对应的双臂抓取流程。
                         if (hint_shelf
                                 and not refreshed_hint.get("hidden_fallback")
                                 and refreshed_hint.get("column") in {"1", "2", "3"}
-                                and (controller.target_kind != "zhijin"
-                                     or refreshed_hint.get("column") == "2")
                                 and float(refreshed_hint.get(
                                     "confidence", 0.0) or 0.0)
                                 >= DYNAMIC_DIRECT_CONF_MIN

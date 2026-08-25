@@ -951,12 +951,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         hint_x = float(hint["x"])
         column = str(hint.get("column", ""))
         confidence = float(hint.get("confidence", 0.0) or 0.0)
-        # Snapshot 直达门槛：隐藏历史候选不直达；zhijin 双臂托举只支持
-        # 中列；动态直达还需置信度门槛。close-recheck 由调用方按需开启
+        # Snapshot 直达门槛：隐藏历史候选不直达；纸巾三列均由双臂流程
+        # 支持；动态直达还需置信度门槛。close-recheck 由调用方按需开启
         # （关闭时不再作为直达的强制前置条件，抓取直接进入 ALIGN→grasp）。
         if (not hint.get("hidden_fallback")
                 and column in {"1", "2", "3"}
-                and (self.target_kind != "zhijin" or column == "2")
                 and confidence >= DYNAMIC_DIRECT_CONF_MIN
                 and self.configure_direct_slot_target(
                     str(hint["shelf"]), str(hint["level"]), column,
