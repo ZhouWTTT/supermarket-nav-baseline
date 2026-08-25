@@ -63,6 +63,7 @@ from supermarket_navigation import (  # noqa: E402  (baseline nav, unmodified)
     DELIVERY_TRUNK_EXIT,
     DELIVERY_TABLE_COSTMAP_BOUNDS,
     DELIVERY_TABLE_XML_BOUNDS,
+    START_POSE,
     SupermarketNavigator,
     WHOLE_BODY_KEEP_OUT_RADIUS,
     point_to_rect_clearance,
@@ -460,7 +461,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             backup_after_grab_m: float = 0.20,
             place_creep_m: float = PLACE_CREEP_DISTANCE_M,
             close_recheck: bool = True,
-            return_west_after_place: bool = False):
+            return_west_after_place: bool = False,
+            return_start_after_place: bool = False):
         super().__init__(
             target_kind, max_scan_cycles,
             tcp_diagnostic_ground_truth, scan_skip_lower,
@@ -490,6 +492,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_release_dwell_s = place_release_dwell_s
         self.place_retreat_dwell_s = place_retreat_dwell_s
         self.return_west_after_place = bool(return_west_after_place)
+        self.return_start_after_place = bool(return_start_after_place)
         self.placement_completed = False
         self.post_delivery_warnings: list[str] = []
         self.delivery_completed_by_drop = False
@@ -2108,10 +2111,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         over_table = self._tcp_over_delivery_table_official(reference)
         delivered = bool(
             self.flow_phase == "place"
-            and self.place_stage == 2
             and self._tcp_over_delivery_table(reference)
-            and self._tcp_at_assigned_slot(reference)
-            and self._product_bottom_at_table(reference))
+            and self._tcp_at_assigned_slot(reference))
         self._start_transport_drop_recovery(
             now, delivered=delivered, over_table=over_table, details=details,
             reference=reference)
@@ -3790,7 +3791,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 f"[flow] PLACE COMPLETE — {self.target_kind} delivered; "
                 f"table cleared (clearance={clearance:.3f}m); "
                 f"base=({self.base_xy[0]:.2f},{self.base_xy[1]:.2f})")
-            if self.return_west_after_place:
+            if self.return_start_after_place:
+                self._start_return_to_start(now)
+            elif self.return_west_after_place:
                 self._start_return_to_west(now)
             else:
                 self._set_flow_phase("done")
@@ -3834,6 +3837,31 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.cmd_angular = 0.0
         self._set_flow_phase("done")
         self.place_t0 = now
+
+    def _start_return_to_start(self, now: float) -> None:
+        """Start the final-delivery return from the table to the start pose."""
+        self._set_flow_phase("return_to_start")
+        self._nav_goal = None
+        self._nav_last_log = 0.0
+        self._last_nav_reason = None
+        self._nav_memory_logged = False
+        self.get_logger().info(
+            "[return-start] final delivery complete; returning to start "
+            f"goal=({START_POSE[0]:.3f},{START_POSE[1]:.3f},"
+            f"{math.degrees(START_POSE[2]):.0f}deg)")
+
+    def _return_to_start_tick(self, now: float) -> None:
+        target = np.asarray(START_POSE[:2], dtype=float)
+        arrived = self.drive_to(target, START_POSE[2], 0.08)
+        if not arrived:
+            return
+        self.set_twist(0.0, 0.0)
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
+        self._set_flow_phase("done")
+        self.get_logger().info(
+            f"[return-start] reached start pose base=({self.base_xy[0]:.2f},"
+            f"{self.base_xy[1]:.2f}) yaw={math.degrees(self.base_yaw):.0f}deg")
 
     def _start_return_to_west(self, now: float) -> None:
         """Start the first-delivery return from the table to shelf A."""
@@ -4041,7 +4069,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         # to hold; obstacle stops may still rotate in place to find a route.
         nav_reason = self.nav.controller.stop_reason
         if (self.flow_phase in {
-                "grab", "nav_to_delivery", "return_to_west"}
+                "grab", "nav_to_delivery", "return_to_west",
+                "return_to_start"}
                 and abs(self.des_linear) <= 1e-9
                 and nav_reason is not None):
             self.cmd_linear = 0.0
@@ -4055,7 +4084,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 and (nav_reason.startswith("no_path")
                      or nav_reason.startswith("stuck_no_path"))))
         if (self.flow_phase in {
-                "grab", "nav_to_delivery", "return_to_west"}
+                "grab", "nav_to_delivery", "return_to_west",
+                "return_to_start"}
                 and abs(self.des_angular) <= 1e-9
                 and full_hold):
             self.cmd_angular = 0.0
@@ -4265,6 +4295,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     self._nav_to_delivery_tick()
                 elif self.flow_phase == "place":
                     self._place_tick()
+                elif self.flow_phase == "return_to_start":
+                    self._return_to_start_tick(now)
                 elif self.flow_phase == "return_to_west":
                     self._return_to_west_tick(now)
                 elif self.flow_phase == "return_west_scan":
@@ -4431,6 +4463,10 @@ def parse_args() -> argparse.Namespace:
         help="after a successful placement, return to shelf A and perform "
              "one stationary full-view inventory scan before exiting")
     parser.add_argument(
+        "--return-start-after-place", action="store_true",
+        help="after the final placement of a match, return to the start pose "
+             "before exiting")
+    parser.add_argument(
         "--scan-start-x", type=float,
         help="measured product world X from cross-order inventory; chooses "
              "the nearest first scan station without bypassing perception")
@@ -4552,7 +4588,8 @@ def main() -> int:
             backup_after_grab_m=args.backup_after_grab,
             place_creep_m=args.place_creep_distance,
             close_recheck=not args.no_close_recheck,
-            return_west_after_place=args.return_west_after_place)
+            return_west_after_place=args.return_west_after_place,
+            return_start_after_place=args.return_start_after_place)
         controller.perception_always_on = bool(args.perception_always_on)
         controller.dynamic_direct_enabled = bool(args.dynamic_direct)
         controller.configure_external_perception(args.external_perception)

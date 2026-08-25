@@ -332,7 +332,15 @@ class CompetitionRunner(Node):
         # Keep that worker alive after placement so it returns to shelf A and
         # records a stationary inventory sweep before the next order starts.
         return_west_after_place = place_slot == 0
-        if return_west_after_place:
+        # The last pending order returns to the start pose after placement;
+        # this takes precedence over the shelf-A inventory return.
+        remaining_pending = sum(
+            1 for item in self.task.orders
+            if item.status == "pending" and item.id != order.id)
+        return_start_after_place = remaining_pending == 0
+        if return_start_after_place:
+            command.append("--return-start-after-place")
+        elif return_west_after_place:
             command.append("--return-west-after-place")
         scan_hint_x = None
         scan_marker_z = None
@@ -418,6 +426,8 @@ class CompetitionRunner(Node):
             f"scan_start_west={int(scan_start_west)} "
             f"return_west_after_place="
             f"{int(return_west_after_place)} "
+            f"return_start_after_place="
+            f"{int(return_start_after_place)} "
             f"same_order_drop_retry={int(same_order_drop_retry)} "
             f"memory_hint={self.selected_memory_hint} "
             f"direct_hint={direct_hint} "
