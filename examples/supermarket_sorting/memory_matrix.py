@@ -305,6 +305,35 @@ def primary_candidates_from_document(
     return result
 
 
+def candidates_from_document(
+        document: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+    """Read every unconsumed historical candidate of one kind from JSON.
+
+    Mirrors ``MemoryMatrix.candidates_for`` for the serialized document so a
+    worker process can feed the same two-tier routing selection
+    (``select_memory_route_hint``) as the in-process GUI client.
+    """
+    cells = document.get("cells", {})
+    candidates = document.get("candidates", {})
+    if not isinstance(cells, dict) or not isinstance(candidates, dict):
+        return []
+    result = []
+    for key, by_kind in candidates.items():
+        cell = cells.get(key)
+        if (not isinstance(cell, dict)
+                or cell.get("consumed")
+                or str(cell.get("kind", "")) != kind):
+            continue
+        candidate = (
+            by_kind.get(kind) if isinstance(by_kind, dict) else None)
+        if not isinstance(candidate, dict):
+            continue
+        item = dict(candidate)
+        item["slot_key"] = str(key)
+        result.append(item)
+    return result
+
+
 def grasp_eligible_candidates(
         kind: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filter memory evidence by constraints that apply before ranking.
@@ -319,6 +348,73 @@ def grasp_eligible_candidates(
         candidate for candidate in candidates
         if str(candidate.get("column", "")) in {"1", "2", "3"}
     ]
+
+
+def select_memory_route_hint(
+        kind: str,
+        primary_candidates: list[dict[str, Any]],
+        all_candidates: list[dict[str, Any]],
+        base_xy,
+        conf_threshold: float,
+        exclude_slots=(),
+        exclude_shelves=(),
+        exclude_shelf_levels=(),
+        min_last_seen: float | None = None,
+        reliable_only: bool = False,
+        require_direct: bool = False,
+        nearest_hidden_bonus_m: float = 0.60) -> dict[str, Any] | None:
+    """Snapshot-parity two-tier memory routing selection.
+
+    Ported from ``snapshot_pick_client._memory_hint_for`` so the competition
+    runner and its workers make the same navigation decisions as the proven
+    GUI client:
+
+    * Primary candidates (the GUI's main per-cell evidence) may drive either a
+      direct slot target or a shelf/level scan hint.
+    * Historical candidates hidden behind another class in the same cell
+      (``hidden_fallback``) may only act as a scan hint, never a direct
+      target, so a misclassified stale record cannot pull the robot to a
+      wrong slot.
+    * When a primary hint exists but an all-candidate (possibly hidden) hint
+      sits on a shelf meaningfully closer (default 0.60 m), prefer the closer
+      shelf for a scan, again never for direct routing.
+
+    ``require_direct=True`` disables the all-candidate fallback entirely:
+    callers use it when the result may become a direct slot target.
+    """
+    primary = grasp_eligible_candidates(kind, primary_candidates)
+    eligible_all = grasp_eligible_candidates(kind, all_candidates)
+    common = {
+        "exclude_slots": exclude_slots,
+        "exclude_shelves": exclude_shelves,
+        "exclude_shelf_levels": exclude_shelf_levels,
+        "min_last_seen": min_last_seen,
+    }
+    selected = select_memory_hint(
+        primary, base_xy, conf_threshold,
+        reliable_only=reliable_only, **common)
+    if selected is None:
+        if require_direct:
+            return None
+        selected = select_memory_hint(
+            eligible_all, base_xy, conf_threshold,
+            reliable_only=False, **common)
+        if selected is None:
+            return None
+        selected["hidden_fallback"] = True
+        return selected
+    if require_direct:
+        return selected
+    nearest_all = select_memory_hint(
+        eligible_all, base_xy, conf_threshold,
+        reliable_only=False, **common)
+    if (nearest_all is not None
+            and float(selected.get("travel", float("inf")))
+            > float(nearest_all.get("travel", float("inf")))
+            + nearest_hidden_bonus_m):
+        nearest_all["hidden_fallback"] = True
+        selected = nearest_all
+    return selected
 
 
 def read_memory_document(path: Path | str) -> dict[str, Any]:

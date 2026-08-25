@@ -48,10 +48,10 @@ from memory_matrix import (  # noqa: E402
     MEMORY_REROUTE_SAVING_M,
     STATION_Y_MAX,
     STATION_Y_MIN,
-    grasp_eligible_candidates,
+    candidates_from_document,
     primary_candidates_from_document,
     read_memory_document,
-    select_memory_hint,
+    select_memory_route_hint,
     shelf_for_scan_x,
 )
 
@@ -260,6 +260,9 @@ PLACE_CLEAR_TABLE_TIMEOUT_S = 15.0
 # hand-off made every shelf station spend roughly 15--20 s in low-speed trim.
 NAV_TRANSIT_GATE_M = 0.10
 NAV_PRECISE_HANDOFF_MARGIN_M = 0.02
+# Memory-slot routing terminates at the same pose envelope used by ALIGN, so
+# the obstacle-aware leg itself is the final base motion before grasping.
+DIRECT_GRASP_POSITION_TOLERANCE_M = 0.025
 NAV_LASER_STALE_S = 0.50           # fail safe if the 12 Hz scan stops
 NAV_STATE_STALE_S = 0.50           # odom/joints must also remain live
 FEEDBACK_LOSS_HARD_TIMEOUT_S = 10.0
@@ -544,6 +547,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._route_leg_last_progress_at = 0.0
         self._route_leg_best_distance = float("inf")
         self._route_leg_replans = 0
+        self._route_leg_position_tolerance = None
+        self._route_leg_yaw_tolerance = None
         self.delivery_nav_stage = None
         self.delivery_direct_fallback_used = False
         self.scan_trunk_route_stage = None
@@ -834,14 +839,15 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         if self.memory_file is None:
             return None
         document = read_memory_document(self.memory_file)
-        # Tissue side columns are eligible when the narrow rolled-wrist dual
-        # profile is enabled; the shared helper still rejects malformed slots.
-        candidates = grasp_eligible_candidates(
+        # Snapshot 两层语义：主证据可直接/扫描；被同格其他品类盖住的历史
+        # 候选只做扫描提示（hidden_fallback），且就近偏好由共享函数处理。
+        return select_memory_route_hint(
             self.target_kind,
             primary_candidates_from_document(
-                document, self.target_kind))
-        return select_memory_hint(
-            candidates, self.base_xy,
+                document, self.target_kind),
+            candidates_from_document(
+                document, self.target_kind),
+            self.base_xy,
             self.memory_confidence_threshold,
             exclude_slots=self.excluded_slot_keys,
             exclude_shelves=self.memory_exhausted_shelves,
@@ -889,38 +895,68 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         return True
 
     def advance_direct_transit(self) -> None:
-        """Navigate to a remembered slot before starting ALIGN's watchdog."""
+        """单趟精直达记忆槽位抓取位，停稳即抓（即停即抓）。
+
+        障碍导航从起点直接收敛到 ALIGN 的 0.025m / 0.035rad 位姿包络，
+        到站后不再进入第二次 ALIGN 慢速对位：默认直接进入抓取停稳门控；
+        若开启了 close-recheck 则先做近距核验。父级 configure_grasp 的
+        retry / base-nudge 仍会回退 STATE_ALIGN 兜底。
+        """
         if self.target_world is None or self.direct_transit_slot is None:
             raise RuntimeError(
                 "direct transit entered without a resolved slot target")
 
         arrived = self.drive_to(
             [self.align_base_x, self.align_base_y],
-            pick.YAW_NORTH, 0.08)
+            pick.YAW_NORTH, DIRECT_GRASP_POSITION_TOLERANCE_M,
+            linear_min_mps=pick.NAV_ALIGN_LINEAR_MIN_MPS,
+            linear_gain=pick.NAV_ALIGN_LINEAR_GAIN,
+            rotate_gate_rad=pick.NAV_ALIGN_ROTATE_GATE_RAD,
+            translate_angular_max_rps=(
+                pick.NAV_ALIGN_TRANSLATE_ANGULAR_MAX_RADPS))
         if not arrived:
             return
 
         elapsed = (
             0.0 if self.direct_transit_started_at is None
             else max(0.0, time.monotonic() - self.direct_transit_started_at))
+        position_error = float(np.linalg.norm(
+            self.base_xy - np.array([
+                self.align_base_x, self.align_base_y], dtype=float)))
+        yaw_error = abs(pick.wrap_to_pi(pick.YAW_NORTH - self.base_yaw))
         slot = self.direct_transit_slot
         self.direct_transit_slot = None
         self.direct_transit_started_at = None
         self.set_twist(0.0, 0.0)
         self.cmd_linear = 0.0
         self.cmd_angular = 0.0
-        self.set_state(pick.STATE_ALIGN)
-        self.get_logger().info(
-            f"[direct-transit] arrived slot={slot} after {elapsed:.1f}s; "
-            "starting precision ALIGN with a fresh watchdog")
+        if self.close_recheck and not self._recheck_passed:
+            self.set_state(pick.STATE_RECHECK)
+            self._start_close_recheck()
+            self.get_logger().info(
+                f"[direct-transit] arrived slot={slot} after {elapsed:.1f}s; "
+                f"pose_error={position_error:.3f}m/"
+                f"{yaw_error:.3f}rad; "
+                "stop-and-grasp handoff (close-recheck enabled)")
+        else:
+            self._start_grasp_settle()
+            self.get_logger().info(
+                f"[direct-transit] arrived slot={slot} after {elapsed:.1f}s; "
+                f"pose_error={position_error:.3f}m/"
+                f"{yaw_error:.3f}rad; "
+                "stop-and-grasp handoff (no recheck)")
 
     def _try_apply_direct_memory_hint(
             self, hint: dict, reason: str) -> bool:
         hint_x = float(hint["x"])
         column = str(hint.get("column", ""))
         confidence = float(hint.get("confidence", 0.0) or 0.0)
-        if (self.close_recheck
+        # Snapshot 直达门槛：隐藏历史候选不直达；zhijin 双臂托举只支持
+        # 中列；动态直达还需置信度门槛。close-recheck 由调用方按需开启
+        # （关闭时不再作为直达的强制前置条件，抓取直接进入 ALIGN→grasp）。
+        if (not hint.get("hidden_fallback")
                 and column in {"1", "2", "3"}
+                and (self.target_kind != "zhijin" or column == "2")
                 and confidence >= DYNAMIC_DIRECT_CONF_MIN
                 and self.configure_direct_slot_target(
                     str(hint["shelf"]), str(hint["level"]), column,
@@ -986,9 +1022,22 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self.memory_failed_hint_levels.add(failed_hint)
             next_hint = self._select_live_memory_hint(reliable_only=True)
             if next_hint is not None:
-                self._apply_memory_hint(
-                    next_hint,
-                    f"hint {failed_hint} failed; matrix failover")
+                # Snapshot 语义：提示层失败后只做“下一条矩阵证据”的扫描
+                # 直达（货架+层），不再原地展开全架扫描，也不直接跳槽位；
+                # 抓取前的 close-recheck 仍负责槽位复核。
+                hint_x = float(next_hint["x"])
+                hint_z = float(next_hint["z"])
+                self.configure_inventory_scan_hint(hint_x, hint_z)
+                self.memory_active_hint = (
+                    str(next_hint["shelf"]), str(next_hint["level"]))
+                self.scan_station_order = None
+                self.scan_index = 0
+                self.scan_pose_index = 0
+                self.scan_camera_ready_since = None
+                self.memory_last_scan_station_x = hint_x
+                self.get_logger().info(
+                    f"[memory] hint {failed_hint} failed; matrix failover "
+                    f"-> {self.memory_active_hint} x={hint_x:.3f}")
                 return
             self.get_logger().info(
                 f"[memory] hint {failed_hint} failed; no reliable matrix "
@@ -1081,7 +1130,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
     def _start_route_leg(
             self, name: str, goal, *, use_memory: bool,
-            lock_cached_path: bool = False) -> None:
+            lock_cached_path: bool = False,
+            position_tolerance: float | None = None,
+            yaw_tolerance: float | None = None) -> None:
         """Start one explicit leg of a composite shelf/delivery route."""
         goal = tuple(float(value) for value in goal)
         now = self.now()
@@ -1092,6 +1143,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._route_leg_best_distance = float(np.linalg.norm(
             np.asarray(goal[:2], dtype=float) - self.base_xy))
         self._route_leg_replans = 0
+        self._route_leg_position_tolerance = position_tolerance
+        self._route_leg_yaw_tolerance = yaw_tolerance
         self._nav_last_log = 0.0
         self._last_nav_reason = None
         self._nav_memory_logged = False
@@ -1105,12 +1158,16 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 DELIVERY_TRUNK_CACHE_GOAL_TOLERANCE_M
                 if use_memory else None),
             use_path_memory=use_memory,
-            lock_cached_path=lock_cached_path)
+            lock_cached_path=lock_cached_path,
+            position_tolerance=position_tolerance,
+            yaw_tolerance=yaw_tolerance)
         self.get_logger().info(
             f"[route] start leg={name} goal="
             f"({goal[0]:.2f},{goal[1]:.2f},"
             f"{math.degrees(goal[2]):.0f}deg) "
-            f"memory={int(use_memory)} lock={int(lock_cached_path)}")
+            f"memory={int(use_memory)} lock={int(lock_cached_path)} "
+            f"pos_tol={self.nav.controller.pos_tol:.3f} "
+            f"yaw_tol={self.nav.controller.yaw_tol:.3f}")
 
     def _route_leg_tick(self) -> tuple[bool, str | None]:
         """Drive the active route leg and report a terminal failure reason."""
@@ -1205,7 +1262,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self.nav.set_goal(
                 *self._route_leg_goal,
                 use_path_memory=False,
-                lock_cached_path=False)
+                lock_cached_path=False,
+                position_tolerance=self._route_leg_position_tolerance,
+                yaw_tolerance=self._route_leg_yaw_tolerance)
             self._route_leg_last_progress_at = now
             self._route_leg_best_distance = distance
             self._nav_memory_logged = False
@@ -1257,22 +1316,37 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
         if self.scan_trunk_route_stage is None:
             self.scan_trunk_route_stage = "direct_to_shelf"
+            precise_handoff = self.state == pick.STATE_DIRECT_TRANSIT
             self.get_logger().info(
                 "[route] single direct leg to shelf station goal="
                 f"({final_goal[0]:.2f},{final_goal[1]:.2f},"
-                f"{math.degrees(final_goal[2]):.0f}deg)")
+                f"{math.degrees(final_goal[2]):.0f}deg) "
+                f"precise_handoff={int(precise_handoff)}")
             self._start_route_leg(
                 "scan_direct_to_shelf", final_goal,
-                use_memory=False)
+                use_memory=False,
+                position_tolerance=(
+                    DIRECT_GRASP_POSITION_TOLERANCE_M
+                    if precise_handoff else None),
+                yaw_tolerance=(
+                    pick.NAV_YAW_DEADBAND_RAD
+                    if precise_handoff else None))
             return False
 
         if (self.scan_trunk_route_stage == "direct_to_shelf"
                 and self._route_leg_goal is not None
                 and np.linalg.norm(
                     np.asarray(self._route_leg_goal[:2]) - target) > 0.05):
+            precise_handoff = self.state == pick.STATE_DIRECT_TRANSIT
             self._start_route_leg(
                 "scan_direct_to_shelf", final_goal,
-                use_memory=False)
+                use_memory=False,
+                position_tolerance=(
+                    DIRECT_GRASP_POSITION_TOLERANCE_M
+                    if precise_handoff else None),
+                yaw_tolerance=(
+                    pick.NAV_YAW_DEADBAND_RAD
+                    if precise_handoff else None))
 
         reached, failure = self._route_leg_tick()
         if failure is not None:
@@ -1289,8 +1363,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         return False
 
     # ------------------------------------------------------------------
-    # drive_to override — navigator for transit, parent logic for the last
-    # few centimetres where 0.10 m navigator tolerance is not precise enough.
+    # drive_to override — normal scan transit retains the coarse navigator +
+    # parent final trim.  Direct memory-slot transit gives the navigator the
+    # grasp tolerance, so that route reaches the final pose without a second
+    # base adjustment.
     # ------------------------------------------------------------------
     def drive_to(self, target_xy, final_yaw: float,
                  position_tolerance: float = 0.055,
