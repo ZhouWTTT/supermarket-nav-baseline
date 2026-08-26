@@ -828,7 +828,7 @@ GRASP_TCP_Z_OFFSET_BY_KIND = {"kele": -0.010, "heweidao": -0.010}
 # KDL/仿真运动学的 X 方向执行偏差：普通货物右臂 TCP 实测比指令偏东约
 # 1-2cm（用户视角为偏左），把指令目标再往西（-x）10mm，右臂合计 -20mm；
 # 左臂不再往东补偿，保持目标点居中。球体与纸巾不走该补偿，不受影响。
-GRASP_TCP_X_OFFSET_BY_ARM = {"r": 0.005, "l": 0.000}
+GRASP_TCP_X_OFFSET_BY_ARM = {"r": 0.003, "l": 0.000}
 GRIPPER_MAX_OPENING_M = 0.080
 GRIP_PRESHAPE_CLEARANCE_M = 0.012
 GRIP_PRESHAPE_REACHED_TOLERANCE = 0.04
@@ -1093,6 +1093,11 @@ class ShelfPickController(Node):
         self.target_physical_marker_id = None
         self.target_world = None
         self.committed_slot = None
+        # 记忆直达槽位复核失败后的同货架相邻列重试（方案 B）：
+        # 列证据通常只差一格，相邻列命中可省掉整轮“回货架中心全量扫描”。
+        self.direct_slot_target_active = False
+        self.direct_slot_adjacent_retries = 0
+        self.direct_slot_adjacent_max_retries = 2
         self.grasp_arm = "r"
         self.align_base_x = None
         self.align_base_y = SCAN_Y
@@ -1830,6 +1835,7 @@ class ShelfPickController(Node):
             extra=f" slot={slot_key}",
             shelf=shelf,
             enter_align=not defer_align)
+        self.direct_slot_target_active = True
         return True
 
     def advance_direct_transit(self) -> None:
@@ -2115,6 +2121,20 @@ class ShelfPickController(Node):
                 f"{np.round(vision_error, 4)}m")
         else:
             self.target_world = measured_target
+        # 商品与 ArUco 会在场景初始化时一起随机换位，marker ID 对应的是
+        # 商品身份，不再代表固定物理槽位。纸巾侧列动作必须以本次视觉定位
+        # 得到的世界坐标判列，否则 SLOT_BY_MARKER 的初始布局会把侧列误判
+        # 为中列。这里只修正纸巾的动作选择；其他品类保持原 marker 路径。
+        if self.target_kind == "zhijin":
+            physical_slot = fixed_slot_from_world(
+                float(self.target_world[0]), float(self.target_world[2]))
+            if physical_slot is not None:
+                marker_slot = SLOT_BY_MARKER.get(int(self.target_marker_id))
+                self.committed_slot = physical_slot
+                self.get_logger().info(
+                    "[tissue-slot] using localised physical slot "
+                    f"{physical_slot}; marker={self.target_marker_id} "
+                    f"initial_slot={marker_slot}")
         if self.use_dual_tissue_grasp:
             # Centre the chassis between both arms instead of biasing it for a
             # single selected arm.
@@ -2351,7 +2371,8 @@ class ShelfPickController(Node):
         return True
 
     def _recheck_fail(self) -> None:
-        """Skip this slot and resume scanning."""
+        """Skip this slot and resume scanning (after bounded adjacent-column
+        retries for memory direct-slot targets)."""
         marker_id = self.target_marker_id
         if marker_id is not None:
             self.recheck_marker_skips.add(marker_id)
@@ -2359,19 +2380,27 @@ class ShelfPickController(Node):
             skipped_slot = self.target_slot_key()
             if skipped_slot is not None:
                 self.excluded_slot_keys.add(skipped_slot)
-        self.get_logger().warn(
-            f"[close-recheck] FAILED marker={marker_id} "
-            f"kind={self.target_kind}; all close-view poses exhausted; "
-            "skipping this slot and resuming the shelf scan")
         self._recheck_passed = False
         self.recheck_poses = ()
         self.recheck_confirmation_times.clear()
         self.recheck_last_yolo_stamp = None
         self.scan_camera_ready_since = None
+        # 方案 B：记忆直达槽位复核失败时，先试同货架相邻列（横向 0.22m 级），
+        # 而不是立刻回货架中心全量扫描。列证据通常只差一格，相邻列命中即可
+        # 省掉整轮扫描/补拍/重新定位/二次对齐（实测约 26s → 约 5s）。
+        if (marker_id is None
+                and self.direct_slot_target_active
+                and self._try_adjacent_direct_slot()):
+            return
+        self.get_logger().warn(
+            f"[close-recheck] FAILED marker={marker_id} "
+            f"kind={self.target_kind}; all close-view poses exhausted; "
+            "skipping this slot and resuming the shelf scan")
         self.target_marker_id = None
         self.target_physical_marker_id = None
         self.target_world = None
         self.committed_slot = None
+        self.direct_slot_target_active = False
         self.association_candidate_id = None
         self.association_confirmation_count = 0
         self.marker_positions.clear()
@@ -2385,6 +2414,55 @@ class ShelfPickController(Node):
             self.yolo_frames.clear()
             self.aruco_frames.clear()
         self.set_state(STATE_GO_SCAN)
+
+    def _try_adjacent_direct_slot(self) -> bool:
+        """复核失败后改试同货架相邻列（就近方向优先，受重试次数限制）。
+
+        只在记忆直达槽位（``configure_direct_slot_target`` 建立的
+        ``memory_direct`` 目标）复核失败时调用；命中后继续走原
+        直达 + ALIGN + close-recheck 流程，全部相邻列失败才回退全量扫描。
+        """
+        slot = self.target_slot()
+        if slot is None:
+            return False
+        shelf, level, column = slot
+        if (self.direct_slot_adjacent_retries
+                >= self.direct_slot_adjacent_max_retries):
+            return False
+        shelf_x = SCAN_X[self._scan_x_index_for_shelf(shelf)]
+        base_x = (
+            float(self.base_xy[0]) if self.base_xy is not None
+            else float("nan"))
+        candidates = []
+        for delta in (-1, 1):
+            next_column = str(int(column) + delta)
+            if next_column not in {"1", "2", "3"}:
+                continue
+            slot_key = f"{level}|{shelf}|{next_column}"
+            if slot_key in self.excluded_slot_keys:
+                continue
+            target_x = shelf_x + {
+                "1": -0.22, "2": 0.00, "3": 0.22}[next_column]
+            distance = (
+                float("inf") if not math.isfinite(base_x)
+                else abs(base_x - target_x))
+            candidates.append((distance, next_column))
+        if not candidates:
+            return False
+        candidates.sort(key=lambda item: item[0])
+        next_column = candidates[0][1]
+        self.direct_slot_adjacent_retries += 1
+        self.get_logger().warn(
+            f"[direct-slot-retry] recheck failed at "
+            f"{shelf}-{level}-{column}; trying adjacent column "
+            f"{shelf}-{level}-{next_column} "
+            f"({self.direct_slot_adjacent_retries}/"
+            f"{self.direct_slot_adjacent_max_retries})")
+        if not self.configure_direct_slot_target(
+                shelf, level, next_column):
+            self.direct_slot_adjacent_retries -= 1
+            return False
+        return True
 
     def initialize_commands(self) -> None:
         self.cmd_slide = self.joints.get("slide_joint", 0.0)

@@ -48,10 +48,10 @@ from memory_matrix import (  # noqa: E402
     MEMORY_REROUTE_SAVING_M,
     STATION_Y_MAX,
     STATION_Y_MIN,
-    grasp_eligible_candidates,
+    candidates_from_document,
     primary_candidates_from_document,
     read_memory_document,
-    select_memory_hint,
+    select_memory_route_hint,
     shelf_for_scan_x,
 )
 
@@ -173,10 +173,12 @@ PRODUCT_HALF_HEIGHT_M = {
 # placement alone needs the physical half-height to put the product bottom on
 # the delivery table and to validate contact there.
 HEWEIDAO_PLACE_HALF_HEIGHT_M = 0.0525
-# Command a few millimetres beyond the geometric table plane.  The product
-# stops on the tabletop first, leaving enough slide error for the existing
-# velocity/effort stall detector to prove that it is supported before release.
+# The original target commanded a few millimetres beyond the geometric table
+# plane.  Raise only heweidao's release by 20 mm so its wide rim opens 14 mm
+# above the tabletop; the existing contact detector remains a fallback if the
+# product touches the table before reaching that target.
 HEWEIDAO_PLACE_CONTACT_OVERTRAVEL_M = 0.006
+HEWEIDAO_PLACE_RELEASE_RAISE_M = 0.020
 HEWEIDAO_PLACE_DESCENT_SLIDE_STEP_M = 0.0004
 HEWEIDAO_PLACE_DESCENT_TIMEOUT_S = 20.0
 # Product bottom clearance above the delivery table top at release: the arm
@@ -187,7 +189,9 @@ PLACE_PRODUCT_BOTTOM_CLEARANCE_M = 0.010
 # Spheres can roll after even a short free fall.  Lower them to 3 mm above the
 # measured tabletop while boxes retain the original 10 mm clearance.
 PLACE_PRODUCT_BOTTOM_CLEARANCE_BY_KIND_M = {
-    "heweidao": -HEWEIDAO_PLACE_CONTACT_OVERTRAVEL_M,
+    "heweidao": (
+        -HEWEIDAO_PLACE_CONTACT_OVERTRAVEL_M
+        + HEWEIDAO_PLACE_RELEASE_RAISE_M),
     "chengzi": 0.003,
     "pingguo": 0.003,
 }
@@ -260,6 +264,9 @@ PLACE_CLEAR_TABLE_TIMEOUT_S = 15.0
 # hand-off made every shelf station spend roughly 15--20 s in low-speed trim.
 NAV_TRANSIT_GATE_M = 0.10
 NAV_PRECISE_HANDOFF_MARGIN_M = 0.02
+# Memory-slot routing terminates at the same pose envelope used by ALIGN, so
+# the obstacle-aware leg itself is the final base motion before grasping.
+DIRECT_GRASP_POSITION_TOLERANCE_M = 0.025
 NAV_LASER_STALE_S = 0.50           # fail safe if the 12 Hz scan stops
 NAV_STATE_STALE_S = 0.50           # odom/joints must also remain live
 FEEDBACK_LOSS_HARD_TIMEOUT_S = 10.0
@@ -544,6 +551,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._route_leg_last_progress_at = 0.0
         self._route_leg_best_distance = float("inf")
         self._route_leg_replans = 0
+        self._route_leg_position_tolerance = None
+        self._route_leg_yaw_tolerance = None
         self.delivery_nav_stage = None
         self.delivery_direct_fallback_used = False
         self.scan_trunk_route_stage = None
@@ -834,14 +843,15 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         if self.memory_file is None:
             return None
         document = read_memory_document(self.memory_file)
-        # Tissue side columns are eligible when the narrow rolled-wrist dual
-        # profile is enabled; the shared helper still rejects malformed slots.
-        candidates = grasp_eligible_candidates(
+        # Snapshot 两层语义：主证据可直接/扫描；被同格其他品类盖住的历史
+        # 候选只做扫描提示（hidden_fallback），且就近偏好由共享函数处理。
+        return select_memory_route_hint(
             self.target_kind,
             primary_candidates_from_document(
-                document, self.target_kind))
-        return select_memory_hint(
-            candidates, self.base_xy,
+                document, self.target_kind),
+            candidates_from_document(
+                document, self.target_kind),
+            self.base_xy,
             self.memory_confidence_threshold,
             exclude_slots=self.excluded_slot_keys,
             exclude_shelves=self.memory_exhausted_shelves,
@@ -889,37 +899,66 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         return True
 
     def advance_direct_transit(self) -> None:
-        """Navigate to a remembered slot before starting ALIGN's watchdog."""
+        """单趟精直达记忆槽位抓取位，停稳即抓（即停即抓）。
+
+        障碍导航从起点直接收敛到 ALIGN 的 0.025m / 0.035rad 位姿包络，
+        到站后不再进入第二次 ALIGN 慢速对位：默认直接进入抓取停稳门控；
+        若开启了 close-recheck 则先做近距核验。父级 configure_grasp 的
+        retry / base-nudge 仍会回退 STATE_ALIGN 兜底。
+        """
         if self.target_world is None or self.direct_transit_slot is None:
             raise RuntimeError(
                 "direct transit entered without a resolved slot target")
 
         arrived = self.drive_to(
             [self.align_base_x, self.align_base_y],
-            pick.YAW_NORTH, 0.08)
+            pick.YAW_NORTH, DIRECT_GRASP_POSITION_TOLERANCE_M,
+            linear_min_mps=pick.NAV_ALIGN_LINEAR_MIN_MPS,
+            linear_gain=pick.NAV_ALIGN_LINEAR_GAIN,
+            rotate_gate_rad=pick.NAV_ALIGN_ROTATE_GATE_RAD,
+            translate_angular_max_rps=(
+                pick.NAV_ALIGN_TRANSLATE_ANGULAR_MAX_RADPS))
         if not arrived:
             return
 
         elapsed = (
             0.0 if self.direct_transit_started_at is None
             else max(0.0, time.monotonic() - self.direct_transit_started_at))
+        position_error = float(np.linalg.norm(
+            self.base_xy - np.array([
+                self.align_base_x, self.align_base_y], dtype=float)))
+        yaw_error = abs(pick.wrap_to_pi(pick.YAW_NORTH - self.base_yaw))
         slot = self.direct_transit_slot
         self.direct_transit_slot = None
         self.direct_transit_started_at = None
         self.set_twist(0.0, 0.0)
         self.cmd_linear = 0.0
         self.cmd_angular = 0.0
-        self.set_state(pick.STATE_ALIGN)
-        self.get_logger().info(
-            f"[direct-transit] arrived slot={slot} after {elapsed:.1f}s; "
-            "starting precision ALIGN with a fresh watchdog")
+        if self.close_recheck and not self._recheck_passed:
+            self.set_state(pick.STATE_RECHECK)
+            self._start_close_recheck()
+            self.get_logger().info(
+                f"[direct-transit] arrived slot={slot} after {elapsed:.1f}s; "
+                f"pose_error={position_error:.3f}m/"
+                f"{yaw_error:.3f}rad; "
+                "stop-and-grasp handoff (close-recheck enabled)")
+        else:
+            self._start_grasp_settle()
+            self.get_logger().info(
+                f"[direct-transit] arrived slot={slot} after {elapsed:.1f}s; "
+                f"pose_error={position_error:.3f}m/"
+                f"{yaw_error:.3f}rad; "
+                "stop-and-grasp handoff (no recheck)")
 
     def _try_apply_direct_memory_hint(
             self, hint: dict, reason: str) -> bool:
         hint_x = float(hint["x"])
         column = str(hint.get("column", ""))
         confidence = float(hint.get("confidence", 0.0) or 0.0)
-        if (self.close_recheck
+        # Snapshot 直达门槛：隐藏历史候选不直达；纸巾三列均由双臂流程
+        # 支持；动态直达还需置信度门槛。close-recheck 由调用方按需开启
+        # （关闭时不再作为直达的强制前置条件，抓取直接进入 ALIGN→grasp）。
+        if (not hint.get("hidden_fallback")
                 and column in {"1", "2", "3"}
                 and confidence >= DYNAMIC_DIRECT_CONF_MIN
                 and self.configure_direct_slot_target(
@@ -986,9 +1025,22 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self.memory_failed_hint_levels.add(failed_hint)
             next_hint = self._select_live_memory_hint(reliable_only=True)
             if next_hint is not None:
-                self._apply_memory_hint(
-                    next_hint,
-                    f"hint {failed_hint} failed; matrix failover")
+                # Snapshot 语义：提示层失败后只做“下一条矩阵证据”的扫描
+                # 直达（货架+层），不再原地展开全架扫描，也不直接跳槽位；
+                # 抓取前的 close-recheck 仍负责槽位复核。
+                hint_x = float(next_hint["x"])
+                hint_z = float(next_hint["z"])
+                self.configure_inventory_scan_hint(hint_x, hint_z)
+                self.memory_active_hint = (
+                    str(next_hint["shelf"]), str(next_hint["level"]))
+                self.scan_station_order = None
+                self.scan_index = 0
+                self.scan_pose_index = 0
+                self.scan_camera_ready_since = None
+                self.memory_last_scan_station_x = hint_x
+                self.get_logger().info(
+                    f"[memory] hint {failed_hint} failed; matrix failover "
+                    f"-> {self.memory_active_hint} x={hint_x:.3f}")
                 return
             self.get_logger().info(
                 f"[memory] hint {failed_hint} failed; no reliable matrix "
@@ -1081,7 +1133,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
     def _start_route_leg(
             self, name: str, goal, *, use_memory: bool,
-            lock_cached_path: bool = False) -> None:
+            lock_cached_path: bool = False,
+            position_tolerance: float | None = None,
+            yaw_tolerance: float | None = None) -> None:
         """Start one explicit leg of a composite shelf/delivery route."""
         goal = tuple(float(value) for value in goal)
         now = self.now()
@@ -1092,6 +1146,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._route_leg_best_distance = float(np.linalg.norm(
             np.asarray(goal[:2], dtype=float) - self.base_xy))
         self._route_leg_replans = 0
+        self._route_leg_position_tolerance = position_tolerance
+        self._route_leg_yaw_tolerance = yaw_tolerance
         self._nav_last_log = 0.0
         self._last_nav_reason = None
         self._nav_memory_logged = False
@@ -1105,12 +1161,16 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 DELIVERY_TRUNK_CACHE_GOAL_TOLERANCE_M
                 if use_memory else None),
             use_path_memory=use_memory,
-            lock_cached_path=lock_cached_path)
+            lock_cached_path=lock_cached_path,
+            position_tolerance=position_tolerance,
+            yaw_tolerance=yaw_tolerance)
         self.get_logger().info(
             f"[route] start leg={name} goal="
             f"({goal[0]:.2f},{goal[1]:.2f},"
             f"{math.degrees(goal[2]):.0f}deg) "
-            f"memory={int(use_memory)} lock={int(lock_cached_path)}")
+            f"memory={int(use_memory)} lock={int(lock_cached_path)} "
+            f"pos_tol={self.nav.controller.pos_tol:.3f} "
+            f"yaw_tol={self.nav.controller.yaw_tol:.3f}")
 
     def _route_leg_tick(self) -> tuple[bool, str | None]:
         """Drive the active route leg and report a terminal failure reason."""
@@ -1205,7 +1265,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self.nav.set_goal(
                 *self._route_leg_goal,
                 use_path_memory=False,
-                lock_cached_path=False)
+                lock_cached_path=False,
+                position_tolerance=self._route_leg_position_tolerance,
+                yaw_tolerance=self._route_leg_yaw_tolerance)
             self._route_leg_last_progress_at = now
             self._route_leg_best_distance = distance
             self._nav_memory_logged = False
@@ -1257,22 +1319,37 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
         if self.scan_trunk_route_stage is None:
             self.scan_trunk_route_stage = "direct_to_shelf"
+            precise_handoff = self.state == pick.STATE_DIRECT_TRANSIT
             self.get_logger().info(
                 "[route] single direct leg to shelf station goal="
                 f"({final_goal[0]:.2f},{final_goal[1]:.2f},"
-                f"{math.degrees(final_goal[2]):.0f}deg)")
+                f"{math.degrees(final_goal[2]):.0f}deg) "
+                f"precise_handoff={int(precise_handoff)}")
             self._start_route_leg(
                 "scan_direct_to_shelf", final_goal,
-                use_memory=False)
+                use_memory=False,
+                position_tolerance=(
+                    DIRECT_GRASP_POSITION_TOLERANCE_M
+                    if precise_handoff else None),
+                yaw_tolerance=(
+                    pick.NAV_YAW_DEADBAND_RAD
+                    if precise_handoff else None))
             return False
 
         if (self.scan_trunk_route_stage == "direct_to_shelf"
                 and self._route_leg_goal is not None
                 and np.linalg.norm(
                     np.asarray(self._route_leg_goal[:2]) - target) > 0.05):
+            precise_handoff = self.state == pick.STATE_DIRECT_TRANSIT
             self._start_route_leg(
                 "scan_direct_to_shelf", final_goal,
-                use_memory=False)
+                use_memory=False,
+                position_tolerance=(
+                    DIRECT_GRASP_POSITION_TOLERANCE_M
+                    if precise_handoff else None),
+                yaw_tolerance=(
+                    pick.NAV_YAW_DEADBAND_RAD
+                    if precise_handoff else None))
 
         reached, failure = self._route_leg_tick()
         if failure is not None:
@@ -1289,8 +1366,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         return False
 
     # ------------------------------------------------------------------
-    # drive_to override — navigator for transit, parent logic for the last
-    # few centimetres where 0.10 m navigator tolerance is not precise enough.
+    # drive_to override — normal scan transit retains the coarse navigator +
+    # parent final trim.  Direct memory-slot transit gives the navigator the
+    # grasp tolerance, so that route reaches the final pose without a second
+    # base adjustment.
     # ------------------------------------------------------------------
     def drive_to(self, target_xy, final_yaw: float,
                  position_tolerance: float = 0.055,
@@ -3084,11 +3163,13 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             f"slide={float(measured_slide):.3f}->{target_slide:.3f}")
 
     def _start_dual_place_release_spread(self, now: float) -> None:
-        """双臂横向分开，把闭合夹爪从纸巾盒两侧抽离（抓取合拢的取反）。
+        """Reverse the measured tissue squeeze while keeping both jaws shut.
 
-        纸巾抓取时双臂从预抓半跨度(0.150m)向中间合拢到夹持半跨度(0.090m)；
-        放置取反：双臂横向向外分开回预抓半跨度，让闭合的夹爪离开盒侧，
-        再由 stage 4 垂直抬升，全程不先松爪。
+        抓取时以双侧实测接触位置为锚，每侧继续向内预压
+        ``dual_squeeze_m``。放置时严格反向：从当前实测 TCP 出发，每侧仅
+        沿当前双臂 TCP 的水平连线向外移动同样距离。保留当前 TCP 姿态
+        以及各自的 Z，不再张爪，也不再移动到固定 0.150m 半跨度；纸巾
+        卸载后再垂直抬升和后退。
         """
         left_tcp = self.arm_tcp_world("left")
         right_tcp = self.arm_tcp_world("right")
@@ -3101,27 +3182,39 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             raise RuntimeError(
                 "dual release spread lacks arm/slide feedback")
 
-        centre = 0.5 * (np.asarray(left_tcp) + np.asarray(right_tcp))
-        release_half_span = float(pick.DUAL_TISSUE_PREGRASP_HALF_SPAN_M)
+        release_outward_m = float(self.dual_squeeze_m)
+        # 抓取货架时底盘朝北，放置时底盘朝南，左右臂在世界 X 轴上的
+        # 大小关系会反转。不能固定用“左减 X、右加 X”判断外侧；应以
+        # 当前左右 TCP 的水平连线为准，保证两臂间距确实增大。
+        release_axis_xy = (
+            np.asarray(right_tcp[:2], dtype=float)
+            - np.asarray(left_tcp[:2], dtype=float))
+        release_axis_norm = float(np.linalg.norm(release_axis_xy))
+        if (not math.isfinite(release_axis_norm)
+                or release_axis_norm <= 1e-6):
+            raise RuntimeError(
+                "dual release spread has invalid measured TCP separation")
+        release_axis_xy /= release_axis_norm
+
         left_goal = np.asarray(left_tcp, dtype=float).copy()
         right_goal = np.asarray(right_tcp, dtype=float).copy()
-        left_goal[0] = centre[0] - release_half_span
-        right_goal[0] = centre[0] + release_half_span
-        left_goal[1] = centre[1]
-        right_goal[1] = centre[1]
-        left_goal[2] = centre[2]
-        right_goal[2] = centre[2]
+        left_goal[:2] -= release_axis_xy * release_outward_m
+        right_goal[:2] += release_axis_xy * release_outward_m
 
-        left_target = np.eye(4)
-        right_target = np.eye(4)
-        left_target[:3, 3] = self.world_to_footprint(left_goal)
-        right_target[:3, 3] = self.world_to_footprint(right_goal)
+        # Preserve the exact measured endpoint orientations.  Starting from
+        # identity rotations here can make the wrist/elbow joints unwind while
+        # the intended release is only a short lateral inverse-squeeze.
         slide = float(measured_slide)
         reference = np.concatenate((
             [slide],
             np.asarray(left_reference, dtype=float),
             np.asarray(right_reference, dtype=float),
         ))
+        left_target, right_target = self.kdl.forward_kinematics(reference)
+        left_target = np.asarray(left_target, dtype=float).copy()
+        right_target = np.asarray(right_target, dtype=float).copy()
+        left_target[:3, 3] = self.world_to_footprint(left_goal)
+        right_target[:3, 3] = self.world_to_footprint(right_goal)
         try:
             solutions = self.kdl.inverse_kinematics(
                 T_left=left_target,
@@ -3134,8 +3227,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             raise RuntimeError("dual release spread IK failed") from exc
         if solutions is None or len(solutions) == 0:
             raise RuntimeError(
-                "no IK solution for dual release spread at "
-                f"{np.round(centre, 3)}")
+                "no IK solution for inverse-squeeze tissue release: "
+                f"left={np.round(left_goal, 3)} "
+                f"right={np.round(right_goal, 3)}")
 
         candidates = [
             np.asarray(item[1:], dtype=float) for item in solutions]
@@ -3148,10 +3242,20 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.commands_ready_since = None
         self._dual_release_spread_sent = True
         self.place_t0 = now
+        self.start_dual_tissue_motion(
+            "release_open",
+            self.des_left_arm,
+            self.des_right_arm,
+            release_outward_m,
+            pick.DUAL_TISSUE_SQUEEZE_SPEED_MPS,
+            self.state,
+            require_convergence=True)
         self.get_logger().info(
-            "[place-dual] spreading closed grippers apart to release tissue "
-            f"centre={np.round(centre, 3)} "
-            f"half_span={release_half_span:.3f}m")
+            "[place-dual] reversing the grasp squeeze with grippers unchanged "
+            f"outward={release_outward_m:.3f}m/side "
+            f"axis_xy={np.round(release_axis_xy, 3)} "
+            f"left={np.round(left_tcp, 3)}->{np.round(left_goal, 3)} "
+            f"right={np.round(right_tcp, 3)}->{np.round(right_goal, 3)}")
 
     def _start_place_vertical_clear(self, now: float) -> None:
         """Raise vertically after release before arm or chassis retreat."""
@@ -3266,8 +3370,14 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.set_twist(0.0, 0.0)
         self.cmd_linear = 0.0
         self.cmd_angular = 0.0
-        self.des_left_grip = pick.GRIP_OPEN
-        self.des_right_grip = pick.GRIP_OPEN
+        if self.use_dual_tissue_grasp:
+            # The inverse-squeeze has already released the tissue.  Keep the
+            # jaws unchanged while lifting so opening fingers cannot sweep the
+            # box; they open only after the chassis is clear of the table.
+            self._hold_grasp_during_transport()
+        else:
+            self.des_left_grip = pick.GRIP_OPEN
+            self.des_right_grip = pick.GRIP_OPEN
         ready = (
             self.dual_commands_ready(
                 arm_tolerance=0.05, slide_tolerance=0.020)
@@ -3510,7 +3620,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
     def _configure_dual_place_target(
             self, max_step_m: float | None = None) -> bool:
-        """Translate the clamped tissue centre to the assigned slot."""
+        """Translate the clamped tissue to its slot without changing wrist pose."""
         left_tcp = self.arm_tcp_world("left")
         right_tcp = self.arm_tcp_world("right")
         left_reference = self.arm_positions("left")
@@ -3531,16 +3641,21 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         left_goal[:2] += offset_xy
         right_goal[:2] += offset_xy
 
-        left_target = np.eye(4)
-        right_target = np.eye(4)
-        left_target[:3, 3] = self.world_to_footprint(left_goal)
-        right_target[:3, 3] = self.world_to_footprint(right_goal)
         slide = float(measured_slide)
         reference = np.concatenate((
             [slide],
             np.asarray(left_reference, dtype=float),
             np.asarray(right_reference, dtype=float),
         ))
+        # Middle-column and side-column tissue grasps deliberately use
+        # different wrist orientations.  Derive both target transforms from
+        # the measured FK and replace translation only; an identity transform
+        # here would silently unroll a side-column grasp during placement.
+        left_target, right_target = self.kdl.forward_kinematics(reference)
+        left_target = np.asarray(left_target, dtype=float).copy()
+        right_target = np.asarray(right_target, dtype=float).copy()
+        left_target[:3, 3] = self.world_to_footprint(left_goal)
+        right_target[:3, 3] = self.world_to_footprint(right_goal)
         try:
             solutions = self.kdl.inverse_kinematics(
                 T_left=left_target,
@@ -3598,6 +3713,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     np.abs(best - arms_reference))), 4),
                 "measured_slide": round(float(slide), 4),
                 "grip_command": self._transport_grip_command,
+                "tcp_orientation": "preserved_measured",
             }, ensure_ascii=False, separators=(",", ":")))
         return True
 
@@ -3723,7 +3839,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self._place_release_started_at = now
             self._place_slide_stall_snapshot = None
             self.get_logger().info(
-                "[place-dual] vertical descent complete; opening grippers "
+                "[place-dual] vertical descent complete; starting "
+                "inverse-squeeze arm opening with grippers unchanged "
                 f"at centre={None if release_world is None else np.round(release_world, 3)}")
             self.get_logger().info(
                 "[place-joints] dual_descent_reached="
@@ -3741,18 +3858,20 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                         "right_arm_eef_gripper_joint"),
                 }, ensure_ascii=False, separators=(",", ":")))
         elif self.place_stage == 3:
-            # 触桌后立即双臂向两侧分开（抓取合拢的取反），把闭合夹爪从
-            # 纸巾盒两侧抽离，分开到位后再垂直抬升，全程不松爪。
-            self.des_left_grip = pick.DUAL_TISSUE_GRIP_COMMAND
-            self.des_right_grip = pick.DUAL_TISSUE_GRIP_COMMAND
+            # 反向复用抓取预压：夹爪命令保持运输值不变，左右 TCP 各向外
+            # 移动 dual_squeeze_m。张臂到位后先垂直上抬，再后退离桌。
+            self._hold_grasp_during_transport()
             if not self._dual_release_spread_sent:
                 self._start_dual_place_release_spread(now)
                 return
-            if not self.dual_commands_ready(
-                    arm_tolerance=0.05, slide_tolerance=0.020):
+            release_status = self.advance_dual_tissue_motion()
+            if release_status == "failed":
+                raise RuntimeError(
+                    "inverse-squeeze tissue release did not converge")
+            if release_status != "reached":
                 if now - self.place_t0 >= PLACE_DESCENT_TIMEOUT_S:
                     raise RuntimeError(
-                        "dual release spread did not settle within "
+                        "inverse-squeeze tissue release did not settle within "
                         f"{PLACE_DESCENT_TIMEOUT_S:.1f}s")
                 return
             self._dual_release_spread_sent = False
@@ -3799,10 +3918,15 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 self._set_flow_phase("done")
             return
 
-        # Vertical raising is already complete.  Keep the raised arm/slide
-        # pose and open grippers unchanged throughout horizontal retreat.
-        self.des_left_grip = pick.GRIP_OPEN
-        self.des_right_grip = pick.GRIP_OPEN
+        # Vertical raising is already complete.  Tissue keeps its unchanged
+        # closed-jaw command throughout horizontal retreat; normal products
+        # keep their already-open command.  Once the chassis is clear,
+        # _start_place_arm_recovery opens both grippers away from the goods.
+        if self.use_dual_tissue_grasp:
+            self._hold_grasp_during_transport()
+        else:
+            self.des_left_grip = pick.GRIP_OPEN
+            self.des_right_grip = pick.GRIP_OPEN
 
         elapsed = now - self.place_t0
         if elapsed >= PLACE_CLEAR_TABLE_TIMEOUT_S:

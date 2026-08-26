@@ -793,9 +793,15 @@ class NavigationController:
         # clearance checks below remain authoritative.
         self.translation_heading_gate = 0.85
 
-        # Tolerances
-        self.pos_tol = 0.10
-        self.yaw_tol = 0.15
+        # Tolerances.  Most route legs use the coarse defaults; a caller can
+        # request a tighter terminal pose for a manipulation hand-off.  Keep
+        # the defaults separately so every new goal resets a previous precise
+        # goal instead of leaking centimetre-scale tolerances into delivery or
+        # scan transit.
+        self.default_pos_tol = 0.10
+        self.default_yaw_tol = 0.15
+        self.pos_tol = self.default_pos_tol
+        self.yaw_tol = self.default_yaw_tol
 
         # Obstacle safety.  The laser is 9 cm ahead of base_link and the base
         # front is about 21 cm ahead, so 0.32 m still leaves braking margin.
@@ -908,8 +914,22 @@ class NavigationController:
         self._last_plan_lidar_count = 0
         self._last_plan_vision_count = 0
 
-    def set_goal(self, x, y, yaw=None):
+    def set_goal(self, x, y, yaw=None, position_tolerance=None,
+                 yaw_tolerance=None):
         """Set a new navigation goal.  Clears the current path."""
+        position_tolerance = (
+            self.default_pos_tol
+            if position_tolerance is None else float(position_tolerance))
+        yaw_tolerance = (
+            self.default_yaw_tol
+            if yaw_tolerance is None else float(yaw_tolerance))
+        if (not math.isfinite(position_tolerance)
+                or position_tolerance <= 0.0):
+            raise ValueError("position_tolerance must be finite and positive")
+        if not math.isfinite(yaw_tolerance) or yaw_tolerance <= 0.0:
+            raise ValueError("yaw_tolerance must be finite and positive")
+        self.pos_tol = position_tolerance
+        self.yaw_tol = yaw_tolerance
         self.goal_x = float(x)
         self.goal_y = float(y)
         self.goal_yaw = yaw
@@ -2080,8 +2100,12 @@ class SupermarketNavigator:
 
     def set_goal(self, x, y, yaw=None, cached_start_offset_limit=None,
                  cached_goal_offset_limit=None, use_path_memory=True,
-                 lock_cached_path=False):
-        self.controller.set_goal(x, y, yaw)
+                 lock_cached_path=False, position_tolerance=None,
+                 yaw_tolerance=None):
+        self.controller.set_goal(
+            x, y, yaw,
+            position_tolerance=position_tolerance,
+            yaw_tolerance=yaw_tolerance)
         self._reached = False
         self._goal = (float(x), float(y), None if yaw is None else float(yaw))
         self._goal_start_pose = None

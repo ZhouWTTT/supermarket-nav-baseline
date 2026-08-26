@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+import random
 import re
 import subprocess
 import sys
@@ -33,7 +34,7 @@ from competition_task import (
     TaskMessageError,
     marker_arguments,
 )
-from memory_matrix import MemoryMatrixTracker, select_memory_hint
+from memory_matrix import MemoryMatrixTracker, select_memory_route_hint
 
 
 HERE = Path(__file__).resolve().parent
@@ -154,6 +155,7 @@ class CompetitionRunner(Node):
             f"grab_policy={self.args.grab_policy} "
             f"record_everywhere={int(self.args.record_everywhere)} "
             f"dynamic_direct={int(self.args.dynamic_direct)} "
+            f"close_recheck={int(self.args.close_recheck)} "
             "perception_always_on="
             f"{int(self.args.perception_always_on)}")
         self._publish_perception_enabled(False)
@@ -326,6 +328,10 @@ class CompetitionRunner(Node):
         ])
         if self.args.dynamic_direct:
             command.append("--dynamic-direct")
+        # 默认关闭抓前 close-recheck：记忆直达/扫描命中后直接 ALIGN→grasp，
+        # 流程更丝滑；需要恢复核验时用 --close-recheck 重新开启（代码保留）。
+        if not self.args.close_recheck:
+            command.append("--no-close-recheck")
         if self.args.perception_always_on:
             command.append("--perception-always-on")
         # The first physically delivered item always occupies slot zero.
@@ -352,29 +358,11 @@ class CompetitionRunner(Node):
             except (KeyError, TypeError, ValueError):
                 scan_hint_x = None
                 scan_marker_z = None
-            try:
-                shelf = str(self.selected_memory_hint["shelf"])
-                level = str(self.selected_memory_hint["level"])
-                column = str(self.selected_memory_hint["column"])
-                slot_key = str(self.selected_memory_hint["slot_key"])
-                expected_slot_key = f"{level}|{shelf}|{column}"
-                if (shelf in {"A", "B", "C", "D", "E"}
-                        and level in {"L1", "L2", "L3"}
-                        and column in {"1", "2", "3"}
-                        and slot_key == expected_slot_key
-                        and slot_key not in excluded_slots):
-                    raw_y = self.selected_memory_hint.get("world_y")
-                    raw_z = self.selected_memory_hint.get("world_z")
-                    world_y = (
-                        float(raw_y) if raw_y is not None else None)
-                    world_z = (
-                        float(raw_z) if raw_z is not None else None)
-                    if ((world_y is None or math.isfinite(world_y))
-                            and (world_z is None or math.isfinite(world_z))):
-                        direct_hint = (
-                            shelf, level, column, world_y, world_z)
-            except (KeyError, TypeError, ValueError):
-                direct_hint = None
+        if self.args.dynamic_direct:
+            # Snapshot 直达语义：直达槽位必须重新从"主证据"选择，隐藏历史
+            # 候选只允许做扫描提示。失败槽位排除后，若直达不可用则保留
+            # scan_hint_x 作为扫描兜底（worker 会从同一货架开始）。
+            direct_hint = self._select_direct_hint(order, excluded_slots)
         if scan_hint_x is not None:
             command.extend(["--scan-start-x", str(scan_hint_x)])
             if scan_marker_z is not None:
@@ -460,6 +448,54 @@ class CompetitionRunner(Node):
             self.worker_result_path = None
             self._write_summary("worker_start_failed")
             self._publish_stop()
+
+    def _select_direct_hint(
+            self, order, excluded_slots: list[str] | set[str]):
+        """Snapshot 直达语义：仅主证据可直达槽位，隐藏候选只做扫描。
+
+        直达槽位必须重新从主证据（primary_candidates）选择，而不是沿用
+        订单排序时的混合提示：被同格其他品类盖住的历史候选（hidden
+        fallback）绝不直达，避免追着误检/旧记录跑。纸巾三列均由双臂
+        抓取流程支持。与 snapshot 初始直达一致，不再额外要求置信度
+        门槛——primary 主证据本身已含多帧确认与样本数门槛。
+        """
+        memory_candidates, observer_xy = (
+            self.memory_tracker.routing_snapshot(order.kind))
+        all_candidates = self.memory_tracker.matrix.candidates_for(order.kind)
+        hint = select_memory_route_hint(
+            order.kind,
+            memory_candidates,
+            all_candidates,
+            observer_xy,
+            self.args.memory_confidence_threshold,
+            exclude_slots=excluded_slots,
+            require_direct=True)
+        if hint is None or hint.get("hidden_fallback"):
+            return None
+        try:
+            shelf = str(hint["shelf"])
+            level = str(hint["level"])
+            column = str(hint["column"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        expected_slot_key = f"{level}|{shelf}|{column}"
+        if (shelf not in {"A", "B", "C", "D", "E"}
+                or level not in {"L1", "L2", "L3"}
+                or column not in {"1", "2", "3"}
+                or str(hint.get("slot_key", "")) != expected_slot_key
+                or expected_slot_key in excluded_slots):
+            return None
+        raw_y = hint.get("world_y")
+        raw_z = hint.get("world_z")
+        try:
+            world_y = float(raw_y) if raw_y is not None else None
+            world_z = float(raw_z) if raw_z is not None else None
+        except (TypeError, ValueError):
+            return None
+        if ((world_y is not None and not math.isfinite(world_y))
+                or (world_z is not None and not math.isfinite(world_z))):
+            return None
+        return (shelf, level, column, world_y, world_z)
 
     def _request_worker_stop(self, reason: str) -> None:
         if self.worker is None or self.worker.poll() is not None:
@@ -902,8 +938,12 @@ class CompetitionRunner(Node):
         for order in candidates:
             memory_candidates, observer_xy = (
                 self.memory_tracker.routing_snapshot(order.kind))
-            hint = select_memory_hint(
+            all_candidates = (
+                self.memory_tracker.matrix.candidates_for(order.kind))
+            hint = select_memory_route_hint(
+                order.kind,
                 memory_candidates,
+                all_candidates,
                 observer_xy,
                 self.args.memory_confidence_threshold,
                 exclude_slots=self.failed_memory_slots.get(
@@ -920,18 +960,33 @@ class CompetitionRunner(Node):
             order, hint, _travel = min(
                 evaluated, key=lambda item: item[0].source_index)
         else:
-            order, hint, _travel = min(
-                evaluated,
-                key=lambda item: (
-                    item[1] is None,
-                    item[2],
-                    item[0].source_index))
+            any_usable = any(
+                item[1] is not None and math.isfinite(item[2])
+                for item in evaluated)
+            if not any_usable:
+                # 最近优先无法触发：矩阵为空或所有待办订单都没有可用记忆，
+                # 距离信息不存在。不固定抓订单表第一单，随机选一单即可——
+                # 商品通常分布在最近的 E/D 货架，无论选哪单都能就近找到。
+                order, hint, _travel = random.choice(evaluated)
+            else:
+                order, hint, _travel = min(
+                    evaluated,
+                    key=lambda item: (
+                        item[1] is None,
+                        item[2],
+                        item[0].source_index))
         self.selected_memory_hint = (
             None if hint is None else dict(hint))
+        fallback_note = (
+            "no-memory/random fallback"
+            if (self.args.grab_policy != "sequence"
+                and (hint is None or not math.isfinite(_travel)))
+            else None)
         self.get_logger().info(
             f"[orders] policy={self.args.grab_policy} selected "
             f"id={order.id} kind={order.kind} "
             f"travel={None if hint is None else _travel} "
+            f"{'fallback=' + fallback_note + ' ' if fallback_note else ''}"
             f"hint={self.selected_memory_hint}")
         return order
 
@@ -996,6 +1051,12 @@ def parse_args() -> argparse.Namespace:
         "--dynamic-direct", action="store_true",
         help="allow a worker to use a fresh in-run memory candidate for one "
              "guarded direct-slot reroute")
+    parser.add_argument(
+        "--close-recheck", action="store_true",
+        help="re-enable close-range class verification before grasp "
+             "(default off: the grasp flow skips close-recheck for a "
+             "smoother ALIGN->grasp sequence; the recheck code is retained "
+             "and can be turned back on with this flag)")
     parser.add_argument(
         "--perception-always-on", action="store_true",
         help="keep persistent or worker-local perception enabled throughout "
