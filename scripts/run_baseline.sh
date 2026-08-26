@@ -28,6 +28,7 @@ runner=(
     --inference-hz "${SUPERMARKET_INFERENCE_HZ:-12}"
     --device "${SUPERMARKET_DEVICE:-cpu}"
     --order-timeout "${SUPERMARKET_ORDER_TIMEOUT:-300}"
+    --return-timeout "${SUPERMARKET_RETURN_TIMEOUT:-180}"
     --match-timeout "${SUPERMARKET_MATCH_TIMEOUT:-3600}"
     --target-time "${SUPERMARKET_TARGET_TIME:-400}"
 )

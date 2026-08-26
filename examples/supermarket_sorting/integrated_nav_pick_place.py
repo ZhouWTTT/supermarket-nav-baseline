@@ -500,6 +500,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_retreat_dwell_s = place_retreat_dwell_s
         self.return_west_after_place = bool(return_west_after_place)
         self.return_start_after_place = bool(return_start_after_place)
+        self.completion_file: str | None = None
+        self.completion_order_id: str | None = None
+        self._all_orders_completion_signalled = False
         self.placement_completed = False
         self.post_delivery_warnings: list[str] = []
         self.delivery_completed_by_drop = False
@@ -3964,6 +3967,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
     def _start_return_to_start(self, now: float) -> None:
         """Start the final-delivery return from the table to the start pose."""
+        self._signal_all_orders_completed(now)
         self._set_flow_phase("return_to_start")
         self._nav_goal = None
         self._nav_last_log = 0.0
@@ -3973,6 +3977,47 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             "[return-start] final delivery complete; returning to start "
             f"goal=({START_POSE[0]:.3f},{START_POSE[1]:.3f},"
             f"{math.degrees(START_POSE[2]):.0f}deg)")
+
+    def configure_all_orders_completion_signal(
+            self, order_id: str, completion_file: str | None) -> None:
+        """Configure the atomic hand-off from delivery to final return."""
+        self.completion_order_id = str(order_id)
+        self.completion_file = completion_file
+
+    def _signal_all_orders_completed(self, now: float) -> None:
+        """Persist final delivery before entering the independent return."""
+        if self._all_orders_completion_signalled:
+            return
+        if not self.completion_file:
+            # Manual single-worker runs have no supervising runner.  They
+            # still retain the same phase boundary and human-facing log, but
+            # do not need the file handshake used to disable the runner's
+            # per-order timeout.
+            self._all_orders_completion_signalled = True
+            self.get_logger().info("All order completed")
+            return
+        slot = self.target_slot()
+        document = {
+            "schema_version": 1,
+            "milestone": "all_orders_completed",
+            "status": "delivered",
+            "order_id": self.completion_order_id,
+            "kind": self.target_kind,
+            "marker_id": self.target_marker_id,
+            "slot": None if slot is None else list(slot),
+            "slot_key": self.target_slot_key(),
+            "flow_phase": "return_to_start",
+            "signalled_at_monotonic": round(float(now), 3),
+        }
+        destination = pathlib.Path(self.completion_file)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        temporary.replace(destination)
+        self._all_orders_completion_signalled = True
+        self.get_logger().info("All order completed")
 
     def _return_to_start_tick(self, now: float) -> None:
         target = np.asarray(START_POSE[:2], dtype=float)
@@ -4496,6 +4541,9 @@ def parse_args() -> argparse.Namespace:
         "--result-file",
         help="write a machine-readable worker result for competition_runner")
     parser.add_argument(
+        "--completion-file",
+        help="atomically signal final delivery before independent return")
+    parser.add_argument(
         "--exclude-marker-id", action="append", type=int, default=[],
         help="ignore a marker already delivered or failed in this match")
     parser.add_argument(
@@ -4714,6 +4762,8 @@ def main() -> int:
             close_recheck=not args.no_close_recheck,
             return_west_after_place=args.return_west_after_place,
             return_start_after_place=args.return_start_after_place)
+        controller.configure_all_orders_completion_signal(
+            args.order_id, args.completion_file)
         controller.perception_always_on = bool(args.perception_always_on)
         controller.dynamic_direct_enabled = bool(args.dynamic_direct)
         controller.configure_external_perception(args.external_perception)
