@@ -299,10 +299,15 @@ class CompetitionRunner(Node):
 
         same_order_drop_retry = (
             self.immediate_retry_order_id == order.id)
-        # Nearest/sequence selection belongs to the runner.  Letting a worker
-        # opportunistically change class after dispatch would invalidate the
-        # selected memory hint, retry bookkeeping and failed-slot ownership.
-        candidate_kinds = [order.kind]
+        # A worker still carries exactly one item, but before committing a
+        # grasp it may choose any pending order whose reliable matrix target
+        # is currently nearest.  _resolve_worker_order() accounts the result
+        # against the class actually delivered, so changing class here does
+        # not consume or retry the originally dispatched order by mistake.
+        candidate_kinds = (
+            [order.kind]
+            if self.args.grab_policy == "sequence"
+            else self._candidate_kinds_for(order))
         self.immediate_retry_order_id = None
         command = [
             sys.executable,
@@ -330,13 +335,17 @@ class CompetitionRunner(Node):
             for marker_id in self.task.excluded_markers(kind)
         })
         command.extend(marker_arguments(excluded_markers))
-        excluded_slots = sorted({
-            slot_key
+        excluded_slots_by_kind = {
+            kind: sorted(self.failed_memory_slots.get(kind, set()))
             for kind in candidate_kinds
-            for slot_key in self.failed_memory_slots.get(kind, set())
-        })
-        for slot_key in excluded_slots:
-            command.extend(["--exclude-slot-key", slot_key])
+            if self.failed_memory_slots.get(kind)
+        }
+        for kind, slot_keys in excluded_slots_by_kind.items():
+            for slot_key in slot_keys:
+                command.extend([
+                    "--exclude-kind-slot", f"{kind}={slot_key}"])
+        excluded_slots = set(
+            excluded_slots_by_kind.get(order.kind, ()))
         command.extend([
             "--memory-file", str(self.memory_path),
             "--memory-confidence-threshold",
@@ -440,7 +449,7 @@ class CompetitionRunner(Node):
             f"persistent_perception={int(external_perception)} "
             f"single_item_candidates={candidate_kinds} "
             f"excluded_markers={excluded_markers} "
-            f"excluded_slots={excluded_slots}")
+            f"excluded_slots_by_kind={excluded_slots_by_kind}")
         try:
             self.worker = subprocess.Popen(
                 command,
