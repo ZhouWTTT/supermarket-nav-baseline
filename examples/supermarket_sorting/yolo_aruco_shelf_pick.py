@@ -347,9 +347,6 @@ MARKER_SAMPLE_SPREAD_MAX_M = 0.04
 # verifies that the requested class is still present at the selected slot.
 CLOSE_RECHECK_CONFIRMATIONS = 2
 CLOSE_RECHECK_WINDOW_S = 2.0
-# 单帧错码可能来自邻近商品或偶发误关联；同一个错误码需连续多帧与
-# 目标框明确关联，才把该槽位判为冲突并拒绝。
-CLOSE_RECHECK_ARUCO_CONFLICT_CONFIRMATIONS = 2
 # 单一复核位姿超时：覆盖“位姿移动 + 相机稳定 + 首帧
 # YOLO/深度”。ArUco 在同一时窗内被动识别，不为它增加超时或视角。
 CLOSE_RECHECK_POSE_TIMEOUT_S = 2.5
@@ -364,6 +361,43 @@ CLOSE_RECHECK_PARTIAL_CONFIRMATION_GRACE_S = 0.50
 # not passed depth/ArUco checks yet) always keeps the full confirmation window.
 CLOSE_RECHECK_EMPTY_TARGET_SWITCH_S = 0.80
 CLOSE_RECHECK_EMPTY_TARGET_FRAMES = 3
+# These localisation paths already contain stable YOLO/depth evidence (or a
+# matrix candidate built from that evidence).  A close-view timeout may not
+# discard them merely because the optional ArUco code is occluded or decoded
+# as a neighbouring shelf marker.
+DEPTH_BACKED_RECHECK_FALLBACK_SOURCES = frozenset({
+    "yolo_only",
+    "position_fallback",
+    "memory_direct",
+    "aruco+depth",
+})
+# ArUco 成功识别后的深度相机矫正（近距复核阶段）。
+#
+# 只在“目标确实被识别成功”的情况下用深度相机辅佐修正抓取目标：
+#   * 复核同帧同时命中“目标深度在槽位 + 期望 ArUco 识别成功”，即
+#     depth+aruco / depth+aruco-x；
+#   * 或目标本身由 ArUco 直达锁定（aruco(no-depth)/aruco+partial-depth，
+#     扫描期深度样本不足，球体等目标只靠 marker 模型定位最容易出错），
+#     复核通过后同样允许用近距深度矫正。
+# 其余情况（深度通过但无码、复核超时等）一律保持原目标不动。
+# 矫正只使用本帧已经通过复核判定的深度点，绝不为矫正额外等待深度/
+# ArUco 帧，避免重蹈“首次抓取长时间卡住”的覆辙。
+RECHECK_ARUCO_DEPTH_CORRECTION_SOURCES = frozenset({
+    "depth+aruco",
+    "depth+aruco-x",
+})
+RECHECK_DIRECT_ARUCO_LOCALISATION_SOURCES = frozenset({
+    "aruco(no-depth)",
+    "aruco+partial-depth",
+})
+# 单轴最大矫正量：近距复核已把深度点限制在目标槽位附近
+# （CLOSE_RECHECK_XY_MAX_M=0.12），这里再收紧到几厘米，防止单帧深度
+# 噪声把目标拽出槽位。深度点新鲜度同样只做“可跳过”的软约束。
+RECHECK_DEPTH_CORRECTION_MAX_DELTA_M = 0.05
+RECHECK_DEPTH_CORRECTION_MAX_DELTA_MS = 300.0
+# 深度矫正把目标 X 移动超过该值后，重新驱动基座对准新列中心再抓取；
+# 只移动 Y（进深）时不需要移动基座，部署期 IK 会按当前基座重解。
+RECHECK_DEPTH_CORRECTION_REALIGN_X_M = 0.010
 REVISIT_POSE_COMMAND_TIMEOUT_S = 5.0
 # 近距复核的期望 marker 世界坐标容差：货架列间距 0.22m、层间距约 0.35m，
 # 这里留的余量足以区分相邻列/层，同时容忍 PnP 定位数 cm 的误差。只比较
@@ -1135,6 +1169,7 @@ class ShelfPickController(Node):
         # YOLO-only localisation has no decoded marker identity.  Failed
         # attempts therefore blacklist the fixed matrix slot instead.
         self.excluded_slot_keys = set()
+        self.excluded_slot_keys_by_kind = {}
         self.close_recheck = bool(close_recheck)
         self.recheck_marker_skips = set()
         self.recheck_confirmation_times = deque(maxlen=12)
@@ -1151,10 +1186,12 @@ class ShelfPickController(Node):
         self.recheck_pose_index = 0
         self.recheck_poses = ()
         self._recheck_passed = False
+        self.recheck_last_confirmation_detection = None
         self.last_generic_close_log = 0.0
         self.target_marker_id = None
         self.target_physical_marker_id = None
         self.target_world = None
+        self.target_localisation_source = None
         self.committed_slot = None
         # 记忆直达槽位复核失败后的同货架相邻列重试（方案 B）：
         # 列证据通常只差一格，相邻列命中可省掉整轮“回货架中心全量扫描”。
@@ -1583,8 +1620,11 @@ class ShelfPickController(Node):
 
     def _set_pregrasp_target_kind(self, kind: str) -> None:
         """Update target-dependent grasp parameters before localisation."""
-        if (self.state != STATE_SCAN or self.target_marker_id is not None):
-            raise RuntimeError("target kind can only change during initial scan")
+        if (self.state not in {STATE_GO_SCAN, STATE_SCAN}
+                or self.target_marker_id is not None
+                or self.target_world is not None):
+            raise RuntimeError(
+                "target kind can only change before localisation")
         self.target_kind = kind
         self.product_height = PRODUCT_CENTER_ABOVE_MARKER_M[kind]
         self.product_grasp_width = PRODUCT_GRASP_WIDTH_M[kind]
@@ -1608,6 +1648,13 @@ class ShelfPickController(Node):
         self.association_candidate_id = None
         self.association_confirmation_count = 0
         self.last_association_pair = None
+
+    def _slot_excluded_for_target(self, slot_key: str) -> bool:
+        """Return whether this physical slot failed for the active class."""
+        return bool(
+            slot_key in self.excluded_slot_keys
+            or slot_key in self.excluded_slot_keys_by_kind.get(
+                self.target_kind, set()))
 
     def aruco_cb(self, message: String) -> None:
         records = [record for record in decode_list(message)
@@ -1681,7 +1728,7 @@ class ShelfPickController(Node):
                     "[tissue-filter] ignoring side-column tissue "
                     f"slot={key}; only the middle column is eligible")
             return
-        if f"{level}|{shelf}|{column}" in self.excluded_slot_keys:
+        if self._slot_excluded_for_target(f"{level}|{shelf}|{column}"):
             return
         level_name = {"L3": "top", "L2": "middle", "L1": "lower"}[level]
         surface_z = SHELF_SURFACE_Z_M[level_name]
@@ -1736,6 +1783,7 @@ class ShelfPickController(Node):
         self.target_world = np.asarray(target_world, dtype=float)
         self.target_marker_id = marker_id
         self.target_physical_marker_id = physical_marker_id
+        self.target_localisation_source = str(source)
         self.committed_slot = None
         slot_x = float(self.target_world[0])
         slot_z = float(self.target_world[2])
@@ -1870,7 +1918,7 @@ class ShelfPickController(Node):
                 f"column={column}; only the middle column is eligible")
             return False
         slot_key = f"{level}|{shelf}|{column}"
-        if slot_key in self.excluded_slot_keys:
+        if self._slot_excluded_for_target(slot_key):
             self.get_logger().warn(
                 f"[direct-slot] fixed slot {slot_key} is excluded")
             return False
@@ -2205,6 +2253,7 @@ class ShelfPickController(Node):
                 f"{np.round(vision_error, 4)}m")
         else:
             self.target_world = measured_target
+        self.target_localisation_source = target_source
         # 商品与 ArUco 会在场景初始化时一起随机换位，marker ID 对应的是
         # 商品身份，不再代表固定物理槽位。纸巾侧列动作必须以本次视觉定位
         # 得到的世界坐标判列，否则 SLOT_BY_MARKER 的初始布局会把侧列误判
@@ -2344,12 +2393,13 @@ class ShelfPickController(Node):
         return float(np.clip(yaw, -0.45, 0.45))
 
     def _expected_recheck_marker_id(self) -> int | None:
-        """Return the fixed marker that must be seen before this grasp.
+        """Return the fixed marker that may enrich close-view confirmation.
 
         A scan-localised target may have a genuinely decoded marker already;
         a YOLO-only target has only a committed fixed slot.  In the latter
-        case the public slot-to-ArUco layout supplies the *expected* identity
-        for close recheck without pretending that it was observed earlier.
+        case the public slot-to-ArUco layout supplies an *expected* identity
+        for diagnostics and positive fusion without pretending that it was
+        observed earlier or making it mandatory for grasp.
         """
         marker_id = self.target_marker_id
         if marker_id is not None:
@@ -2372,6 +2422,7 @@ class ShelfPickController(Node):
         self.recheck_confirmation_times.clear()
         self.recheck_last_yolo_stamp = None
         self.recheck_last_confirmation_source = None
+        self.recheck_last_confirmation_detection = None
         self.recheck_conflict_marker_id = None
         self.recheck_conflict_count = 0
         self.recheck_conflict_confirmed = False
@@ -2482,62 +2533,31 @@ class ShelfPickController(Node):
                 f"expected={self._expected_recheck_marker_id()}")
 
         best_match = None
-        conflict_marker_id = None
         for detection in sorted(
                 detections,
                 key=lambda item: float(item.get("conf", 0.0)),
                 reverse=True):
             matched, source = self._recheck_detection_matches(
                 detection, markers)
-            if source.startswith("aruco-conflict:"):
-                try:
-                    if conflict_marker_id is None:
-                        conflict_marker_id = int(source.rsplit(":", 1)[1])
-                except (TypeError, ValueError):
-                    pass
-                continue
             if not matched:
                 continue
             candidate = (0, detection, source)
             if best_match is None or candidate[0] < best_match[0]:
                 best_match = candidate
-
-        # A matching optional code on a depth-confirmed target cancels a
-        # competing pixel-association conflict; otherwise depth remains the
-        # primary positive signal.
-        if (best_match is not None
-                and "+aruco" in best_match[2]):
-            conflict_marker_id = None
-        # A clearly associated wrong code beats depth-only fallback for this
-        # frame.  It becomes a hard rejection only after repeated fresh frames.
-        if conflict_marker_id is not None:
-            self.recheck_confirmation_times.clear()
-            self.recheck_last_confirmation_source = None
-            if conflict_marker_id == self.recheck_conflict_marker_id:
-                self.recheck_conflict_count += 1
-            else:
-                self.recheck_conflict_marker_id = conflict_marker_id
-                self.recheck_conflict_count = 1
-            self.get_logger().warn(
-                f"[close-recheck] associated ArUco conflict "
-                f"expected={self._expected_recheck_marker_id()} "
-                f"seen={conflict_marker_id} "
-                f"count={self.recheck_conflict_count}/"
-                f"{CLOSE_RECHECK_ARUCO_CONFLICT_CONFIRMATIONS}")
-            if (self.recheck_conflict_count
-                    >= CLOSE_RECHECK_ARUCO_CONFLICT_CONFIRMATIONS):
-                self.recheck_conflict_confirmed = True
-            return
+        # ArUco never owns a negative gate.  Mismatches are retained in the
+        # confirmation source string for diagnostics, while depth decides.
         self.recheck_conflict_marker_id = None
         self.recheck_conflict_count = 0
+        self.recheck_conflict_confirmed = False
 
         if best_match is None:
             return
         _, detection, source = best_match
         # No ArUco grace period: a fresh YOLO+depth match is counted
-        # immediately.  Decoded markers enrich or reject the same frame but
-        # never delay the primary confirmation path.
+        # immediately.  Decoded markers only enrich the same frame and never
+        # delay or reject the primary confirmation path.
         self.recheck_last_confirmation_source = source
+        self.recheck_last_confirmation_detection = detection
         now = self.now()
         cutoff = now - CLOSE_RECHECK_WINDOW_S
         while (self.recheck_confirmation_times
@@ -2556,7 +2576,7 @@ class ShelfPickController(Node):
     def _recheck_detection_matches(
             self, detection: dict,
             markers: list[dict]) -> tuple[bool, str]:
-        """Close recheck with ArUco identity and depth geometry fusion."""
+        """Verify YOLO depth; use ArUco only to enrich a positive match."""
         if detection.get("class") != self.target_kind:
             return False, "class-mismatch"
         expected_marker_id = self._expected_recheck_marker_id()
@@ -2594,32 +2614,15 @@ class ShelfPickController(Node):
                 self._recheck_marker_matches_world(markers))
             if world_matched:
                 return True, "depth+" + world_source
-            if (marker_id is not None
-                    and expected_marker_id is not None
-                    and self._associated_marker_can_conflict(marker_id)):
-                return False, f"aruco-conflict:{marker_id}"
+            if marker_id is not None and expected_marker_id is not None:
+                return True, (
+                    f"depth(ignore-aruco={marker_id},"
+                    f"expected={expected_marker_id})")
             return True, "depth(no-associated-aruco)"
         if (expected_marker_id is not None
                 and marker_id == expected_marker_id):
             return False, "aruco-depth-conflict"
         return False, "depth(outside-target-slot)"
-
-    def _associated_marker_can_conflict(self, marker_id: int) -> bool:
-        """A wrong code is negative evidence only on the target shelf level.
-
-        The close camera often contains markers from lower shelves inside or
-        just below a tall YOLO box.  For example marker 10 (B-L1-2) must not
-        reject a B-L3-2 target merely because pixel association selected it.
-        A stable different-column code on the same shelf and level remains a
-        valid conflict and can still trigger the two-frame rejection rule.
-        """
-        seen_slot = SLOT_BY_MARKER.get(int(marker_id))
-        target_slot = self.target_slot()
-        if seen_slot is None or target_slot is None:
-            return False
-        return (
-            tuple(seen_slot[:2]) == tuple(target_slot[:2])
-            and tuple(seen_slot) != tuple(target_slot))
 
     def _marker_fixed_position_consistent(self, marker: dict) -> bool:
         """解码 marker 的实测世界位置必须与其固定槽位位置一致。
@@ -2711,6 +2714,101 @@ class ShelfPickController(Node):
         return (len(self.recheck_confirmation_times)
                 >= CLOSE_RECHECK_CONFIRMATIONS)
 
+    def _recheck_depth_correction_eligible(self, source: str | None) -> bool:
+        """复核通过后是否允许用深度相机矫正抓取目标。
+
+        用户语义：只有“复核结果为 depth+aruco / depth+aruco-x”或“目标为
+        ArUco 直达锁定（aruco(no-depth)/aruco+partial-depth）”这类目标
+        识别成功的情况下才辅佐深度矫正；其余复核成功形式不额外改目标。
+        """
+        if source in RECHECK_ARUCO_DEPTH_CORRECTION_SOURCES:
+            return True
+        return bool(
+            getattr(self, "target_localisation_source", None)
+            in RECHECK_DIRECT_ARUCO_LOCALISATION_SOURCES)
+
+    def _apply_recheck_depth_correction(self) -> np.ndarray | None:
+        """用最后一张复核确认帧的深度对 target_world 做小幅矫正。
+
+        只在使用者允许的“ArUco 识别成功”分支执行；深度点就是本帧已经
+        通过复核判定的同一点，因此永远不会等待额外深度/ArUco 帧。返回
+        实际应用的位移向量 (dx, dy)，未应用返回 None。Z 保持复核前目标
+        值：球体中心高度由板面+半径几何决定，盒子中心高度由 marker 模型
+        决定，近距深度 z 是前表面/下半球，不能直接替换。
+        """
+        source = self.recheck_last_confirmation_source
+        if not self._recheck_depth_correction_eligible(source):
+            return None
+        detection = self.recheck_last_confirmation_detection
+        if not isinstance(detection, dict):
+            return None
+        try:
+            target = np.asarray(self.target_world, dtype=float)
+        except (TypeError, ValueError):
+            return None
+        if target.shape != (3,) or not np.all(np.isfinite(target)):
+            return None
+        half_depth = PRODUCT_HALF_DEPTH_M.get(self.target_kind)
+        if half_depth is None:
+            return None
+        delta_ms = detection.get("depth_delta_ms")
+        if (delta_ms is not None
+                and isinstance(delta_ms, (int, float))
+                and float(delta_ms) > RECHECK_DEPTH_CORRECTION_MAX_DELTA_MS):
+            self.get_logger().warn(
+                "[close-recheck] depth correction skipped: depth "
+                f"delta={float(delta_ms):.0f}ms > "
+                f"{RECHECK_DEPTH_CORRECTION_MAX_DELTA_MS:.0f}ms")
+            return None
+        world = self._detection_world(detection)
+        if world is None:
+            return None
+        # 近距深度点落在目标前表面：横向 x 即目标中心所在射线，纵向 y
+        # 叠加半深恢复中心（与扫描期深度融合同一口径）。
+        corrected = target.copy()
+        corrected[0] = float(world[0])
+        corrected[1] = float(world[1]) + half_depth
+        delta = corrected - target
+        if not np.all(
+                np.abs(delta)
+                <= RECHECK_DEPTH_CORRECTION_MAX_DELTA_M):
+            self.get_logger().warn(
+                f"[close-recheck] depth correction skipped: "
+                f"delta={np.round(delta, 4)}m exceeds "
+                f"{RECHECK_DEPTH_CORRECTION_MAX_DELTA_M}m")
+            return None
+        slot_before = self.target_slot()
+        slot_after = fixed_slot_from_world(
+            float(corrected[0]), float(corrected[2]))
+        if slot_after != slot_before:
+            self.get_logger().warn(
+                f"[close-recheck] depth correction skipped: "
+                f"slot would change {slot_before} -> {slot_after}")
+            return None
+        self.target_world = corrected
+        self.get_logger().info(
+            f"[close-recheck] depth correction applied source={source} "
+            f"kind={self.target_kind} "
+            f"delta={np.round(delta, 4)}m "
+            f"target={np.round(self.target_world, 4)}")
+        return delta
+
+    def _depth_recheck_fallback_available(self) -> bool:
+        """Whether existing non-ArUco evidence is safe to keep for grasp."""
+        if (getattr(self, "target_localisation_source", None)
+                not in DEPTH_BACKED_RECHECK_FALLBACK_SOURCES):
+            return False
+        try:
+            target = np.asarray(self.target_world, dtype=float)
+        except (TypeError, ValueError):
+            return False
+        slot_key = self.target_slot_key()
+        return bool(
+            target.shape == (3,)
+            and np.all(np.isfinite(target))
+            and slot_key is not None
+            and not self._slot_excluded_for_target(slot_key))
+
     def _advance_recheck_pose(self) -> bool:
         """Move to the next view; return False when all views are exhausted."""
         if self.recheck_pose_index + 1 >= len(self.recheck_poses):
@@ -2720,6 +2818,7 @@ class ShelfPickController(Node):
         self.recheck_confirmation_times.clear()
         self.recheck_last_yolo_stamp = None
         self.recheck_last_confirmation_source = None
+        self.recheck_last_confirmation_detection = None
         self.recheck_conflict_marker_id = None
         self.recheck_conflict_count = 0
         self.recheck_conflict_confirmed = False
@@ -2735,46 +2834,38 @@ class ShelfPickController(Node):
         return True
 
     def _recheck_fail(self) -> None:
-        """Handle a hard code conflict or an inconclusive recheck timeout."""
+        """Use depth fallback when possible; otherwise resume local scan."""
         marker_id = self._expected_recheck_marker_id()
-        skipped_slot = self.target_slot_key()
-        hard_conflict = bool(self.recheck_conflict_confirmed)
-        # A timeout is not negative inventory evidence.  Only a repeated,
-        # geometrically associated wrong code may blacklist a slot and launch
-        # direct adjacent-column recovery.  This prevents a late first depth
-        # confirmation from expelling the robot from the nearest shelf.
-        if hard_conflict:
-            if marker_id is not None:
-                self.recheck_marker_skips.add(marker_id)
-            if skipped_slot is not None:
-                self.excluded_slot_keys.add(skipped_slot)
+        fallback_source = self.target_localisation_source
+        use_depth_fallback = self._depth_recheck_fallback_available()
         self._recheck_passed = False
         self.recheck_poses = ()
         self.recheck_confirmation_times.clear()
         self.recheck_last_yolo_stamp = None
         self.recheck_last_confirmation_source = None
+        self.recheck_last_confirmation_detection = None
         self.recheck_conflict_marker_id = None
         self.recheck_conflict_count = 0
         self.recheck_conflict_confirmed = False
         self.recheck_fresh_yolo_frames = 0
         self.recheck_target_seen = False
         self.scan_camera_ready_since = None
-        # Only a confirmed code conflict may try another evidenced column.
-        # An ordinary timeout stays on this shelf and returns control to the
-        # YOLO+depth scan instead of turning missing optional ArUco into travel.
-        if (hard_conflict
-                and self.direct_slot_target_active
-                and self._try_adjacent_direct_slot()):
+        if use_depth_fallback:
+            self._recheck_passed = True
+            self.get_logger().warn(
+                f"[close-recheck] optional ArUco/close view inconclusive; "
+                f"keeping {fallback_source} target at "
+                f"slot={self.target_slot_key()} and proceeding to grasp")
+            self._start_grasp_settle()
             return
         self.get_logger().warn(
             f"[close-recheck] FAILED marker={marker_id} "
             f"kind={self.target_kind}; all close-view poses exhausted; "
-            + ("confirmed code conflict; trying another matrix hint"
-               if hard_conflict
-               else "ambiguous timeout; scanning this shelf locally"))
+            "no valid YOLO/depth fallback; scanning this shelf locally")
         self.target_marker_id = None
         self.target_physical_marker_id = None
         self.target_world = None
+        self.target_localisation_source = None
         self.committed_slot = None
         self.direct_slot_target_active = False
         self.association_candidate_id = None
@@ -2782,9 +2873,7 @@ class ShelfPickController(Node):
         self.marker_positions.clear()
         self.depth_target_samples.clear()
         self.last_association_pair = None
-        if hard_conflict:
-            self._restore_full_scan_after_inventory_hint()
-        elif hasattr(self, "dynamic_direct_enabled"):
+        if hasattr(self, "dynamic_direct_enabled"):
             # Keep the current inventory hint and disable only further direct
             # slot jumps for this worker.  Normal YOLO+depth scanning now gets
             # the next decision at the same (nearest) shelf.
@@ -2823,7 +2912,7 @@ class ShelfPickController(Node):
             if next_column == column:
                 continue
             slot_key = f"{level}|{shelf}|{next_column}"
-            if slot_key in self.excluded_slot_keys:
+            if self._slot_excluded_for_target(slot_key):
                 continue
             if not self._direct_retry_slot_supported(
                     shelf, level, next_column):
@@ -3531,7 +3620,7 @@ class ShelfPickController(Node):
                     f"tissue slot={inferred_slot_key}; only the middle "
                     "column is eligible")
             return False
-        if inferred_slot_key in self.excluded_slot_keys:
+        if self._slot_excluded_for_target(inferred_slot_key):
             return False
         if inferred_slot_marker_id in self.excluded_marker_ids:
             return False
@@ -6949,12 +7038,6 @@ class ShelfPickController(Node):
                     self._start_grasp_settle()
 
         elif self.state == STATE_RECHECK:
-            if self.recheck_conflict_confirmed:
-                self.get_logger().warn(
-                    "[close-recheck] repeated associated ArUco mismatch; "
-                    "rejecting this slot")
-                self._recheck_fail()
-                return
             pose = self.current_recheck_pose()
             if pose is None:
                 self._recheck_fail()
@@ -6971,12 +7054,57 @@ class ShelfPickController(Node):
                     self._recheck_passed = True
                     self.recheck_confirmation_times.clear()
                     self.recheck_poses = ()
+                    correction_delta = (
+                        self._apply_recheck_depth_correction())
+                    correction_dx = (
+                        None if correction_delta is None
+                        else float(correction_delta[0]))
+                    correction_dy = (
+                        None if correction_delta is None
+                        else float(correction_delta[1]))
                     self.get_logger().info(
                         f"[close-recheck] PASS marker="
                         f"{self._expected_recheck_marker_id()} "
                         f"kind={self.target_kind} "
-                        f"source={self.recheck_last_confirmation_source}; "
-                        "proceeding to grasp")
+                        f"source={self.recheck_last_confirmation_source} "
+                        + (
+                            "depth_correction="
+                            f"({correction_dx * 1000:.1f},"
+                            f"{correction_dy * 1000:.1f})mm"
+                            if correction_delta is not None
+                            else "depth_correction=none")
+                        + "; proceeding to grasp")
+                    realign_base = bool(
+                        correction_dx is not None
+                        and abs(correction_dx)
+                        > RECHECK_DEPTH_CORRECTION_REALIGN_X_M)
+                    if (correction_dy is not None
+                            and self.is_top_shelf
+                            and abs(correction_dy)
+                            > RECHECK_DEPTH_CORRECTION_REALIGN_X_M):
+                        # 顶层基座纵向位置由目标进深推导（target_y - 0.69），
+                        # 深度矫正改目标 Y 后必须让基座跟随，否则顶层手臂
+                        # 够不到更深/更浅的球体中心。
+                        self.align_base_y = float(np.clip(
+                            self.align_base_y + correction_dy,
+                            DUAL_ALIGN_Y_MIN_M, GENERIC_ALIGN_Y_MAX_M))
+                        realign_base = True
+                    if realign_base:
+                        self.align_base_x = float(np.clip(
+                            self.align_base_x
+                            + (correction_dx or 0.0),
+                            NAV_X_MIN, NAV_X_MAX))
+                        self.get_logger().warn(
+                            f"[close-recheck] depth-corrected target by "
+                            f"({correction_dx * 1000:.1f},"
+                            f"{correction_dy * 1000:.1f})mm; re-aligning "
+                            f"base=({self.align_base_x:.3f},"
+                            f"{self.align_base_y:.3f}) before grasp")
+                        # _recheck_passed 已置 True：回到 ALIGN 只做一次
+                        # 短距基座重对准，随后直接进入 grasp settle，不再
+                        # 重复复核，也不会为矫正等待任何额外帧。
+                        self.set_state(STATE_ALIGN)
+                        return
                     self._start_grasp_settle()
             else:
                 self.scan_camera_ready_since = None

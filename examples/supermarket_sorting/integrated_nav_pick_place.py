@@ -214,13 +214,30 @@ PLACE_XY_REFINE_SETTLE_S = 0.30
 PLACE_XY_REFINE_TIMEOUT_S = 12.0
 PLACE_XY_COMMAND_MIN_WAIT_S = 0.75
 PLACE_XY_STATIONARY_SETTLE_S = 0.30
-PLACE_XY_STATIONARY_ARM_RAD_S = 0.020
+# 精调阶段的“臂静止”判据使用实测关节位置漂移而不是速度话题：负载关节
+# 在力矩限位附近静止时，位置几乎不动，但速度话题仍会报 ±0.1 rad/s 的
+# 噪声（实测 j6 位置 0.003 rad 内抖动时速度 ±0.12）。用速度阈值会把
+# 已经静止的臂误判为运动中，导致水平精调空等满 12 s 超时后才兜底下降。
+PLACE_XY_STATIONARY_ARM_POS_M = 0.006
 PLACE_XY_STATIONARY_SLIDE_MPS = 0.005
 # Under a held product the passive slide settles about 6 mm away from its
 # command even though its velocity is effectively zero.  Keep the normal
 # 4 mm command-ready gate above, but let the Cartesian refinement consume a
 # genuinely stationary loaded pose inside this separate safety envelope.
 PLACE_XY_STATIONARY_SLIDE_ERROR_M = 0.012
+# During the loaded overhead approach a joint can stop a few hundredths of a
+# radian short because the product/arm is already at its effort limit.  If the
+# arm and slide have then been stationary for a short command interval, the
+# measured pose is safe to hand to the existing XY refinement stage.  This is
+# deliberately a separate, looser gate: it never authorises release and the
+# normal slot/height checks still guard the subsequent descent.
+# Keep this aligned with the existing vertical-descent arm gate.  The latest
+# fifth delivery settled at 0.0489 rad on joint 5: it is mechanically static
+# and therefore safe for measured-TCP refinement, but just outside 0.040.
+PLACE_APPROACH_STATIONARY_ARM_ERROR_RAD = 0.050
+PLACE_APPROACH_STATIONARY_ARM_RAD_S = 0.020
+PLACE_APPROACH_STATIONARY_SLIDE_VEL_MPS = 0.005
+PLACE_APPROACH_STATIONARY_MIN_AGE_S = 0.75
 # A placement timeout must end by lowering onto the table, never by sweeping a
 # clamped product back through the table edge.  This envelope is only a last
 # resort; normal refinement still targets the 20 mm assigned-slot tolerance.
@@ -605,6 +622,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._place_refine_target_sent = False
         self._place_refine_target_sent_at = None
         self._place_refine_motion_stable_since = None
+        self._place_refine_motion_anchor = None
         self._place_refine_stable_since = None
         self._place_refine_iterations = 0
         self._place_release_started_at = None
@@ -663,7 +681,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.memory_active_hint = None
         self.memory_failed_hint = None
         self.memory_failed_hint_levels = set()
+        self.memory_failed_hint_levels_by_kind = {}
         self.memory_exhausted_shelves = set()
+        self.memory_exhausted_shelves_by_kind = {}
+        self.excluded_slot_keys_by_kind = {}
         self.memory_last_scan_station_x = None
         self.memory_rerouted = False
         self.dynamic_direct_enabled = False
@@ -867,25 +888,73 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
     def _select_live_memory_hint(
             self, *, reliable_only: bool,
-            min_last_seen: float | None = None):
+            min_last_seen: float | None = None,
+            require_direct: bool = False):
         if self.memory_file is None:
             return None
         document = read_memory_document(self.memory_file)
-        # Snapshot 两层语义：主证据可直接/扫描；被同格其他品类盖住的历史
-        # 候选只做扫描提示（hidden_fallback），且就近偏好由共享函数处理。
-        return select_memory_route_hint(
-            self.target_kind,
-            primary_candidates_from_document(
-                document, self.target_kind),
-            candidates_from_document(
-                document, self.target_kind),
-            self.base_xy,
-            self.memory_confidence_threshold,
-            exclude_slots=self.excluded_slot_keys,
-            exclude_shelves=self.memory_exhausted_shelves,
-            exclude_shelf_levels=self.memory_failed_hint_levels,
-            min_last_seen=min_last_seen,
-            reliable_only=reliable_only)
+        # Rank every still-pending class carried by this worker, not merely
+        # the class chosen when the process was dispatched.  This lets a live
+        # matrix update replace a stale target with the nearest pending item.
+        kinds = tuple(dict.fromkeys(getattr(
+            self, "opportunistic_target_kinds", (self.target_kind,))))
+        failed_by_kind = getattr(
+            self, "memory_failed_hint_levels_by_kind", {})
+        exhausted_by_kind = getattr(
+            self, "memory_exhausted_shelves_by_kind", None)
+        ranked = []
+        for priority, kind in enumerate(kinds):
+            failed_levels = set(failed_by_kind.get(kind, set()))
+            # Backward compatibility for standalone/tests created before the
+            # per-kind failure map existed.
+            if kind == self.target_kind:
+                failed_levels.update(self.memory_failed_hint_levels)
+            if exhausted_by_kind is None:
+                exhausted_shelves = (
+                    self.memory_exhausted_shelves
+                    if kind == self.target_kind else set())
+            else:
+                exhausted_shelves = set(
+                    exhausted_by_kind.get(kind, set()))
+            hint = select_memory_route_hint(
+                kind,
+                primary_candidates_from_document(document, kind),
+                candidates_from_document(document, kind),
+                self.base_xy,
+                self.memory_confidence_threshold,
+                exclude_slots=(
+                    set(self.excluded_slot_keys)
+                    | set(self.excluded_slot_keys_by_kind.get(kind, set()))),
+                exclude_shelves=exhausted_shelves,
+                exclude_shelf_levels=failed_levels,
+                min_last_seen=min_last_seen,
+                reliable_only=reliable_only,
+                require_direct=require_direct)
+            if hint is None:
+                continue
+            candidate = dict(hint)
+            candidate["target_kind"] = kind
+            try:
+                travel = float(candidate.get("travel", float("inf")))
+                confidence = float(candidate.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(travel):
+                continue
+            ranked.append(((travel, -confidence, priority), candidate))
+        return min(ranked, key=lambda item: item[0])[1] if ranked else None
+
+    def _activate_memory_target_kind(self, hint: dict, reason: str) -> str:
+        """Switch to the pending class selected by a matrix route hint."""
+        kind = str(hint.get("target_kind", self.target_kind))
+        if kind == self.target_kind:
+            return self.target_kind
+        previous = self.target_kind
+        self._set_pregrasp_target_kind(kind)
+        self.get_logger().info(
+            f"[order-select] matrix nearest switched kind={previous}->{kind} "
+            f"reason={reason} travel={float(hint['travel']):.2f}m")
+        return previous
 
     def _direct_retry_slot_supported(
             self, shelf: str, level: str, column: str) -> bool:
@@ -1006,11 +1075,16 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         if (not hint.get("hidden_fallback")
                 and column in {"1", "2", "3"}
                 and memory_direct_candidate_allowed(hint)
-                and confidence >= DYNAMIC_DIRECT_CONF_MIN
-                and self.configure_direct_slot_target(
-                    str(hint["shelf"]), str(hint["level"]), column,
-                    product_y=hint.get("world_y"),
-                    product_z=hint.get("world_z"))):
+                and confidence >= DYNAMIC_DIRECT_CONF_MIN):
+            previous_kind = self._activate_memory_target_kind(hint, reason)
+            accepted = self.configure_direct_slot_target(
+                str(hint["shelf"]), str(hint["level"]), column,
+                product_y=hint.get("world_y"),
+                product_z=hint.get("world_z"))
+            if not accepted:
+                if previous_kind != self.target_kind:
+                    self._set_pregrasp_target_kind(previous_kind)
+                return False
             self.scan_preferred_x = hint_x
             self.memory_active_hint = (
                 str(hint["shelf"]), str(hint["level"]))
@@ -1025,6 +1099,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
     def _apply_memory_hint(self, hint: dict, reason: str) -> str:
         if self._try_apply_direct_memory_hint(hint, reason):
             return "direct"
+        self._activate_memory_target_kind(hint, reason)
         hint_x = float(hint["x"])
         hint_z = float(hint["z"])
         self.configure_inventory_scan_hint(hint_x, hint_z)
@@ -1054,39 +1129,37 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             return
         shelf = shelf_for_scan_x(float(previous_x))
         self.memory_exhausted_shelves.add(shelf)
+        self.memory_exhausted_shelves_by_kind.setdefault(
+            self.target_kind, set()).add(shelf)
         self.memory_last_scan_station_x = current_x
         self.get_logger().info(
             f"[memory] shelf {shelf} fully scanned without localisation; "
             "suppressing dynamic revisit for this order")
 
     def _memory_route_tick(self) -> None:
-        if self.memory_file is None or self.state != pick.STATE_GO_SCAN:
+        if self.memory_file is None:
+            return
+        if self.state == pick.STATE_DIRECT_TRANSIT:
+            self._memory_direct_transit_conflict_tick()
+            return
+        if self.state != pick.STATE_GO_SCAN:
             return
         if self.target_world is not None:
             return
 
         if self.memory_failed_hint is not None:
-            failed_hint = self.memory_failed_hint
+            failed_kind, failed_hint = self.memory_failed_hint
             self.memory_failed_hint = None
-            self.memory_failed_hint_levels.add(failed_hint)
+            self.memory_failed_hint_levels_by_kind.setdefault(
+                failed_kind, set()).add(failed_hint)
+            if failed_kind == self.target_kind:
+                self.memory_failed_hint_levels.add(failed_hint)
             next_hint = self._select_live_memory_hint(reliable_only=True)
             if next_hint is not None:
-                # Snapshot 语义：提示层失败后只做“下一条矩阵证据”的扫描
-                # 直达（货架+层），不再原地展开全架扫描，也不直接跳槽位；
-                # 抓取前的 close-recheck 仍负责槽位复核。
-                hint_x = float(next_hint["x"])
-                hint_z = float(next_hint["z"])
-                self.configure_inventory_scan_hint(hint_x, hint_z)
-                self.memory_active_hint = (
-                    str(next_hint["shelf"]), str(next_hint["level"]))
-                self.scan_station_order = None
-                self.scan_index = 0
-                self.scan_pose_index = 0
-                self.scan_camera_ready_since = None
-                self.memory_last_scan_station_x = hint_x
-                self.get_logger().info(
-                    f"[memory] hint {failed_hint} failed; matrix failover "
-                    f"-> {self.memory_active_hint} x={hint_x:.3f}")
+                self._apply_memory_hint(
+                    next_hint,
+                    f"hint {failed_kind}:{failed_hint} failed; nearest "
+                    "pending failover")
                 return
             self.get_logger().info(
                 f"[memory] hint {failed_hint} failed; no reliable matrix "
@@ -1094,13 +1167,18 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
         self._update_memory_scan_progress()
         now = time.monotonic()
-        if (self.memory_rerouted
-                or now - self._memory_last_reroute_check < 0.25):
+        if now - self._memory_last_reroute_check < 0.25:
             return
         self._memory_last_reroute_check = now
+        # ``--dynamic-direct`` may change an in-flight goal only when the
+        # candidate already satisfies the same persistent-evidence contract
+        # as an order-start direct slot.  A weak/far first observation is a
+        # useful matrix hint, but must not redirect the route or turn a single
+        # trip into E -> guessed shelf -> real shelf.
         refreshed = self._select_live_memory_hint(
-            reliable_only=not self.dynamic_direct_enabled,
-            min_last_seen=self.memory_reroute_not_before)
+            reliable_only=True,
+            min_last_seen=self.memory_reroute_not_before,
+            require_direct=self.dynamic_direct_enabled)
         if refreshed is None:
             return
         current_x = (
@@ -1108,18 +1186,25 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             if self.scan_station_order is None
             and self.scan_preferred_x is not None
             else float(self.current_scan_station_x()))
-        if (self.dynamic_direct_enabled
-                and self._try_apply_direct_memory_hint(
-                    refreshed, "dynamic reroute")):
-            self.memory_rerouted = True
-            self.memory_reroute_not_before = time.time()
+        if self.dynamic_direct_enabled:
+            if self._try_apply_direct_memory_hint(
+                    refreshed, "dynamic reroute"):
+                self.memory_rerouted = True
+                self.memory_reroute_not_before = time.time()
+            # Dynamic-direct is intentionally direct-only.  If a candidate
+            # cannot become a concrete slot target, keep the current route;
+            # do not silently degrade it into a shelf-level scan reroute.
             return
 
         hint_shelf = str(refreshed.get("shelf", ""))
         current_shelf = shelf_for_scan_x(current_x)
+        hint_kind = str(refreshed.get("target_kind", self.target_kind))
+        exhausted_for_hint = getattr(
+            self, "memory_exhausted_shelves_by_kind", {}).get(
+                hint_kind, set())
         if (not hint_shelf
                 or hint_shelf == current_shelf
-                or hint_shelf in self.memory_exhausted_shelves
+                or hint_shelf in exhausted_for_hint
                 or abs(float(refreshed["x"]) - current_x) <= 0.40):
             return
         if not self.dynamic_direct_enabled:
@@ -1135,14 +1220,92 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.memory_rerouted = True
         self.memory_reroute_not_before = time.time()
 
+    def _memory_direct_transit_conflict_tick(self) -> None:
+        """Drop a direct target when the matrix reliably replaces its class."""
+        now = time.monotonic()
+        if now - self._memory_last_reroute_check < 0.25:
+            return
+        self._memory_last_reroute_check = now
+        slot_key = self.target_slot_key()
+        if slot_key is None:
+            return
+        document = read_memory_document(self.memory_file)
+        active_still_primary = any(
+            str(candidate.get("slot_key", "")) == slot_key
+            for candidate in primary_candidates_from_document(
+                document, self.target_kind))
+        if active_still_primary:
+            return
+        replacement_kind = None
+        for kind in self.opportunistic_target_kinds:
+            if kind == self.target_kind:
+                continue
+            if any(
+                    str(candidate.get("slot_key", "")) == slot_key
+                    and memory_direct_candidate_allowed(candidate)
+                    for candidate in primary_candidates_from_document(
+                        document, kind)):
+                replacement_kind = kind
+                break
+        # Mere disappearance is not enough to abandon a route; a stable,
+        # different pending class at the same slot is explicit stale-memory
+        # evidence and is safe to act on while still in transit.
+        if replacement_kind is None:
+            return
+
+        stale_kind = self.target_kind
+        self.excluded_slot_keys_by_kind.setdefault(
+            stale_kind, set()).add(slot_key)
+        self.target_marker_id = None
+        self.target_physical_marker_id = None
+        self.target_world = None
+        self.target_localisation_source = None
+        self.committed_slot = None
+        self.direct_slot_target_active = False
+        self.direct_transit_slot = None
+        self.direct_transit_started_at = None
+        self.memory_active_hint = None
+        self.memory_rerouted = False
+        self.set_state(pick.STATE_GO_SCAN)
+        next_hint = self._select_live_memory_hint(
+            reliable_only=True, require_direct=True)
+        self.get_logger().warn(
+            f"[order-select] in-transit matrix conflict slot={slot_key} "
+            f"expected={stale_kind} observed={replacement_kind}; dropping "
+            "stale target and selecting nearest pending item")
+        if next_hint is not None:
+            self._try_apply_direct_memory_hint(
+                next_hint, "in-transit stale-memory failover")
+
     def _restore_full_scan_after_inventory_hint(self) -> None:
         """Expose a failed matrix shelf/level to immediate route failover."""
         was_active = self.inventory_scan_hint_active
         failed_hint = self.memory_active_hint
         super()._restore_full_scan_after_inventory_hint()
         if was_active and failed_hint is not None:
-            self.memory_failed_hint = failed_hint
+            self.memory_failed_hint = (self.target_kind, failed_hint)
             self.memory_active_hint = None
+
+    def _recheck_fail(self) -> None:
+        """After a stale direct slot, choose another nearest pending item."""
+        missed_kind = self.target_kind
+        missed_slot = self.target_slot_key()
+        dynamic_was_enabled = bool(self.dynamic_direct_enabled)
+        super()._recheck_fail()
+        # A valid YOLO/depth fallback proceeds directly to grasp and must not
+        # be disturbed merely because optional ArUco was inconclusive.
+        if self.target_world is not None or self.state != pick.STATE_GO_SCAN:
+            return
+        if missed_slot is not None:
+            self.excluded_slot_keys_by_kind.setdefault(
+                missed_kind, set()).add(missed_slot)
+        self.dynamic_direct_enabled = dynamic_was_enabled
+        self.memory_rerouted = False
+        self.memory_reroute_not_before = time.time()
+        self._memory_last_reroute_check = 0.0
+        self.get_logger().warn(
+            f"[order-select] stale target dropped kind={missed_kind} "
+            f"slot={missed_slot}; selecting nearest remaining pending item")
 
     def _publish_perception_request(
             self, enabled: bool, force: bool = False) -> None:
@@ -3168,15 +3331,51 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             return False
         return now - self._place_base_settle_started_at >= PLACE_BASE_SETTLE_S
 
+    def _place_approach_stationary_ready(
+            self, now: float, arm_error: float, slide_error: float) -> bool:
+        """Accept a physically stationary loaded overhead pose.
+
+        The arm effort limit can leave one joint just outside the strict
+        command-settled tolerance even though all measured velocities are
+        zero.  Waiting for that error to disappear cannot make progress and
+        used to leave the final (fifth) delivery parked at the table.  Treat a
+        short, stationary, low-error interval as ready for XY refinement;
+        that stage works from measured TCP feedback and retains all release
+        safety gates.
+        """
+        if (not self._place_slide_target_sent
+                or now - self.place_t0 < PLACE_APPROACH_STATIONARY_MIN_AGE_S
+                or not math.isfinite(float(arm_error))
+                or float(arm_error) > PLACE_APPROACH_STATIONARY_ARM_ERROR_RAD
+                or not math.isfinite(float(slide_error))
+                or slide_error > PLACE_XY_STATIONARY_SLIDE_ERROR_M):
+            return False
+        sides = ("left",) if self.grasp_arm == "l" else ("right",)
+        arm_velocities = [
+            self.joint_velocities.get(f"{side}_arm_joint{index}")
+            for side in sides for index in range(1, 7)]
+        slide_velocity = self.joint_velocities.get("slide_joint")
+        if (slide_velocity is None
+                or any(value is None for value in arm_velocities)):
+            return False
+        return bool(
+            max(abs(float(value)) for value in arm_velocities)
+            <= PLACE_APPROACH_STATIONARY_ARM_RAD_S
+            and abs(float(slide_velocity))
+            <= PLACE_APPROACH_STATIONARY_SLIDE_VEL_MPS)
+
     def _place_refine_command_settled(
-            self, now: float, *, dual: bool) -> bool:
+            self, now: float, *, dual: bool) -> tuple[bool, bool]:
         """Finish a refine step by target error or measured standstill.
 
-        A loaded joint can legitimately stop short when its effort limit is
-        reached.  In that case Cartesian refinement must continue from the
-        measured TCP instead of waiting forever for an unreachable joint
-        target.  Standstill is accepted only after the command has had time
-        to start and all relevant measured velocities remain small.
+        Returns ``(settled, residual_standstill)``.  A loaded joint can stop
+        short when its effort limit is reached; the commanded pose is then
+        unreachable and retrying cannot make progress.  Standstill is
+        detected from the measured joint positions (negligible drift over a
+        short window) instead of the velocity topic, which reports ±0.1
+        rad/s on an effort-saturated but physically static joint.  When
+        ``residual_standstill`` is True the caller should stop retrying and
+        descend from the measured TCP if that pose is still slot-safe.
         """
         ready = (
             self.dual_commands_ready(
@@ -3187,50 +3386,58 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 slide_tolerance=PLACE_SLIDE_SETTLE_TOLERANCE_M))
         if ready:
             self._place_refine_motion_stable_since = None
-            return True
+            self._place_refine_motion_anchor = None
+            return True, False
         if (self._place_refine_target_sent_at is None
                 or now - self._place_refine_target_sent_at
                 < PLACE_XY_COMMAND_MIN_WAIT_S):
             self._place_refine_motion_stable_since = None
-            return False
-        sides = ("left", "right") if dual else (
-            ("left",) if self.grasp_arm == "l" else ("right",))
-        velocity_names = [
-            f"{side}_arm_joint{index}"
-            for side in sides for index in range(1, 7)]
-        arm_velocities = [
-            self.joint_velocities.get(name) for name in velocity_names]
+            self._place_refine_motion_anchor = None
+            return False, False
         slide_velocity = self.joint_velocities.get("slide_joint")
         measured_slide = self.joints.get("slide_joint")
-        if (slide_velocity is None or measured_slide is None
-                or any(value is None for value in arm_velocities)):
+        if slide_velocity is None or measured_slide is None:
             self._place_refine_motion_stable_since = None
-            return False
-        stationary = (
-            max(abs(float(value)) for value in arm_velocities)
-            <= PLACE_XY_STATIONARY_ARM_RAD_S
-            and abs(float(slide_velocity))
-            <= PLACE_XY_STATIONARY_SLIDE_MPS
-            and abs(float(measured_slide) - self.des_slide)
-            <= PLACE_XY_STATIONARY_SLIDE_ERROR_M)
-        if not stationary:
+            self._place_refine_motion_anchor = None
+            return False, False
+        if (abs(float(slide_velocity)) > PLACE_XY_STATIONARY_SLIDE_MPS
+                or abs(float(measured_slide) - self.des_slide)
+                > PLACE_XY_STATIONARY_SLIDE_ERROR_M):
             self._place_refine_motion_stable_since = None
-            return False
-        if self._place_refine_motion_stable_since is None:
+            self._place_refine_motion_anchor = None
+            return False, False
+        arm = (
+            np.concatenate([
+                self.arm_positions("left"),
+                self.arm_positions("right")])
+            if dual else self.selected_arm_positions())
+        if not np.all(np.isfinite(arm)):
+            self._place_refine_motion_stable_since = None
+            self._place_refine_motion_anchor = None
+            return False, False
+        if self._place_refine_motion_anchor is None:
+            self._place_refine_motion_anchor = arm.copy()
             self._place_refine_motion_stable_since = now
-            return False
+            return False, False
+        drift = float(np.max(
+            np.abs(arm - self._place_refine_motion_anchor)))
+        if drift > PLACE_XY_STATIONARY_ARM_POS_M:
+            self._place_refine_motion_anchor = arm.copy()
+            self._place_refine_motion_stable_since = now
+            return False, False
         if (now - self._place_refine_motion_stable_since
                 < PLACE_XY_STATIONARY_SETTLE_S):
-            return False
+            return False, False
         residual = self.dual_arm_error() if dual else self.selected_arm_error()
         self.get_logger().warn(
             "[place] refine actuator stationary with residual joint error; "
-            "continuing Cartesian correction from measured TCP "
+            "stopping retry and using the measured TCP "
             f"(dual={int(dual)} residual={residual:.4f}rad "
             f"slide_error="
             f"{abs(float(measured_slide) - self.des_slide):.4f}m)")
         self._place_refine_motion_stable_since = None
-        return True
+        self._place_refine_motion_anchor = None
+        return True, True
 
     def _place_timeout_fallback_safe(
             self, reference: np.ndarray | None) -> bool:
@@ -3295,6 +3502,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._place_refine_target_sent = True
         self._place_refine_target_sent_at = self.now()
         self._place_refine_motion_stable_since = None
+        self._place_refine_motion_anchor = None
         self._place_refine_iterations += 1
         self.get_logger().info(
             "[place] horizontal refine step "
@@ -3689,10 +3897,21 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             converged = self.commands_ready(
                 arm_tolerance=PLACE_ARM_SETTLE_TOLERANCE_RAD,
                 slide_tolerance=PLACE_APPROACH_SLIDE_TOLERANCE_M)
-            if converged:
+            stationary_ready = (
+                not converged
+                and self._place_approach_stationary_ready(
+                    now, arm_error, slide_error))
+            if converged or stationary_ready:
                 tcp = self.selected_tcp_world()
                 if tcp is None:
                     return
+                if stationary_ready:
+                    self.get_logger().warn(
+                        "[place] loaded arm reached a stationary overhead "
+                        "pose just outside strict tolerance; continuing "
+                        "with measured-pose XY refinement "
+                        f"arm_error={arm_error:.4f}rad "
+                        f"slide_error={slide_error:.4f}m")
                 self.get_logger().info(
                     f"[place] goods reached overhead pose "
                     f"elapsed={approach_elapsed:.2f}s "
@@ -3710,6 +3929,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 self._place_refine_started_at = now
                 self._place_refine_target_sent = False
                 self._place_refine_stable_since = None
+                self._place_refine_motion_anchor = None
                 self.commands_ready_since = None
             elif (self._place_arm_target_sent
                     and now - self._place_stage0_wait_log
@@ -3750,12 +3970,25 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     "horizontal place refinement timed out; keeping goods "
                     f"clamped after {PLACE_XY_REFINE_TIMEOUT_S:.1f}s")
             if self._place_refine_target_sent:
-                if not self._place_refine_command_settled(
-                        now, dual=False):
+                settled, residual_standstill = (
+                    self._place_refine_command_settled(
+                        now, dual=False))
+                if not settled:
                     return
                 self._place_refine_target_sent = False
                 self._place_refine_target_sent_at = None
                 self.commands_ready_since = None
+                if residual_standstill:
+                    tcp = self.selected_tcp_world()
+                    if (tcp is not None
+                            and self._place_timeout_fallback_safe(tcp)):
+                        self.get_logger().warn(
+                            "[place] refine target unreachable at the arm "
+                            "effort limit; measured TCP already over the "
+                            "assigned table slot; descending in place "
+                            f"tcp={np.round(tcp, 3)}")
+                        self._begin_single_place_descent(now, tcp)
+                        return
             tcp = self.selected_tcp_world()
             if tcp is None:
                 return
@@ -3884,6 +4117,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_t0 = self.now()
         self._place_refine_target_sent_at = self.place_t0
         self._place_refine_motion_stable_since = None
+        self._place_refine_motion_anchor = None
         self._place_approach_best_error = float("inf")
         self._place_approach_best_error_at = self.place_t0
         self.get_logger().info(
@@ -3978,6 +4212,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self._place_refine_started_at = now
             self._place_refine_target_sent = False
             self._place_refine_stable_since = None
+            self._place_refine_motion_anchor = None
             self._dual_place_target_sent = False
             self.commands_ready_since = None
             self.get_logger().info(
@@ -3992,12 +4227,26 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     "dual-arm horizontal place refinement timed out; "
                     "keeping tissue clamped")
             if self._dual_place_target_sent:
-                if not self._place_refine_command_settled(
-                        now, dual=True):
+                settled, residual_standstill = (
+                    self._place_refine_command_settled(
+                        now, dual=True))
+                if not settled:
                     return
                 self._dual_place_target_sent = False
                 self._place_refine_target_sent_at = None
                 self.commands_ready_since = None
+                if residual_standstill:
+                    release_world = self._dual_release_world()
+                    if (release_world is not None
+                            and self._place_timeout_fallback_safe(
+                                release_world)):
+                        self.get_logger().warn(
+                            "[place-dual] refine target unreachable at the "
+                            "arm effort limit; measured centre already over "
+                            "the assigned table slot; descending in place "
+                            f"centre={np.round(release_world, 3)}")
+                        self._begin_dual_place_descent(now, release_world)
+                        return
             release_world = self._dual_release_world()
             if release_world is None:
                 return
@@ -4697,13 +4946,16 @@ def parse_args() -> argparse.Namespace:
         "--exclude-slot-key", action="append", default=[],
         help="ignore a failed YOLO-only slot formatted as Lx|Shelf|Column")
     parser.add_argument(
+        "--exclude-kind-slot", action="append", default=[],
+        help="ignore a class-scoped failed slot formatted as KIND=Lx|Shelf|Column")
+    parser.add_argument(
         "--memory-file",
         help="runner-owned atomic memory-matrix JSON used for live routing")
     parser.add_argument(
         "--memory-confidence-threshold", type=float, default=0.90)
     parser.add_argument(
         "--dynamic-direct", action="store_true",
-        help="allow one fresh memory candidate to redirect this worker "
+        help="allow reliable fresh memory candidates to redirect this worker "
              "directly to a guarded fixed slot")
     parser.add_argument(
         "--perception-always-on", action="store_true",
@@ -4853,6 +5105,20 @@ def parse_args() -> argparse.Namespace:
             invalid_slots.append(value)
     if invalid_slots:
         parser.error(f"invalid memory slot keys: {invalid_slots}")
+    invalid_kind_slots = []
+    for value in args.exclude_kind_slot:
+        kind, separator, slot_key = str(value).partition("=")
+        parts = slot_key.split("|")
+        if (not separator
+                or kind not in pick.PRODUCT_CENTER_ABOVE_MARKER_M
+                or len(parts) != 3
+                or parts[0] not in {"L1", "L2", "L3"}
+                or parts[1] not in {"A", "B", "C", "D", "E"}
+                or parts[2] not in {"1", "2", "3"}):
+            invalid_kind_slots.append(value)
+    if invalid_kind_slots:
+        parser.error(
+            f"invalid class-scoped memory slots: {invalid_kind_slots}")
     return args
 
 
@@ -4923,6 +5189,11 @@ def main() -> int:
                 args.scan_start_x, args.scan_marker_z)
         controller.excluded_marker_ids = set(args.exclude_marker_id)
         controller.excluded_slot_keys = set(args.exclude_slot_key)
+        controller.excluded_slot_keys_by_kind = {}
+        for value in args.exclude_kind_slot:
+            kind, _, slot_key = str(value).partition("=")
+            controller.excluded_slot_keys_by_kind.setdefault(
+                kind, set()).add(slot_key)
         controller.configure_memory_routing(
             args.memory_file,
             args.memory_confidence_threshold,

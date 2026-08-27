@@ -118,11 +118,6 @@ class CompetitionRunner(Node):
         self.worker_stop_reason: str | None = None
         self.worker_terminate_at: float | None = None
         self.spawned_workers = 0
-        # Match wxj snapshot semantics: retries of the first logical order
-        # still use the normal E-side start.  Only after a different order is
-        # dispatched does no-hint full scanning switch permanently to A->E.
-        self.first_dispatched_order_id: str | None = None
-        self.after_first_order_started = False
         self.finished = False
         self.selected_memory_hint: dict | None = None
         self.immediate_retry_order_id: str | None = None
@@ -181,8 +176,6 @@ class CompetitionRunner(Node):
         self.task = incoming
         self.task_started_at = time.monotonic()
         self.spawned_workers = 0
-        self.first_dispatched_order_id = None
-        self.after_first_order_started = False
         self.finished = False
         run_dir = (
             Path(self.args.runtime_dir)
@@ -284,10 +277,15 @@ class CompetitionRunner(Node):
 
         same_order_drop_retry = (
             self.immediate_retry_order_id == order.id)
-        # Nearest/sequence selection belongs to the runner.  Letting a worker
-        # opportunistically change class after dispatch would invalidate the
-        # selected memory hint, retry bookkeeping and failed-slot ownership.
-        candidate_kinds = [order.kind]
+        # A worker still carries exactly one item, but before committing a
+        # grasp it may choose any pending order whose reliable matrix target
+        # is currently nearest.  _resolve_worker_order() accounts the result
+        # against the class actually delivered, so changing class here does
+        # not consume or retry the originally dispatched order by mistake.
+        candidate_kinds = (
+            [order.kind]
+            if self.args.grab_policy == "sequence"
+            else self._candidate_kinds_for(order))
         self.immediate_retry_order_id = None
         command = [
             sys.executable,
@@ -314,13 +312,17 @@ class CompetitionRunner(Node):
             for marker_id in self.task.excluded_markers(kind)
         })
         command.extend(marker_arguments(excluded_markers))
-        excluded_slots = sorted({
-            slot_key
+        excluded_slots_by_kind = {
+            kind: sorted(self.failed_memory_slots.get(kind, set()))
             for kind in candidate_kinds
-            for slot_key in self.failed_memory_slots.get(kind, set())
-        })
-        for slot_key in excluded_slots:
-            command.extend(["--exclude-slot-key", slot_key])
+            if self.failed_memory_slots.get(kind)
+        }
+        for kind, slot_keys in excluded_slots_by_kind.items():
+            for slot_key in slot_keys:
+                command.extend([
+                    "--exclude-kind-slot", f"{kind}={slot_key}"])
+        excluded_slots = set(
+            excluded_slots_by_kind.get(order.kind, ()))
         command.extend([
             "--memory-file", str(self.memory_path),
             "--memory-confidence-threshold",
@@ -335,9 +337,10 @@ class CompetitionRunner(Node):
             command.append("--no-close-recheck")
         if self.args.perception_always_on:
             command.append("--perception-always-on")
-        # 第一单交付后回 A 货架前停定（仅停定、不扫描），作为下一单起点；
-        # 最后一单仍以返回起始区优先。
-        return_west_after_place = place_slot == 0
+        # Do not pre-position the first delivery at shelf A.  The next worker
+        # starts from the actual delivery pose and lets the current matrix
+        # choose the nearest pending item.
+        return_west_after_place = False
         # The last pending order returns to the start pose after placement.
         remaining_pending = sum(
             1 for item in self.task.orders
@@ -345,8 +348,6 @@ class CompetitionRunner(Node):
         return_start_after_place = remaining_pending == 0
         if return_start_after_place:
             command.append("--return-start-after-place")
-        elif return_west_after_place:
-            command.append("--return-west-after-place")
         scan_hint_x = None
         scan_marker_z = None
         direct_hint = None
@@ -379,18 +380,9 @@ class CompetitionRunner(Node):
             if world_z is not None:
                 command.extend([
                     "--memory-initial-product-z", str(world_z)])
-        # wxj snapshot semantics: the first logical order starts from E,
-        # including all of its retries.  Once a different order starts, every
-        # later no-hint full scan starts from the westmost shelf A.  A memory
-        # hint still takes precedence and routes directly to its shelf/level.
-        if self.first_dispatched_order_id is None:
-            self.first_dispatched_order_id = order.id
-        elif order.id != self.first_dispatched_order_id:
-            self.after_first_order_started = True
-        scan_start_west = (
-            self.after_first_order_started and scan_hint_x is None)
-        if scan_start_west:
-            command.append("--scan-start-west")
+        # With no memory hint, retain the worker's own nearest-station scan
+        # order.  In particular, the second trip is no longer forced to A.
+        scan_start_west = False
         if self.args.show:
             command.append("--show")
 
@@ -421,7 +413,7 @@ class CompetitionRunner(Node):
             f"persistent_perception={int(external_perception)} "
             f"single_item_candidates={candidate_kinds} "
             f"excluded_markers={excluded_markers} "
-            f"excluded_slots={excluded_slots}")
+            f"excluded_slots_by_kind={excluded_slots_by_kind}")
         try:
             self.worker = subprocess.Popen(
                 command,
