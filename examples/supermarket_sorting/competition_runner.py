@@ -155,7 +155,7 @@ class CompetitionRunner(Node):
             f"grab_policy={self.args.grab_policy} "
             f"record_everywhere={int(self.args.record_everywhere)} "
             f"dynamic_direct={int(self.args.dynamic_direct)} "
-            f"close_recheck={int(self.args.close_recheck)} "
+            f"no_close_recheck={int(self.args.no_close_recheck)} "
             "perception_always_on="
             f"{int(self.args.perception_always_on)}")
         self._publish_perception_enabled(False)
@@ -328,18 +328,17 @@ class CompetitionRunner(Node):
         ])
         if self.args.dynamic_direct:
             command.append("--dynamic-direct")
-        # 默认关闭抓前 close-recheck：记忆直达/扫描命中后直接 ALIGN→grasp，
-        # 流程更丝滑；需要恢复核验时用 --close-recheck 重新开启（代码保留）。
-        if not self.args.close_recheck:
+        # 正式链路默认开启抓前 close-recheck（ArUco + 类别复核），符合
+        # “每次实际抓取前重新确认 ArUco ID 和商品类别”的规则建议；需要
+        # 更丝滑的流程时用 --no-close-recheck 显式关闭（代码保留）。
+        if self.args.no_close_recheck:
             command.append("--no-close-recheck")
         if self.args.perception_always_on:
             command.append("--perception-always-on")
-        # The first physically delivered item always occupies slot zero.
-        # Keep that worker alive after placement so it returns to shelf A and
-        # records a stationary inventory sweep before the next order starts.
+        # 第一单交付后回 A 货架前停定（仅停定、不扫描），作为下一单起点；
+        # 最后一单仍以返回起始区优先。
         return_west_after_place = place_slot == 0
-        # The last pending order returns to the start pose after placement;
-        # this takes precedence over the shelf-A inventory return.
+        # The last pending order returns to the start pose after placement.
         remaining_pending = sum(
             1 for item in self.task.orders
             if item.status == "pending" and item.id != order.id)
@@ -456,8 +455,8 @@ class CompetitionRunner(Node):
         直达槽位必须重新从主证据（primary_candidates）选择，而不是沿用
         订单排序时的混合提示：被同格其他品类盖住的历史候选（hidden
         fallback）绝不直达，避免追着误检/旧记录跑。纸巾三列均由双臂
-        抓取流程支持。与 snapshot 初始直达一致，不再额外要求置信度
-        门槛——primary 主证据本身已含多帧确认与样本数门槛。
+        抓取流程支持。共享选择器会额外执行直达专用的持续证据门槛，并在
+        稳定证据分档后才比较路程，避免少量近处误检抢占具体槽位。
         """
         memory_candidates, observer_xy = (
             self.memory_tracker.routing_snapshot(order.kind))
@@ -1052,11 +1051,9 @@ def parse_args() -> argparse.Namespace:
         help="allow a worker to use a fresh in-run memory candidate for one "
              "guarded direct-slot reroute")
     parser.add_argument(
-        "--close-recheck", action="store_true",
-        help="re-enable close-range class verification before grasp "
-             "(default off: the grasp flow skips close-recheck for a "
-             "smoother ALIGN->grasp sequence; the recheck code is retained "
-             "and can be turned back on with this flag)")
+        "--no-close-recheck", action="store_true",
+        help="disable close-range ArUco/class re-verification before grasp "
+             "(default: recheck is enabled)")
     parser.add_argument(
         "--perception-always-on", action="store_true",
         help="keep persistent or worker-local perception enabled throughout "

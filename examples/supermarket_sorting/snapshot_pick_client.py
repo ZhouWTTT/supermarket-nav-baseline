@@ -2001,7 +2001,10 @@ def main() -> None:
                 pass
         if args.show:
             import cv2
-            cv2.destroyAllWindows()
+            try:
+                cv2.destroyAllWindows()
+            except Exception:  # noqa: BLE001 - headless OpenCV lacks HighGUI
+                pass
 
 
 if __name__ == "__main__":

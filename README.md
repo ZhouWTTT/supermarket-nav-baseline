@@ -57,6 +57,21 @@ python3 gui_launcher_continuous.py
 正式比赛入口（任务话题驱动、带完整放桌流程）仍可通过 `scripts/run_baseline.sh`
 运行，两者互不影响。
 
+## competition_runner GUI
+
+宿主机运行项目根目录的 `gui_competition_runner.py` 可一键启动官方仿真
+Server 与正式比赛入口（与 `scripts/run_baseline.sh` 同一入口）：
+
+```bash
+python3 gui_competition_runner.py
+```
+
+界面支持随机/手填任务、扫描轮数、超时、设备等参数，并实时显示 Server /
+Runner 日志、记忆矩阵和比赛摘要。Runner 产物写入
+`logs/competition_runner/<run_prefix>/`。需要宿主机已安装
+python3 + tkinter + docker，且本机存在官方 final 镜像
+（`.../supermarket_sorting_final:server` / `:client`）。
+
 ## Submission image
 
 The same entry can be packaged on top of the organizer's Client image:
