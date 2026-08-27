@@ -49,6 +49,7 @@ from memory_matrix import (  # noqa: E402
     STATION_Y_MAX,
     STATION_Y_MIN,
     candidates_from_document,
+    memory_direct_candidate_allowed,
     primary_candidates_from_document,
     read_memory_document,
     select_memory_route_hint,
@@ -63,6 +64,7 @@ from supermarket_navigation import (  # noqa: E402  (baseline nav, unmodified)
     DELIVERY_TRUNK_EXIT,
     DELIVERY_TABLE_COSTMAP_BOUNDS,
     DELIVERY_TABLE_XML_BOUNDS,
+    SHELF_APPROACH,
     START_POSE,
     SupermarketNavigator,
     WHOLE_BODY_KEEP_OUT_RADIUS,
@@ -197,7 +199,7 @@ PLACE_PRODUCT_BOTTOM_CLEARANCE_BY_KIND_M = {
 }
 PLACE_APPROACH_CLEARANCE_M = 0.060
 PLACE_DESCENT_SLIDE_STEP_M = 0.0015
-PLACE_BASE_SETTLE_S = 0.35
+PLACE_BASE_SETTLE_S = 0.20
 PLACE_ARM_SETTLE_TOLERANCE_RAD = 0.025
 PLACE_SLIDE_SETTLE_TOLERANCE_M = 0.004
 # stage0 overhead approach 的 slide 收敛容差。半高表回退后 release_z 目标
@@ -264,8 +266,10 @@ PLACE_CLEAR_TABLE_TIMEOUT_S = 15.0
 # hand-off made every shelf station spend roughly 15--20 s in low-speed trim.
 NAV_TRANSIT_GATE_M = 0.10
 NAV_PRECISE_HANDOFF_MARGIN_M = 0.02
-# Memory-slot routing terminates at the same pose envelope used by ALIGN, so
-# the obstacle-aware leg itself is the final base motion before grasping.
+# Final direct-slot precision.  The obstacle-aware navigator deliberately
+# keeps its 0.10 m terminal envelope; the short shelf-local controller closes
+# the remaining error to this tolerance without asking A* to resolve a pose
+# more finely than its occupancy grid.
 DIRECT_GRASP_POSITION_TOLERANCE_M = 0.025
 NAV_LASER_STALE_S = 0.50           # fail safe if the 12 Hz scan stops
 NAV_STATE_STALE_S = 0.50           # odom/joints must also remain live
@@ -299,6 +303,14 @@ DYNAMIC_DIRECT_CONF_MIN = 0.70
 # the end of the parent grasp state machine.
 BACKUP_SPEED_MPS = 0.30
 BACKUP_TIMEOUT_S = 8.0
+# Clear the shelf straight first, then fold a small part of the delivery turn
+# into the remainder of the reverse.  The bounded angle keeps the loaded arm's
+# swept volume close to the already-safe straight-withdrawal corridor; the
+# normal obstacle-aware navigator still owns the rest of the turn and route.
+BACKUP_TURN_CLEARANCE_M = 0.08
+BACKUP_TURN_MAX_ANGLE_RAD = math.radians(12.0)
+BACKUP_TURN_GAIN = 2.0
+BACKUP_TURN_MAX_RPS = 0.30
 # Heweidao can slide in the fingers during the first delivery turn while it is
 # still settling after grasp.  Limit only that product and loaded interval;
 # every other product and all later delivery/return turns retain the normal
@@ -359,6 +371,13 @@ PLACE_BASE_TO_SLOT_LONGITUDINAL_M = 0.62
 PLACE_CREEP_GOAL_TOLERANCE_M = 0.01
 PLACE_CREEP_YAW_GAIN = 2.0
 PLACE_CREEP_MAX_ANGULAR_RPS = 0.30
+# The overhead IK target can be solved against the deterministic end pose of
+# the final creep.  Starting that loaded-arm motion while the base covers its
+# last centimetres removes a serial wait without lowering the product during
+# chassis motion.  The target is solved again against measured odometry after
+# the base settles, so creep/lidar tolerances cannot shift the release slot.
+PLACE_PARALLEL_SLIDE_ARM_ERROR_RAD = 0.20
+PLACE_PARALLEL_SLIDE_MIN_BOTTOM_CLEARANCE_M = 0.12
 # The parent limiter permits 0.022 rad every 20 ms (about 1.1 rad/s) and can
 # apply that full step as soon as placement starts.  Ramp the loaded arm from
 # rest and cap it at the gentler shelf-contact rate so the held product is not
@@ -391,6 +410,11 @@ SPHERE_TRANSPORT_HELD_MINIMUM = {
 }
 PLACE_RELEASE_TABLE_MARGIN_M = 0.04
 PLACE_APPROACH_HARD_TIMEOUT_S = 30.0
+# 纸巾双臂 overhead 阶段若被顶住（slide stall 且接触几何无法验证），
+# 原来的 30s 会在“slide stall rejected”循环里空等约 27s；缩短到 10s，
+# 尽早触发“原地下降+释放”兜底（该兜底实测 ~3s 内完成），减少放置
+# 后的长时间停顿。仅影响双臂（zhijin）放置，单臂仍用 30s。
+DUAL_TISSUE_APPROACH_HARD_TIMEOUT_S = 10.0
 PLACE_APPROACH_PROGRESS_LOG_S = 2.0
 # 慢速仿真/高负载下载货摆臂可能超过旧的 15 s 上限但仍在正常收敛。硬超时
 # 只作为最终上限：超过后若手臂误差仍在改善（窗口内改善 ≥ 阈值）就继续等，
@@ -462,8 +486,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             place_y: float = DELIVERY_TABLE_PLACE_WORLD[1],
             place_z: float = DELIVERY_TABLE_PLACE_WORLD[2],
             place_slot: int | None = None,
-            place_release_dwell_s: float = 2.0,
-            place_retreat_dwell_s: float = 1.0,
+            place_release_dwell_s: float = 1.0,
+            place_retreat_dwell_s: float = 0.5,
             nav_during_scan: bool = True,
             backup_after_grab_m: float = 0.20,
             place_creep_m: float = PLACE_CREEP_DISTANCE_M,
@@ -574,6 +598,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._place_ik_attempted = False
         self._place_arm_target_sent = False
         self._place_slide_target_sent = False
+        self._place_creep_preposition_attempted = False
+        self._place_creep_preposition_started = False
+        self._place_creep_preposition_finalized = False
         self._place_base_settle_started_at = None
         self._place_base_reference_xy = None
         self._place_base_reference_yaw = None
@@ -604,6 +631,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._place_loaded_arm_step_rad = 0.0
         self._backup_start_xy = None
         self._backup_start_yaw = 0.0
+        self._backup_turn_target_yaw = None
         self._backup_t0 = 0.0
         self._backup_logged = False
         self._height_restore_t0 = 0.0
@@ -862,6 +890,23 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             min_last_seen=min_last_seen,
             reliable_only=reliable_only)
 
+    def _direct_retry_slot_supported(
+            self, shelf: str, level: str, column: str) -> bool:
+        """Only retry columns currently backed by stable target evidence."""
+        if self.memory_file is None:
+            return False
+        document = read_memory_document(self.memory_file)
+        wanted_key = f"{level}|{shelf}|{column}"
+        for candidate in primary_candidates_from_document(
+                document, self.target_kind):
+            if (str(candidate.get("slot_key", "")) == wanted_key
+                    and memory_direct_candidate_allowed(candidate)):
+                return True
+        self.get_logger().info(
+            f"[direct-slot-retry] skip unsupported matrix slot "
+            f"{shelf}-{level}-{column} kind={self.target_kind}")
+        return False
+
     def configure_direct_slot_target(
             self, shelf: str, level: str, column: str,
             marker_id: int | None = None,
@@ -902,12 +947,12 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         return True
 
     def advance_direct_transit(self) -> None:
-        """单趟精直达记忆槽位抓取位，停稳即抓（即停即抓）。
+        """直达记忆槽位抓取位，最终停稳后立即复核/抓取。
 
-        障碍导航从起点直接收敛到 ALIGN 的 0.025m / 0.035rad 位姿包络，
-        到站后不再进入第二次 ALIGN 慢速对位：默认直接进入抓取停稳门控；
-        若开启了 close-recheck 则先做近距核验。父级 configure_grasp 的
-        retry / base-nudge 仍会回退 STATE_ALIGN 兜底。
+        长距离段由障碍导航收敛到稳定的 0.10m 货架包络，最后几厘米在
+        同一个 DIRECT_TRANSIT 状态内交给货架局部控制器完成。这样不会
+        把 2.5cm 精度强塞给栅格规划器，也不会重新进入一次 ALIGN 状态；
+        close-recheck 关闭时仍然是到最终站位、停稳、直接抓取。
         """
         if self.target_world is None or self.direct_transit_slot is None:
             raise RuntimeError(
@@ -959,10 +1004,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         column = str(hint.get("column", ""))
         confidence = float(hint.get("confidence", 0.0) or 0.0)
         # Snapshot 直达门槛：隐藏历史候选不直达；纸巾三列均由双臂流程
-        # 支持；动态直达还需置信度门槛。close-recheck 由调用方按需开启
+        # 支持；动态直达还需持续证据与置信度门槛。close-recheck 由调用方按需开启
         # （关闭时不再作为直达的强制前置条件，抓取直接进入 ALIGN→grasp）。
         if (not hint.get("hidden_fallback")
                 and column in {"1", "2", "3"}
+                and memory_direct_candidate_allowed(hint)
                 and confidence >= DYNAMIC_DIRECT_CONF_MIN
                 and self.configure_direct_slot_target(
                     str(hint["shelf"]), str(hint["level"]), column,
@@ -1304,7 +1350,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
     def _scan_trunk_route_tick(
             self, target: np.ndarray, final_yaw: float) -> bool:
-        """Drive directly to a shelf station in one live-planned leg.
+        """Drive to the baseline shelf-approach line in one planned leg.
 
         The multi-stage delivery-trunk routing (table -> trunk exit ->
         trunk entry -> shelf) is removed: with five random corridor boxes per
@@ -1316,43 +1362,40 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         """
         final_goal = (
             float(target[0]), float(target[1]), float(final_yaw))
+        # The baseline navigation map defines y=2.40 as the obstacle-aware
+        # shelf approach line.  Manipulation targets are 7--15 cm farther
+        # north and intentionally sit outside the global planner's remit.
+        # Preserve the target column X, but make A* terminate on that safe
+        # line; drive_to then performs the short measured shelf-local advance.
+        shelf_approach_y = float(SHELF_APPROACH["A"][1])
+        route_goal = (
+            final_goal[0], min(final_goal[1], shelf_approach_y),
+            final_goal[2])
         self.scan_route_final_goal = final_goal
         if self.scan_trunk_route_done:
             return True
 
         if self.scan_trunk_route_stage is None:
             self.scan_trunk_route_stage = "direct_to_shelf"
-            precise_handoff = self.state == pick.STATE_DIRECT_TRANSIT
             self.get_logger().info(
                 "[route] single direct leg to shelf station goal="
-                f"({final_goal[0]:.2f},{final_goal[1]:.2f},"
-                f"{math.degrees(final_goal[2]):.0f}deg) "
-                f"precise_handoff={int(precise_handoff)}")
+                f"({route_goal[0]:.2f},{route_goal[1]:.2f},"
+                f"{math.degrees(route_goal[2]):.0f}deg) "
+                f"final=({final_goal[0]:.2f},{final_goal[1]:.2f}) "
+                "terminal=coarse_then_local")
             self._start_route_leg(
-                "scan_direct_to_shelf", final_goal,
-                use_memory=False,
-                position_tolerance=(
-                    DIRECT_GRASP_POSITION_TOLERANCE_M
-                    if precise_handoff else None),
-                yaw_tolerance=(
-                    pick.NAV_YAW_DEADBAND_RAD
-                    if precise_handoff else None))
+                "scan_direct_to_shelf", route_goal,
+                use_memory=False)
             return False
 
         if (self.scan_trunk_route_stage == "direct_to_shelf"
                 and self._route_leg_goal is not None
                 and np.linalg.norm(
-                    np.asarray(self._route_leg_goal[:2]) - target) > 0.05):
-            precise_handoff = self.state == pick.STATE_DIRECT_TRANSIT
+                    np.asarray(self._route_leg_goal[:2])
+                    - np.asarray(route_goal[:2])) > 0.05):
             self._start_route_leg(
-                "scan_direct_to_shelf", final_goal,
-                use_memory=False,
-                position_tolerance=(
-                    DIRECT_GRASP_POSITION_TOLERANCE_M
-                    if precise_handoff else None),
-                yaw_tolerance=(
-                    pick.NAV_YAW_DEADBAND_RAD
-                    if precise_handoff else None))
+                "scan_direct_to_shelf", route_goal,
+                use_memory=False)
 
         reached, failure = self._route_leg_tick()
         if failure is not None:
@@ -1366,13 +1409,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._route_leg_goal = None
         self._nav_goal = None
         return True
-        return False
 
     # ------------------------------------------------------------------
-    # drive_to override — normal scan transit retains the coarse navigator +
-    # parent final trim.  Direct memory-slot transit gives the navigator the
-    # grasp tolerance, so that route reaches the final pose without a second
-    # base adjustment.
+    # drive_to override — shelf transit uses one obstacle-aware coarse leg,
+    # followed by the parent's short local trim.  The second stage is a
+    # continuous controller hand-off, not another route or ALIGN state.
     # ------------------------------------------------------------------
     def drive_to(self, target_xy, final_yaw: float,
                  position_tolerance: float = 0.055,
@@ -1383,6 +1424,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                      pick.NAV_TRANSLATE_ANGULAR_MAX_RADPS)) -> bool:
         target = np.asarray(target_xy, dtype=float)
         distance = float(np.linalg.norm(target - self.base_xy))
+        shelf_transit = self._is_shelf_scan_transit(target)
 
         # A previous delivery may leave the chassis inside the conservative
         # whole-body table keep-out.  The normal navigator correctly forbids
@@ -1444,11 +1486,12 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 f"delivery-table startup escape complete; "
                 f"clearance={table_clearance:.3f}m")
 
-        if self._is_shelf_scan_transit(target):
+        if shelf_transit:
             if not self._scan_trunk_route_tick(target, final_yaw):
                 return False
 
         if (self.nav_during_scan
+                and not shelf_transit
                 and distance > max(NAV_TRANSIT_GATE_M,
                                    position_tolerance
                                    + NAV_PRECISE_HANDOFF_MARGIN_M)):
@@ -1458,7 +1501,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 self._nav_goal = goal
                 self.nav.set_goal(
                     *goal,
-                    use_path_memory=not self._is_shelf_scan_transit(target))
+                    use_path_memory=True)
                 self._nav_last_log = 0.0
                 self._nav_memory_logged = False
                 self.get_logger().info(
@@ -1583,11 +1626,24 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self._set_flow_phase("backup")
             self._backup_start_xy = self.base_xy.copy()
             self._backup_start_yaw = float(self.base_yaw)
+            delivery_goal = self._delivery_slot_goal()
+            delivery_heading = math.atan2(
+                float(delivery_goal[1]) - float(self.base_xy[1]),
+                float(delivery_goal[0]) - float(self.base_xy[0]))
+            delivery_turn = pick.wrap_to_pi(
+                delivery_heading - self._backup_start_yaw)
+            bounded_delivery_turn = float(np.clip(
+                delivery_turn,
+                -BACKUP_TURN_MAX_ANGLE_RAD,
+                BACKUP_TURN_MAX_ANGLE_RAD))
+            self._backup_turn_target_yaw = pick.wrap_to_pi(
+                self._backup_start_yaw + bounded_delivery_turn)
             self._backup_t0 = self.now()
             self._backup_logged = False
             self.get_logger().info(
                 f"[flow] backing up {self.backup_after_grab_m:.2f}m "
-                "before delivery rotation")
+                "with a bounded delivery turn after shelf clearance "
+                f"target_delta={math.degrees(bounded_delivery_turn):.1f}°")
             return
         self._start_height_restore()
 
@@ -1697,12 +1753,13 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         return self._delivery_slot_goal()
 
     def _backup_tick(self) -> None:
-        """Reverse along the grasp heading while holding the current yaw."""
+        """Clear the shelf straight, then reverse through a bounded arc."""
         now = self.now()
         self.des_slide = self._transit_slide_target()
         if self._backup_start_xy is None:
             self._backup_start_xy = self.base_xy.copy()
             self._backup_start_yaw = float(self.base_yaw)
+            self._backup_turn_target_yaw = self._backup_start_yaw
             self._backup_t0 = now
 
         heading = np.array([
@@ -1720,8 +1777,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self.set_twist(0.0, 0.0)
             self.cmd_linear = 0.0
             self.cmd_angular = 0.0
+            turned_deg = math.degrees(pick.wrap_to_pi(
+                self.base_yaw - self._backup_start_yaw))
             message = (
                 f"[flow] backup finished (moved={moved_back:.3f}m, "
+                f"turned={turned_deg:.1f}°, "
                 f"elapsed={elapsed:.1f}s); verifying transit height")
             if timed_out and not reached:
                 self.get_logger().warn(message + " after timeout")
@@ -1730,14 +1790,26 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self._start_height_restore()
             return
 
-        angular = float(np.clip(2.0 * yaw_err, -0.6, 0.6))
+        if (moved_back >= BACKUP_TURN_CLEARANCE_M
+                and self._backup_turn_target_yaw is not None):
+            yaw_err = pick.wrap_to_pi(
+                self._backup_turn_target_yaw - self.base_yaw)
+            angular = float(np.clip(
+                BACKUP_TURN_GAIN * yaw_err,
+                -BACKUP_TURN_MAX_RPS,
+                BACKUP_TURN_MAX_RPS))
+        else:
+            # Preserve the original straight withdrawal until the protruding
+            # product and arm have cleared the shelf face.
+            angular = float(np.clip(2.0 * yaw_err, -0.6, 0.6))
         self.set_twist(-BACKUP_SPEED_MPS, angular)
         if not self._backup_logged and elapsed >= 1.0:
             self._backup_logged = True
             self.get_logger().info(
                 f"[backup] dist={moved_back:.3f}/"
                 f"{self.backup_after_grab_m:.2f}m "
-                f"yaw_err={math.degrees(yaw_err):.1f}°")
+                f"yaw_err={math.degrees(yaw_err):.1f}° "
+                f"turn_active={int(moved_back >= BACKUP_TURN_CLEARANCE_M)}")
 
     def _nav_to_delivery_tick(self) -> None:
         now = self.now()
@@ -2669,7 +2741,120 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             "stopping descent and releasing in place tcp="
             f"{None if tcp is None else np.round(tcp, 3)}")
 
-    def _compute_place_arm_joints(self) -> np.ndarray | None:
+    def _projected_place_creep_pose(self) -> tuple[np.ndarray, float]:
+        """Predict the deterministic base pose at the end of final creep."""
+        if self.place_creep_start_y is None:
+            self.place_creep_start_y = float(self.base_xy[1])
+        distance_cap_y = (
+            float(self.place_creep_start_y) - float(self.place_creep_m))
+        slot_stop_y = (
+            float(self.place_world[1])
+            + PLACE_BASE_TO_SLOT_LONGITUDINAL_M
+            + PLACE_CREEP_GOAL_TOLERANCE_M)
+        # Facing south, the first (larger) Y threshold reached terminates the
+        # creep.  X is not commanded during this short segment.
+        projected_xy = np.array([
+            float(self.base_xy[0]), max(distance_cap_y, slot_stop_y)],
+            dtype=float)
+        return projected_xy, -math.pi / 2.0
+
+    def _command_loaded_place_arm(
+            self, now: float, *, projected_base_pose: tuple | None,
+            phase_label: str) -> bool:
+        """Solve and command the loaded single arm while slide stays high."""
+        self.place_arm_joints = self._compute_place_arm_joints(
+            projected_base_pose=projected_base_pose)
+        if self.place_arm_joints is None:
+            return False
+        self.des_slide = self._transit_slide_target()
+        self.set_selected_arm_target(self.place_arm_joints)
+        self._place_slide_target_sent = False
+        self.place_t0 = now
+        self._place_stage0_wait_log = 0.0
+        self._place_approach_best_error = float("inf")
+        self._place_approach_best_error_at = now
+        if not self._place_arm_target_sent:
+            self._place_loaded_arm_step_rad = 0.0
+        self._place_arm_target_sent = True
+        loaded_arm_max_step = PLACE_LOADED_ARM_MAX_STEP_BY_KIND_RAD.get(
+            self.target_kind, PLACE_LOADED_ARM_MAX_STEP_RAD)
+        self.get_logger().info(
+            f"[place] {phase_label}; slide remains at transport height; "
+            f"loaded-arm soft start max_step={loaded_arm_max_step:.4f}rad/"
+            "tick")
+        self.get_logger().info(
+            "[place-joints] motion_start="
+            + json.dumps(
+                self._place_joint_snapshot(), ensure_ascii=False,
+                separators=(",", ":")))
+        return True
+
+    def _maybe_start_place_creep_preposition(self, now: float) -> None:
+        """Start single-arm overhead positioning during the final creep."""
+        if (self.use_dual_tissue_grasp
+                or self.place_creep_done
+                or self._place_creep_preposition_attempted):
+            return
+        self._place_creep_preposition_attempted = True
+        projected_pose = self._projected_place_creep_pose()
+        if self._command_loaded_place_arm(
+                now, projected_base_pose=projected_pose,
+                phase_label="parallel arm pre-position started during creep"):
+            self._place_creep_preposition_started = True
+            self.get_logger().info(
+                "[place] projected creep endpoint="
+                f"({projected_pose[0][0]:.3f},"
+                f"{projected_pose[0][1]:.3f},"
+                f"{math.degrees(projected_pose[1]):.1f}°); "
+                "base and loaded arm may now move in parallel")
+            return
+
+        # A projected-pose miss is not a placement failure.  The measured
+        # settled pose remains authoritative and gets the normal IK attempt.
+        self._place_ik_attempted = False
+        self.place_arm_joints = None
+        self.get_logger().warn(
+            "[place] projected creep-end IK unavailable; deferring arm "
+            "positioning until measured base settle")
+
+    def _finalize_place_creep_preposition(self, now: float) -> None:
+        """Re-solve against settled odometry before any slide descent."""
+        if (not self._place_creep_preposition_started
+                or self._place_creep_preposition_finalized):
+            return
+        self._place_ik_attempted = False
+        self.place_arm_joints = None
+        if not self._command_loaded_place_arm(
+                now, projected_base_pose=None,
+                phase_label=(
+                    "parallel pre-position refined at measured base pose")):
+            raise RuntimeError(
+                "place IK failed at settled base after creep pre-position; "
+                "refusing to release goods off-table")
+        self._place_creep_preposition_finalized = True
+
+    def _place_parallel_slide_safe(self, arm_error: float) -> bool:
+        """Whether the near-final arm is in a safe vertical descent corridor."""
+        if (not math.isfinite(float(arm_error))
+                or arm_error > PLACE_PARALLEL_SLIDE_ARM_ERROR_RAD):
+            return False
+        reference = self._held_product_reference_world()
+        if (reference is None
+                or not self._tcp_over_delivery_table(reference)):
+            return False
+        bottom_z = (
+            float(reference[2])
+            - self._place_tcp_offset()
+            - self._placement_product_half_height())
+        return bool(
+            math.isfinite(bottom_z)
+            and bottom_z
+            >= (DELIVERY_TABLE_TOP_Z_M
+                + PLACE_PARALLEL_SLIDE_MIN_BOTTOM_CLEARANCE_M))
+
+    def _compute_place_arm_joints(
+            self, *, projected_base_pose: tuple | None = None
+    ) -> np.ndarray | None:
         """Solve an approach pose with enough slide travel for a low release.
 
         The numeric IK depends heavily on the reference joints.  Start from
@@ -2734,7 +2919,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                         continue
                     world = np.array([x, y, z], dtype=float)
                     for ref_source, ref in refs:
-                        joints = self._solve_place_world(world, ref, slide)
+                        joints = self._solve_place_world(
+                            world, ref, slide,
+                            projected_base_pose=projected_base_pose)
                         if joints is None:
                             continue
                         comparison = {}
@@ -2743,7 +2930,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                                 other_joints = joints
                             else:
                                 other_joints = self._solve_place_world(
-                                    world, other_ref, slide)
+                                    world, other_ref, slide,
+                                    projected_base_pose=projected_base_pose)
                             if other_joints is None:
                                 comparison[other_source] = None
                                 continue
@@ -2798,6 +2986,13 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                                 "grip_command": self._transport_grip_command,
                                 "measured_grip": (
                                     self.selected_gripper_position()),
+                                "projected_base_pose": (
+                                    None if projected_base_pose is None
+                                    else self._rounded_list(np.concatenate((
+                                        np.asarray(
+                                            projected_base_pose[0],
+                                            dtype=float),
+                                        [float(projected_base_pose[1])])))),
                             }, ensure_ascii=False, separators=(",", ":")))
                         return joints
 
@@ -2808,7 +3003,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
     def _solve_place_world(
             self, world: np.ndarray, reference: np.ndarray,
-            slide: float) -> np.ndarray | None:
+            slide: float, *, projected_base_pose: tuple | None = None
+    ) -> np.ndarray | None:
         """Solve the selected arm to ``world`` at a given slide height."""
         target = np.eye(4)
         if self.target_kind == "heweidao":
@@ -2816,7 +3012,19 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             # ——宽口朝下接触桌面，松爪后夹爪直接从窄底脱离，不再需要
             # "开爪后底盘水平抽离"。(绕 y 轴腕轴翻滚会导致放置 IK 无解)
             target[:3, :3] = pick.Rotation.from_euler("x", math.pi).as_matrix()
-        target[:3, 3] = self.world_to_footprint(world)
+        if projected_base_pose is None:
+            target[:3, 3] = self.world_to_footprint(world)
+        else:
+            projected_xy, projected_yaw = projected_base_pose
+            delta = np.asarray(world, dtype=float) - np.array([
+                float(projected_xy[0]), float(projected_xy[1]), 0.0])
+            cosine = math.cos(-float(projected_yaw))
+            sine = math.sin(-float(projected_yaw))
+            target[:3, 3] = np.array([
+                cosine * delta[0] - sine * delta[1],
+                sine * delta[0] + cosine * delta[1],
+                delta[2],
+            ])
         reference = np.asarray(reference, dtype=float)
         ref_with_slide = np.concatenate(([slide], reference))
         try:
@@ -3250,7 +3458,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self.des_left_arm,
             self.des_right_arm,
             release_outward_m,
-            pick.DUAL_TISSUE_SQUEEZE_SPEED_MPS,
+            pick.DUAL_TISSUE_RELEASE_SPEED_MPS,
             self.state,
             require_convergence=True)
         self.get_logger().info(
@@ -3408,47 +3616,23 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             return
 
         if self.place_stage == 0:
-            # Stop and settle the chassis, then move to a safe overhead pose.
+            # Solve against the deterministic creep endpoint and begin the
+            # loaded-arm motion while the chassis covers its final short
+            # segment.  Slide remains at transport height throughout base
+            # motion.  Settled odometry is authoritative and is re-solved
+            # below before any descent.
+            self._maybe_start_place_creep_preposition(now)
             if not self._advance_place_creep():
                 return
             if not self._place_base_settled(now):
                 return
+            self._finalize_place_creep_preposition(now)
             if self.place_arm_joints is None:
-                self.place_arm_joints = self._compute_place_arm_joints()
-                if self.place_arm_joints is not None:
-                    # Send once — set_selected_arm_target resets
-                    # commands_ready_since, so calling it every tick would
-                    # prevent the settling gate from ever passing.
-                    self.set_selected_arm_target(self.place_arm_joints)
-                    # Keep the carried product high while the loaded arm
-                    # changes IK branches.  Moving the arm and lowering the
-                    # slide together can make the intermediate TCP path dip
-                    # below the tabletop even though both endpoints are safe
-                    # (observed with a lower-shelf orange).  Once the arm is
-                    # pre-positioned, the slide provides a predictable purely
-                    # vertical approach to the overhead pose.
-                    self._place_slide_target_sent = False
-                    self.place_t0 = now
-                    self._place_stage0_wait_log = 0.0
-                    self._place_approach_best_error = float("inf")
-                    self._place_approach_best_error_at = now
-                    self._place_loaded_arm_step_rad = 0.0
-                    self._place_arm_target_sent = True
-                    loaded_arm_max_step = (
-                        PLACE_LOADED_ARM_MAX_STEP_BY_KIND_RAD.get(
-                            self.target_kind, PLACE_LOADED_ARM_MAX_STEP_RAD))
-                    self.get_logger().info(
-                        "[place] two-stage loaded approach enabled; arm first "
-                        "at transport height, then slow vertical slide; "
-                        "loaded-arm soft start "
-                        f"max_step={loaded_arm_max_step:.4f}rad/"
-                        "tick")
-                    self.get_logger().info(
-                        "[place-joints] motion_start="
-                        + json.dumps(
-                            self._place_joint_snapshot(),
-                            ensure_ascii=False, separators=(",", ":")))
-                else:
+                if not self._command_loaded_place_arm(
+                        now, projected_base_pose=None,
+                        phase_label=(
+                            "loaded arm positioning started after base "
+                            "settle")):
                     raise RuntimeError(
                         "place IK failed; refusing to release goods off-table")
             if (self._place_arm_target_sent
@@ -3459,7 +3643,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 # des_slide 与实测的差 > 容差而死锁（实测卡死：
                 # arm_error=0.0072rad 但 slide=0.0121 永不过 4mm 门）。
                 # slide 到位检查留给阶段 2（slide 命令发出之后）。
-                if arm_error <= PLACE_ARM_SETTLE_TOLERANCE_RAD:
+                parallel_slide_safe = self._place_parallel_slide_safe(
+                    arm_error)
+                if (arm_error <= PLACE_ARM_SETTLE_TOLERANCE_RAD
+                        or parallel_slide_safe):
                     self.des_slide = float(self.place_slide_cmd)
                     self._place_slide_target_sent = True
                     self.commands_ready_since = None
@@ -3467,10 +3654,18 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     self._place_approach_best_error = arm_error
                     self._place_approach_best_error_at = now
                     self._place_slide_stall_snapshot = None
-                    self.get_logger().info(
-                        "[place] loaded arm pre-positioned at transport "
-                        f"height; lowering slide vertically "
-                        f"{self.cmd_slide:.3f}->{self.des_slide:.3f}")
+                    if parallel_slide_safe:
+                        self.get_logger().info(
+                            "[place] arm entered verified table-overhead "
+                            "corridor; moving arm and slide in parallel "
+                            f"arm_error={arm_error:.4f}rad "
+                            f"slide={self.cmd_slide:.3f}->"
+                            f"{self.des_slide:.3f}")
+                    else:
+                        self.get_logger().info(
+                            "[place] loaded arm pre-positioned at transport "
+                            f"height; lowering slide vertically "
+                            f"{self.cmd_slide:.3f}->{self.des_slide:.3f}")
                 elif (now - self._place_stage0_wait_log
                         >= PLACE_APPROACH_PROGRESS_LOG_S):
                     self._place_stage0_wait_log = now
@@ -3765,12 +3960,13 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                                 self._dual_release_world()),
                             **self._place_base_diagnostic(),
                         }, ensure_ascii=False, separators=(",", ":")))
-                if (now - self.place_t0 >= PLACE_APPROACH_HARD_TIMEOUT_S
+                if (now - self.place_t0
+                        >= DUAL_TISSUE_APPROACH_HARD_TIMEOUT_S
                         and now - self._place_approach_best_error_at
                         >= PLACE_APPROACH_PROGRESS_GATE_S):
                     raise RuntimeError(
                         "dual-arm overhead pose did not settle within "
-                        f"{PLACE_APPROACH_HARD_TIMEOUT_S:.0f}s")
+                        f"{DUAL_TISSUE_APPROACH_HARD_TIMEOUT_S:.0f}s")
                 return
             release_world = self._dual_release_world()
             if release_world is None:
@@ -4077,13 +4273,12 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.set_twist(0.0, 0.0)
         self.cmd_linear = 0.0
         self.cmd_angular = 0.0
-        self._set_flow_phase("return_west_scan")
-        self.return_scan_pose_index = 0
-        self.return_scan_pose_started_at = now
-        self.return_scan_camera_ready_since = None
+        # 临时要求：只停定在 A 货架前，不做整体库存扫描；停稳即收工，
+        # 让 runner 派发下一单。return_west_scan 相关代码保留未动。
         self.get_logger().info(
-            "[return-west] stopped at shelf A; starting stationary full-view "
-            f"inventory scan ({len(RETURN_WEST_SCAN_POSES)} poses)")
+            "[return-west] stopped at shelf A; finishing worker "
+            "(stop-only, no inventory scan)")
+        self._finish_after_return_scan(now)
 
     def _advance_return_scan_pose(self, now: float) -> None:
         completed_name = RETURN_WEST_SCAN_POSES[
@@ -4591,9 +4786,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-scan-cycles", type=int, default=3)
     parser.add_argument(
-        "--tcp-diagnostic-ground-truth", action="store_true")
+        "--tcp-diagnostic-ground-truth", action="store_true",
+        help="fixed-geometry diagnostic only (no product truth); "
+             "use fixed public shelf geometry for the target centre")
     parser.add_argument(
-        "--scan-skip-lower", action="store_true")
+        "--scan-skip-lower", action="store_true",
+        help="deprecated no-op: the fixed-layout lower-shelf skip was "
+             "removed for rule compliance; scans always use full poses")
     parser.add_argument(
         "--no-close-recheck", action="store_true",
         help="disable close-range class verification before grasping")
@@ -4939,7 +5138,12 @@ def main() -> int:
                 pass
         if args.show:
             import cv2
-            cv2.destroyAllWindows()
+            try:
+                cv2.destroyAllWindows()
+            except Exception:  # noqa: BLE001 - headless OpenCV lacks HighGUI
+                # 结果文件已写入；退出时清理窗口失败不能改变返回码，
+                # 否则已交付订单会被 runner 误判为失败。
+                pass
     return 0 if delivered else 2
 
 

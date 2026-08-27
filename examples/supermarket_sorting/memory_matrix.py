@@ -11,8 +11,8 @@ Cols  = shelf x column (A1..A3, B1..B3, C1..C3, D1..D3, E1..E3) -> 15 cols
 * 因此画面同时看到 A/C/E 等多个货架时，可以在同一批 YOLO 结果中
   同时累积多个货架的记忆；
 * 同一 (货架, 层, 列, 种类) 仍需多帧中位数确认后才写入；
-* 每格按种类分别保留候选证据。观测距离优先：进入更近的距离带就更新，
-  同一近距带内保留置信度最高的一次；远处观测只累计次数，不能覆盖近距证据；
+* 每格按种类分别保留候选证据。主类别先比较持续观测证据档，再比较
+  近距代表置信度；一两批瞬时误检不能覆盖长期稳定候选；
 * ArUco/marker 完全不参与矩阵：marker 只在抓取货物时用于精确定位。
 
 矩阵写入 ``<repo>/logs/memory_matrix.json`` 供宿主机 GUI 渲染。
@@ -88,6 +88,14 @@ DEPTH_MIN_SAMPLES = 4
 # 近距带宽：小于该差值视为同一观测距离带，带内按置信度选代表值。
 # 这样既不会因 1~2cm 深度抖动来回替换，也会在机器人明显靠近后刷新证据。
 OBSERVATION_DISTANCE_BAND_M = 0.15
+# 同一槽位的主类别不能被一两批瞬时误检夺走。证据批次数达到该值后视为
+# “稳定档”，稳定档内再比较置信度；这样 2 批高置信误检不会压过几十批
+# 连续观测，同时避免样本数无限增长后彻底垄断排序。
+MEMORY_EVIDENCE_SATURATION_OBSERVATIONS = 6
+# 直达槽位比扫描提示风险更高，至少要求三批、十二个独立图像样本。
+# 不足门槛的候选仍可作为货架/层扫描提示，但不能直接驱动到具体列。
+MEMORY_DIRECT_MIN_OBSERVATIONS = 3
+MEMORY_DIRECT_MIN_SAMPLES = 12
 # 无距离信息的旧兼容调用仍使用原防覆盖余量。
 OVERWRITE_CONF_MARGIN = 0.02
 
@@ -125,6 +133,26 @@ def _load_slot_map() -> dict[int, tuple[str, str, str]]:
 
 
 SLOT_BY_MARKER = _load_slot_map()
+MARKER_BY_SLOT = {
+    (shelf, level, column): marker_id
+    for marker_id, (shelf, level, column) in SLOT_BY_MARKER.items()
+}
+
+
+def marker_id_for_slot(
+        shelf: str, level: str, column: str) -> int | None:
+    """Resolve the fixed ArUco id bound to a slot (public fixed geometry).
+
+    规则中 ArUco↔货位绑定固定且公开，只有“商品↔货位”每局随机；记忆直达
+    目标用该反查为抓前 close-recheck 提供期望 marker，让 ArUco 复核真正
+    生效。匹配码作为正向确认；无码时仍可由稳定 YOLO+深度通过，连续明确
+    错码才拒绝该槽位。
+    """
+    key = (
+        str(shelf).upper(), str(level).upper(), str(column)[-1:])
+    return MARKER_BY_SLOT.get(key)
+
+
 COL_LABELS = [
     f"{shelf}{column}" for shelf in SHELVES for column in COLUMNS]
 
@@ -199,12 +227,39 @@ def memory_candidate_allowed(
     return True
 
 
+def memory_candidate_evidence(candidate: dict) -> tuple[int, int]:
+    """Return normalized (observation batches, independent samples)."""
+    try:
+        sample_count = max(0, int(candidate.get("sample_count", 0)))
+    except (TypeError, ValueError):
+        sample_count = 0
+    try:
+        observations = max(0, int(candidate.get("observations", 0)))
+    except (TypeError, ValueError):
+        observations = 0
+    # Older serialized matrices did not expose ``observations`` everywhere.
+    # Conservatively infer complete four-frame batches for compatibility.
+    if observations <= 0 and sample_count > 0:
+        observations = sample_count // DEPTH_MIN_SAMPLES
+    return observations, sample_count
+
+
+def memory_direct_candidate_allowed(candidate: dict) -> bool:
+    """Whether evidence is persistent enough to navigate to an exact slot."""
+    observations, sample_count = memory_candidate_evidence(candidate)
+    return (
+        observations >= MEMORY_DIRECT_MIN_OBSERVATIONS
+        and sample_count >= MEMORY_DIRECT_MIN_SAMPLES)
+
+
 def select_memory_hint(
         candidates, base_xy, conf_threshold: float,
         exclude_slots=(), exclude_shelves=(), exclude_shelf_levels=(),
         min_last_seen: float | None = None,
-        reliable_only: bool = False) -> dict[str, Any] | None:
-    """Choose the nearest reliable shelf/level hint from matrix evidence."""
+        reliable_only: bool = False,
+        require_direct_evidence: bool = False,
+        evidence_first: bool = False) -> dict[str, Any] | None:
+    """Choose a reliable hint; exact-slot transit ranks evidence first."""
     if base_xy is None:
         base_xy = (float("nan"), float("nan"))
 
@@ -224,6 +279,9 @@ def select_memory_hint(
                 candidate, exclude_slots, exclude_shelves,
                 exclude_shelf_levels, min_last_seen):
             continue
+        if (require_direct_evidence
+                and not memory_direct_candidate_allowed(candidate)):
+            continue
         shelf = str(candidate.get("shelf", ""))
         level = str(candidate.get("level", ""))
         x = SHELF_SCAN_X.get(shelf)
@@ -239,6 +297,7 @@ def select_memory_hint(
         except (TypeError, ValueError):
             observed_distance = float("inf")
         travel = distance_to(x)
+        observations, sample_count = memory_candidate_evidence(candidate)
         item = {
             "x": x,
             "z": z,
@@ -251,7 +310,8 @@ def select_memory_hint(
             "world_x": candidate.get("world_x"),
             "world_y": candidate.get("world_y"),
             "world_z": candidate.get("world_z"),
-            "sample_count": candidate.get("sample_count"),
+            "observations": observations,
+            "sample_count": sample_count,
             "last_seen": candidate.get("last_seen"),
             "travel": travel,
             "close_relaxed": False,
@@ -270,8 +330,19 @@ def select_memory_hint(
             item["close_relaxed"] = (
                 close_reliable and confidence < conf_threshold)
             item["reliable"] = True
-            reliable_key = (
-                travel, observed_distance, -confidence, x, z)
+            if evidence_first:
+                # Accuracy first for exact-slot transit. Evidence saturates so
+                # two well-established candidates still use travel as the
+                # practical tie-breaker instead of old sample volume forever.
+                evidence_level = min(
+                    observations,
+                    MEMORY_EVIDENCE_SATURATION_OBSERVATIONS)
+                reliable_key = (
+                    -evidence_level, travel, observed_distance,
+                    -confidence, x, z)
+            else:
+                reliable_key = (
+                    travel, observed_distance, -confidence, x, z)
             if nearest is None or reliable_key < nearest[0]:
                 nearest = (reliable_key, item)
     if nearest is not None:
@@ -392,7 +463,10 @@ def select_memory_route_hint(
     }
     selected = select_memory_hint(
         primary, base_xy, conf_threshold,
-        reliable_only=reliable_only, **common)
+        reliable_only=reliable_only,
+        require_direct_evidence=require_direct,
+        evidence_first=require_direct,
+        **common)
     if selected is None:
         if require_direct:
             return None
@@ -615,6 +689,9 @@ class MemoryMatrix:
             primary = max(
                 near_values,
                 key=lambda item: (
+                    min(
+                        memory_candidate_evidence(item)[0],
+                        MEMORY_EVIDENCE_SATURATION_OBSERVATIONS),
                     float(item.get("confidence", 0.0)),
                     int(item.get("sample_count", 0)),
                     float(item.get("last_seen", 0.0))))

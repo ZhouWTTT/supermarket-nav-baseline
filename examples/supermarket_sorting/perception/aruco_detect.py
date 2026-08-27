@@ -4,6 +4,8 @@
 import argparse
 import json
 import math
+import os
+import time
 
 import cv2
 import numpy as np
@@ -275,6 +277,38 @@ class ArucoDetectNode(Node):
         self.publish_detections(msg, valid, orientation)
         if self.publish_result_image:
             self.publish_visualization(msg, image, valid)
+        elif os.environ.get("ARUCO_DEBUG_DIR"):
+            self._debug_dump(image, valid, msg.header.stamp)
+
+    def _debug_dump(self, image, detections, stamp):
+        """设置 ARUCO_DEBUG_DIR 后限频保存标注画面（调试用，不影响判定）。"""
+        debug_dir = os.environ.get("ARUCO_DEBUG_DIR")
+        if not debug_dir:
+            return
+        now_wall = time.monotonic()
+        if now_wall - getattr(self, "_debug_last_write_at", 0.0) < 0.5:
+            return
+        self._debug_last_write_at = now_wall
+        try:
+            drawn = image.copy()
+            for marker_id, corners, rvec, tvec, _ in detections:
+                cv2.aruco.drawDetectedMarkers(
+                    drawn, [corners], np.array([[marker_id]]))
+                cv2.drawFrameAxes(
+                    drawn, self.camera_matrix, self.distortion,
+                    rvec, tvec, self.marker_size * 0.5)
+            ids_text = (
+                "_".join(str(marker_id) for marker_id, *_ in detections)
+                or "none")
+            path = os.path.join(
+                debug_dir,
+                f"aruco_{self.camera_name}_"
+                f"{stamp.sec:010d}_{stamp.nanosec:09d}_"
+                f"{ids_text}.jpg")
+            os.makedirs(debug_dir, exist_ok=True)
+            cv2.imwrite(path, drawn)
+        except Exception as exc:  # noqa: BLE001 - debug dump best effort
+            self.get_logger().warn(f"aruco debug dump failed: {exc}")
 
     def publish_detections(self, image_msg, detections, orientation="normal"):
         frame_id = image_msg.header.frame_id or self.default_frame
@@ -333,6 +367,7 @@ class ArucoDetectNode(Node):
             cv2.aruco.drawDetectedMarkers(image, [corners], np.array([[marker_id]]))
             cv2.drawFrameAxes(image, self.camera_matrix, self.distortion,
                               rvec, tvec, self.marker_size * 0.5)
+        self._debug_dump(image, detections, image_msg.header.stamp)
         result = self.bridge.cv2_to_imgmsg(image, encoding="bgr8")
         result.header = image_msg.header
         self.result_pub.publish(result)
