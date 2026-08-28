@@ -141,6 +141,7 @@ class LauncherApp:
         self.perception_always_on_var = tk.BooleanVar(value=True)
         self.dynamic_direct_var = tk.BooleanVar(value=True)
         self.skip_recheck_var = tk.BooleanVar(value=False)
+        self.wrist_center_var = tk.BooleanVar(value=False)
 
         row1 = ttk.Frame(top)
         row1.pack(fill="x")
@@ -238,6 +239,9 @@ class LauncherApp:
         ttk.Checkbutton(
             row4, text="跳过抓前复核(ArUco+类别,默认开启;勾选=关闭)",
             variable=self.skip_recheck_var).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(
+            row4, text="腕部对中(wrist-center)",
+            variable=self.wrist_center_var).pack(side="left", padx=(0, 10))
 
         btn_row = ttk.Frame(top)
         btn_row.pack(fill="x", pady=(8, 0))
@@ -458,6 +462,8 @@ class LauncherApp:
             runner_flags.append("--no-close-recheck")
         if self.show_yolo_var.get():
             runner_flags.append("--show")
+        if self.wrist_center_var.get():
+            runner_flags.append("--wrist-center")
         args = [
             "docker", "run", "--rm", "-d",
             "--name", CLIENT_NAME,

@@ -738,7 +738,15 @@ DUAL_TISSUE_ENDPOINT_TCP_TOLERANCE_M = 0.018
 # the same orientation is retained through insertion, clamp, lift and retreat.
 DUAL_TISSUE_SIDE_ROLLED_ENABLED = True
 DUAL_TISSUE_SIDE_ROLLED_TCP_CLEARANCE_M = 0.100
-DUAL_TISSUE_SIDE_ROLLED_SQUEEZE_M = 0.025
+# 最东列 E-C3 顶层专属：端列受东墙避让（基座西移 0.12m）影响，0.140
+# 半跨度在 1.289 高度会落在 KDL 可达边界外（第一解 IK 失败、实测低
+# 1~1.5cm 蹭层板）；收窄到 0.112 保证双臂可达。命令高度 1.308
+# （板面 + 0.119）：1.325 实测双臂饱和（命令 1.325 只到 1.313/1.318），
+# 1.308 落在可达上限内，实际落点约 1.30，避开层板且不高过纸盒顶。
+DUAL_TISSUE_EAST_TOP_PROBE_SPAN_M = 0.112
+DUAL_TISSUE_EAST_TOP_TCP_CLEARANCE_M = 0.119
+# 侧列滚腕合拢量同步调到 30mm（客户端收紧双臂间距，防运输掉货）。
+DUAL_TISSUE_SIDE_ROLLED_SQUEEZE_M = 0.030
 DUAL_TISSUE_SIDE_ROLLED_MAX_SEGMENT_JOINT_DELTA_RAD = 0.90
 # 手背（outward）探入到位后，旋转 90° 到“手侧面”夹持姿态的路径长度
 # 与速度。旋转点位于纸盒后侧之外，不会扫到立柱/邻货。
@@ -796,7 +804,9 @@ DUAL_TISSUE_GRIP_CONTACT_MAX = 0.045
 # The previous 30 mm/side position preload kept driving after contact and
 # toppled a tissue box.  25 mm keeps the clamp firm without toppling;
 # the following clamp pose retains roughly 4 mm/side geometric interference.
-DUAL_TISSUE_SQUEEZE_M = 0.025
+# 2026-08-28：抓持偏松导致运输掉货，客户端把合拢量调到 30mm（双臂间距
+# 收紧），实测锚定后每侧多压 5mm；若出现纸盒被压翻再回调到 28mm。
+DUAL_TISSUE_SQUEEZE_M = 0.030
 DUAL_TISSUE_SQUEEZE_SPEED_MPS = 0.012
 # 放置时反向展开（release_open）与抓取挤压共用 0.012m/s 太慢（3.1s）；
 # 展开是远离纸盒的方向，提速到 0.025m/s 安全，单独用这个常量。
@@ -943,6 +953,18 @@ STATE_RETREAT = "retreat"
 STATE_DONE = "done"
 STATE_ABORT = "abort"
 
+# 腕部相机（lft_handeye / rgt_handeye，仅 RGB）抓取位对中辅助。
+# 验证（perception/verify_wrist_aruco.py）表明抓取位看不到货架 ArUco，
+# 但能看到商品本体，因此在 DEPLOY 到位后、前伸前用腕部 YOLO 对商品做
+# 一次横向修正：只改接触/前伸目标的 X、不移动基座、clamp ±3cm、单次。
+# 默认关闭，只有 runner 显式开启才参与，不影响既有流程。
+WRIST_CAMERA_FOVY_DEG = 42.58
+WRIST_IMAGE_W, WRIST_IMAGE_H = 640, 480
+WRIST_CENTER_CONF_MIN = 0.85
+WRIST_CENTER_MAX_DELTA_M = 0.03
+WRIST_CENTER_MIN_DELTA_M = 0.005
+WRIST_GRASP_STATES = frozenset({STATE_DEPLOY})
+
 
 def generic_post_extend_world(
         nominal_contact_world: np.ndarray, target_kind: str) -> np.ndarray:
@@ -1069,8 +1091,12 @@ class ShelfPickController(Node):
     def __init__(self, target_kind: str, max_scan_cycles: int,
                  tcp_diagnostic_ground_truth: bool,
                  scan_skip_lower: bool,
-                 close_recheck: bool = True):
+                 close_recheck: bool = True,
+                 wrist_center: bool = False):
         super().__init__("yolo_aruco_shelf_pick_controller")
+        self.wrist_center_enabled = bool(wrist_center)
+        self.wrist_yolo_frames = deque(maxlen=30)
+        self._wrist_center_applied = False
         self.target_kind = target_kind
         self.product_height = PRODUCT_CENTER_ABOVE_MARKER_M[target_kind]
         self.product_grasp_width = PRODUCT_GRASP_WIDTH_M[target_kind]
@@ -1425,6 +1451,10 @@ class ShelfPickController(Node):
 
     def yolo_cb(self, message: String) -> None:
         all_records = decode_list(message)
+        # 腕部对中辅助（默认关闭）：只在 DEPLOY 收集当前工作臂的目标框，
+        # 独立于 head 逻辑，不改变任何既有判定。
+        if self.wrist_center_enabled:
+            self._collect_wrist_yolo_frames(all_records)
         head_records = [
             record for record in all_records
             if record.get("camera", "head") == "head"]
@@ -1595,6 +1625,11 @@ class ShelfPickController(Node):
                 break
         if not ready:
             return
+        if self.target_kind == "zhijin":
+            # 纸巾订单保持双臂：机会锁定也不允许切到其他品类。
+            ready = [item for item in ready if item[0] == "zhijin"]
+            if not ready:
+                return
         selected, selected_marker = min(
             ready,
             key=lambda item: (
@@ -1648,6 +1683,210 @@ class ShelfPickController(Node):
         self.association_candidate_id = None
         self.association_confirmation_count = 0
         self.last_association_pair = None
+
+    # ---- wrist-camera grasp centering (RGB-only, default off) ----
+
+    def _collect_wrist_yolo_frames(self, all_records: list[dict]) -> None:
+        """Collect target-kind wrist frames only during the deploy state."""
+        if self.state not in WRIST_GRASP_STATES:
+            return
+        arm_camera = "left" if self.grasp_arm == "l" else "right"
+        wrist_records = [
+            record for record in all_records
+            if record.get("camera") == arm_camera
+            and record.get("class") == self.target_kind]
+        if not wrist_records:
+            return
+        stamp_ns = stamp_from_record(wrist_records[0])
+        if stamp_ns is None:
+            return
+        with self.lock:
+            self.wrist_yolo_frames.append((stamp_ns, wrist_records))
+
+    def _latest_wrist_target_detection(self) -> tuple[str, dict] | None:
+        """Best-confidence target-kind detection in the latest wrist frame."""
+        with self.lock:
+            frames = list(self.wrist_yolo_frames)
+        if not frames:
+            return None
+        _, records = frames[-1]
+        best = None
+        for record in records:
+            try:
+                conf = float(record.get("conf", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if best is None or conf > best[0]:
+                best = (conf, record)
+        if best is None or best[0] < WRIST_CENTER_CONF_MIN:
+            return None
+        return str(best[1].get("camera", "")), best[1]
+
+    @staticmethod
+    def _wrist_camera_intrinsics() -> tuple[float, float, float, float]:
+        """Wrist camera K from the fixed 42.58 deg vertical FOV (640x480)."""
+        fy = (WRIST_IMAGE_H / 2.0) / math.tan(
+            math.radians(WRIST_CAMERA_FOVY_DEG) / 2.0)
+        return fy, fy, WRIST_IMAGE_W / 2.0, WRIST_IMAGE_H / 2.0
+
+    @staticmethod
+    def _wrist_camera_tmat(record: dict) -> np.ndarray | None:
+        """Camera(optical)->world from the YOLO record (wrist model)."""
+        try:
+            position = np.asarray(
+                record["camera_world_position"], dtype=float)
+            rotation = np.asarray(
+                record["camera_world_rotation"], dtype=float).reshape(3, 3)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (position.shape != (3,) or rotation.shape != (3, 3)
+                or not np.all(np.isfinite(position))
+                or not np.all(np.isfinite(rotation))):
+            return None
+        transform = np.eye(4)
+        transform[:3, 3] = position
+        transform[:3, :3] = rotation
+        return transform
+
+    @classmethod
+    def _project_to_wrist_pixels(
+            cls, world: np.ndarray, record: dict
+    ) -> tuple[np.ndarray, float] | None:
+        """Project a world point into the wrist image; return (px, depth)."""
+        transform = cls._wrist_camera_tmat(record)
+        if transform is None:
+            return None
+        pc = transform[:3, :3].T @ (
+            np.asarray(world, dtype=float) - transform[:3, 3])
+        if pc[2] <= 1e-6:
+            return None
+        fx, fy, cx, cy = cls._wrist_camera_intrinsics()
+        return np.array([
+            fx * pc[0] / pc[2] + cx,
+            fy * pc[1] / pc[2] + cy,
+        ]), float(pc[2])
+
+    @classmethod
+    def _wrist_pixel_to_world_x(
+            cls, pixel_u: float, pixel_v: float, record: dict,
+            plane_y: float
+    ) -> float | None:
+        """Back-project a wrist pixel to world X at the product plane."""
+        transform = cls._wrist_camera_tmat(record)
+        if transform is None:
+            return None
+        fx, fy, cx, cy = cls._wrist_camera_intrinsics()
+        ray_camera = np.array([
+            (float(pixel_u) - cx) / fx,
+            (float(pixel_v) - cy) / fy,
+            1.0,
+        ])
+        ray_world = transform[:3, :3] @ ray_camera
+        if abs(float(ray_world[1])) < 1e-6:
+            return None
+        t = (float(plane_y) - float(transform[1, 3])) / float(ray_world[1])
+        if not math.isfinite(t) or t <= 0.0:
+            return None
+        return float(transform[0, 3] + t * ray_world[0])
+
+    def _maybe_wrist_center_contact(self) -> None:
+        """DEPLOY 到位后、forward 前，用腕部 YOLO 对商品做一次横向对中。
+
+        只修正 forward/contact 目标的 X（不移动基座、不重进状态机），
+        单次、clamp ±3cm；任何条件不满足（无框、置信度低、投影越界、
+        偏差过大、IK 失败）都保持原目标，绝不影响既有抓取流程。
+        """
+        if not self.wrist_center_enabled or self._wrist_center_applied:
+            return
+        self._wrist_center_applied = True
+        if self.use_dual_tissue_grasp:
+            return
+        detection = self._latest_wrist_target_detection()
+        if detection is None:
+            return
+        _, record = detection
+        contact = (
+            self.sphere_contact_world
+            if self.use_sphere_grasp else self.forward_contact_world)
+        if contact is None:
+            return
+        projected = self._project_to_wrist_pixels(contact, record)
+        if projected is None:
+            return
+        (u_expected, v_expected), _ = projected
+        if not (0 <= u_expected < WRIST_IMAGE_W
+                and 0 <= v_expected < WRIST_IMAGE_H):
+            return
+        try:
+            x0, y0, x1, y1 = map(float, record["bbox_xyxy"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if x1 - x0 < 6.0 or y1 - y0 < 6.0:
+            return
+        u_detected = 0.5 * (x0 + x1)
+        v_detected = 0.5 * (y0 + y1)
+        world_x_detected = self._wrist_pixel_to_world_x(
+            u_detected, v_detected, record, SHELF_PRODUCT_CENTER_Y_M)
+        if world_x_detected is None:
+            return
+        delta = float(world_x_detected - contact[0])
+        if not math.isfinite(delta):
+            return
+        if abs(delta) < WRIST_CENTER_MIN_DELTA_M:
+            self.get_logger().info(
+                "[wrist-center] target already centered "
+                f"(offset={abs(delta) * 1000:.1f}mm); no correction")
+            return
+        if abs(delta) > WRIST_CENTER_MAX_DELTA_M:
+            self.get_logger().warn(
+                "[wrist-center] lateral offset "
+                f"{delta * 1000:.1f}mm exceeds clamp "
+                f"{WRIST_CENTER_MAX_DELTA_M * 1000:.0f}mm; keeping target")
+            return
+        new_contact = contact.copy()
+        new_contact[0] += delta
+        new_approach = None
+        new_post_extend = None
+        if self.use_sphere_grasp:
+            try:
+                new_approach = self.solve_kdl_world(
+                    new_contact, self.pregrasp_arm_joints)
+            except ValueError:
+                self.get_logger().warn(
+                    "[wrist-center] corrected contact IK failed; "
+                    "keeping original target")
+                return
+        if self.post_extend_target_world is not None:
+            # 接触点横向修正后，后续继续前伸（post-extend）的端点也必须
+            # 同步平移并重解，否则扩展阶段会带着旧坐标把商品刮到板缘。
+            nominal = new_contact.copy()
+            extended = generic_post_extend_world(
+                new_contact, self.target_kind)
+            reference = (
+                new_approach
+                if new_approach is not None
+                else self.approach_arm_joints[-1])
+            try:
+                ext_joints = self.solve_kdl_world(extended, reference)
+            except (ValueError, IndexError):
+                self.get_logger().warn(
+                    "[wrist-center] corrected post-extend IK failed; "
+                    "keeping original target")
+                return
+            new_post_extend = (nominal, extended, ext_joints)
+        self.forward_contact_world = new_contact.copy()
+        if new_approach is not None:
+            self.sphere_contact_world = new_contact.copy()
+            self.approach_arm_joints = [new_approach]
+        if new_post_extend is not None:
+            nominal, extended, ext_joints = new_post_extend
+            self.post_extend_nominal_world = nominal
+            self.post_extend_target_world = extended
+            self.post_extend_arm_joints = ext_joints
+        self.get_logger().info(
+            "[wrist-center] corrected contact X by "
+            f"{delta * 1000:.1f}mm -> x={new_contact[0]:.3f} "
+            f"kind={self.target_kind}")
 
     def _slot_excluded_for_target(self, slot_key: str) -> bool:
         """Return whether this physical slot failed for the active class."""
@@ -2794,9 +3033,21 @@ class ShelfPickController(Node):
         return delta
 
     def _depth_recheck_fallback_available(self) -> bool:
-        """Whether existing non-ArUco evidence is safe to keep for grasp."""
+        """Whether existing non-ArUco evidence is safe to keep for grasp.
+
+        近距复核必须在复核窗口内至少见过一次目标品类（recheck_target_seen），
+        否则说明该槽位很可能不是记忆矩阵记的那个品类——记忆直达目标在
+        无码超时后直接抓会抓到旁边的货（2026-08-28 C-L2-1 抓到邻槽
+        sanmingzhi）。没有目标框时拒绝兜底，走失败重选同类其他槽位。
+        """
         if (getattr(self, "target_localisation_source", None)
                 not in DEPTH_BACKED_RECHECK_FALLBACK_SOURCES):
+            return False
+        if not self.recheck_target_seen:
+            self.get_logger().warn(
+                "[close-recheck] depth fallback denied: close view never "
+                f"saw target kind={self.target_kind} "
+                f"slot={self.target_slot_key()}")
             return False
         try:
             target = np.asarray(self.target_world, dtype=float)
@@ -4149,6 +4400,14 @@ class ShelfPickController(Node):
         rotated = bool(getattr(self, "tissue_rotated_90", False))
         slot = self.target_slot()
         column = slot[2] if slot is not None else "2"
+        # 最东列 E-C3 顶层专属参数：端列受东墙避让影响，标准 0.140 半
+        # 跨度在该高度落在 KDL 可达边界外，需要收窄跨度并略抬抓取高度。
+        east_top = bool(
+            self.shelf_level == "top"
+            and slot is not None
+            and str(slot[0]).upper() == "E"
+            and str(slot[1]).upper() == "L3"
+            and str(slot[2]) == "3")
         self.dual_side_rolled = bool(
             DUAL_TISSUE_SIDE_ROLLED_ENABLED
             and column in ("1", "3")
@@ -4182,8 +4441,12 @@ class ShelfPickController(Node):
             self.dual_probe_span_l = DUAL_TISSUE_POST_SIDE_SPAN_M
             self.dual_probe_span_r = DUAL_TISSUE_NEIGHBOUR_PROBE_SPAN_M
         elif column == "3":
-            self.dual_probe_span_l = DUAL_TISSUE_NEIGHBOUR_PROBE_SPAN_M
-            self.dual_probe_span_r = DUAL_TISSUE_POST_SIDE_SPAN_M
+            if east_top:
+                self.dual_probe_span_l = DUAL_TISSUE_EAST_TOP_PROBE_SPAN_M
+                self.dual_probe_span_r = DUAL_TISSUE_EAST_TOP_PROBE_SPAN_M
+            else:
+                self.dual_probe_span_l = DUAL_TISSUE_NEIGHBOUR_PROBE_SPAN_M
+                self.dual_probe_span_r = DUAL_TISSUE_POST_SIDE_SPAN_M
         else:
             self.dual_probe_span_l = DUAL_TISSUE_DIRECT_PROBE_SPAN_M
             self.dual_probe_span_r = DUAL_TISSUE_DIRECT_PROBE_SPAN_M
@@ -4204,6 +4467,9 @@ class ShelfPickController(Node):
             else (DUAL_TISSUE_LOWER_TCP_CLEARANCE_M
                   if self.shelf_level == "lower"
                   else DUAL_TISSUE_TCP_CLEARANCE_M))
+        if self.dual_side_rolled and east_top:
+            # E-C3 顶层：比稳定侧列略抬，补偿端列基座后移下沉（见常量）。
+            tcp_clearance = DUAL_TISSUE_EAST_TOP_TCP_CLEARANCE_M
         target_raise = (
             DUAL_TISSUE_TOP_TCP_RAISE_M
             if self.shelf_level == "top"
@@ -7244,6 +7510,7 @@ class ShelfPickController(Node):
                         f"grip={deploy_gripper} "
                         f"preshape_ready={int(preshape_ready)}; "
                         "starting forward motion")
+                    self._maybe_wrist_center_contact()
                     self.start_arm_forward()
                 elif deploy_elapsed >= GENERIC_DEPLOY_HARD_TIMEOUT_S:
                     if self._deploy_base_nudge_retry("generic-direct"):
@@ -7284,6 +7551,7 @@ class ShelfPickController(Node):
                         f"gate bypassed; actual={np.round(actual_tcp, 4)} "
                         f"error={np.round(tcp_error, 4)}m; "
                         "continuing forward grasp instead of aborting")
+                self._maybe_wrist_center_contact()
                 self.start_arm_forward()
             elif (self.use_sphere_grasp
                   and deploy_elapsed >= (
@@ -7997,6 +8265,10 @@ def parse_args():
     parser.add_argument(
         "--no-close-recheck", action="store_true",
         help="disable close-range class verification before grasping")
+    parser.add_argument(
+        "--wrist-center", action="store_true",
+        help="use the active wrist camera to centre the contact target once "
+             "before the forward grasp (default: off)")
     args = parser.parse_args()
     if not 0.0 <= args.confidence <= 1.0:
         parser.error("--confidence must be in [0, 1]")
@@ -8032,7 +8304,8 @@ def main() -> None:
         controller = ShelfPickController(
             args.target_kind, args.max_scan_cycles,
             args.tcp_diagnostic_ground_truth, args.scan_skip_lower,
-            close_recheck=not args.no_close_recheck)
+            close_recheck=not args.no_close_recheck,
+            wrist_center=args.wrist_center)
         nodes = [yolo_node, aruco_node, controller]
         viewer = None
         if args.show:

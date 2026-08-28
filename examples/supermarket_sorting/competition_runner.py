@@ -289,9 +289,13 @@ class CompetitionRunner(Node):
         # is currently nearest.  _resolve_worker_order() accounts the result
         # against the class actually delivered, so changing class here does
         # not consume or retry the originally dispatched order by mistake.
+        # 跨品类改道保留（更合理：最近优先选单不局限于派单品类）。
+        # 但纸巾订单必须始终用双臂，zhijin 只开放 zhijin 候选，绝不允许
+        # 途中切到其他品类（否则会用单臂姿态执行纸巾任务）。
         candidate_kinds = (
             [order.kind]
-            if self.args.grab_policy == "sequence"
+            if (self.args.grab_policy == "sequence"
+                or order.kind == "zhijin")
             else self._candidate_kinds_for(order))
         self.immediate_retry_order_id = None
         command = [
@@ -344,6 +348,8 @@ class CompetitionRunner(Node):
             command.append("--no-close-recheck")
         if self.args.perception_always_on:
             command.append("--perception-always-on")
+        if self.args.wrist_center:
+            command.append("--wrist-center")
         # 第一单交付后回 A 货架前停定（仅停定、不扫描），作为下一单起点；
         # 最后一单仍以返回起始区优先。
         return_west_after_place = place_slot == 0
@@ -564,6 +570,8 @@ class CompetitionRunner(Node):
         ]
         if self.args.show:
             command.append("--publish-result-images")
+        if self.args.wrist_center:
+            command.append("--wrist-cameras")
         self.perception_ready_path.unlink(missing_ok=True)
         try:
             self.perception_worker = subprocess.Popen(
@@ -1067,6 +1075,10 @@ def parse_args() -> argparse.Namespace:
         "--perception-always-on", action="store_true",
         help="keep persistent or worker-local perception enabled throughout "
              "the match")
+    parser.add_argument(
+        "--wrist-center", action="store_true",
+        help="let the active wrist camera centre the contact target once "
+             "before the forward grasp (adds left/right wrist YOLO)")
     parser.add_argument(
         "--order-timeout", type=float, default=300.0,
         help="per-order timeout in seconds; 0 disables it (default: 300)")

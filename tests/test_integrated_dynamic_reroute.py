@@ -138,6 +138,62 @@ class DynamicRerouteControllerTests(unittest.TestCase):
         self.assertEqual(controller.target_kind, "kele")
         controller._set_pregrasp_target_kind.assert_called_once_with("kele")
 
+    def test_non_zhijin_still_switches_kind(self):
+        """非纸巾品类允许跨品类改道（机会切换仍生效）。"""
+        controller = integrated.IntegratedNavPickPlace.__new__(
+            integrated.IntegratedNavPickPlace)
+        controller.target_kind = "maidong"
+        controller._set_pregrasp_target_kind = mock.Mock(
+            side_effect=lambda kind: setattr(controller, "target_kind", kind))
+        controller.get_logger = mock.Mock(return_value=mock.Mock())
+
+        previous = controller._activate_memory_target_kind({
+            "target_kind": "shupian",
+            "travel": 1.0,
+        }, "test")
+
+        self.assertEqual(previous, "maidong")
+        self.assertEqual(controller.target_kind, "shupian")
+        controller._set_pregrasp_target_kind.assert_called_once_with(
+            "shupian")
+
+    def test_zhijin_order_refuses_kind_switch(self):
+        """纸巾订单双臂锁定：矩阵改道不允许切到其他品类（避免单臂抓纸巾）。"""
+        controller = integrated.IntegratedNavPickPlace.__new__(
+            integrated.IntegratedNavPickPlace)
+        controller.target_kind = "zhijin"
+        controller._set_pregrasp_target_kind = mock.Mock(
+            side_effect=AssertionError("zhijin must not switch kind"))
+        controller.get_logger = mock.Mock(return_value=mock.Mock())
+
+        previous = controller._activate_memory_target_kind({
+            "target_kind": "chengzi",
+            "travel": 1.0,
+        }, "test")
+
+        self.assertEqual(previous, "zhijin")
+        self.assertEqual(controller.target_kind, "zhijin")
+        controller._set_pregrasp_target_kind.assert_not_called()
+
+    def test_kind_switch_updates_tissue_place_world(self):
+        """切换到纸巾后放置位必须是专用位，切回普通品类恢复槽位坐标。"""
+        controller = integrated.IntegratedNavPickPlace.__new__(
+            integrated.IntegratedNavPickPlace)
+        controller.place_slot = 0
+        controller.place_world = np.array(
+            [0.0, 0.0, integrated.DELIVERY_TABLE_PLACE_WORLD[2]])
+        controller.get_logger = mock.Mock(return_value=mock.Mock())
+
+        controller._apply_place_world_for_kind("zhijin")
+        np.testing.assert_allclose(
+            controller.place_world[:2],
+            integrated.TISSUE_DEDICATED_PLACE_XY)
+
+        controller._apply_place_world_for_kind("maidong")
+        np.testing.assert_allclose(
+            controller.place_world[:2],
+            integrated.DELIVERY_PLACE_SLOTS_XY[0])
+
 
 if __name__ == "__main__":
     unittest.main()

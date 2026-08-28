@@ -39,6 +39,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--publish-result-images", action="store_true",
         help="publish annotated YOLO/ArUco images for an explicit viewer")
+    parser.add_argument(
+        "--wrist-cameras", action="store_true",
+        help="also run YOLO on the left/right wrist RGB cameras (used by "
+             "--wrist-center)")
     args = parser.parse_args()
     if not pathlib.Path(args.weights).is_file():
         parser.error(f"weights not found: {args.weights}")
@@ -63,6 +67,9 @@ def main() -> None:
     nodes = []
     executor = MultiThreadedExecutor(num_threads=4)
     try:
+        cameras = (
+            ("head", "left", "right")
+            if args.wrist_cameras else ("head",))
         yolo_node = pick.KeleDetectNode(
             backend="yolo",
             pub_res_img=args.publish_result_images,
@@ -71,7 +78,7 @@ def main() -> None:
             target_kind=None,
             confidence=args.confidence,
             show=False,
-            camera_names=("head",),
+            camera_names=cameras,
             max_inference_hz=args.max_inference_hz,
         )
         aruco_node = pick.ArucoDetectNode(

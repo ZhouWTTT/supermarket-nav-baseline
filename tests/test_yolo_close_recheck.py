@@ -36,6 +36,14 @@ class CloseRecheckFallbackTests(unittest.TestCase):
         controller.excluded_slot_keys = set()
         controller.excluded_slot_keys_by_kind = {}
         controller.shelf_level = "lower"
+        controller.recheck_target_seen = True
+        controller.marker_positions = deque()
+        controller.depth_target_samples = deque()
+        controller.last_association_pair = None
+        controller.association_candidate_id = None
+        controller.association_confirmation_count = 0
+        controller.direct_slot_target_active = False
+        controller.get_logger = mock.Mock(return_value=mock.Mock())
         return controller
 
     @staticmethod
@@ -77,6 +85,23 @@ class CloseRecheckFallbackTests(unittest.TestCase):
         self.assertFalse(matched)
         self.assertEqual(source, "aruco-depth-conflict")
 
+    def test_expected_marker_x_only_match_yields_aruco_x(self):
+        controller = self._controller(marker_id=9)
+        # Expected marker decoded with the right world X but a PnP Z that is
+        # one shelf level off: the close-range relaxation still accepts the
+        # x-only association (depth+aruco-x) instead of dropping the code.
+        detection = self._near_detection()
+        with mock.patch.object(
+                pick, "marker_below_yolo", return_value=None):
+            markers = [{
+                "id": 9,
+                "position_world": [-1.075, 3.22, 1.150],
+            }]
+            matched, source = controller._recheck_detection_matches(
+                detection, markers)
+        self.assertTrue(matched)
+        self.assertEqual(source, "depth+aruco-x")
+
     def test_position_fallback_survives_inconclusive_optional_recheck(self):
         controller = self._controller(source="position_fallback")
         self.assertTrue(controller._depth_recheck_fallback_available())
@@ -91,7 +116,7 @@ class CloseRecheckFallbackTests(unittest.TestCase):
         controller.recheck_conflict_count = 0
         controller.recheck_conflict_confirmed = False
         controller.recheck_fresh_yolo_frames = 3
-        controller.recheck_target_seen = False
+        controller.recheck_target_seen = True
         controller.scan_camera_ready_since = 1.0
         controller._recheck_passed = False
         controller._start_grasp_settle = mock.Mock()
@@ -104,6 +129,15 @@ class CloseRecheckFallbackTests(unittest.TestCase):
         controller._start_grasp_settle.assert_called_once_with()
         self.assertIsNotNone(controller.target_world)
         self.assertEqual(controller.committed_slot, ("A", "L1", "3"))
+
+    def test_inconclusive_recheck_without_target_view_denies_fallback(self):
+        """无码超时时若复核从未见过目标品类，禁止 memory 兜底抓取。"""
+        controller = self._controller(source="position_fallback")
+        controller.recheck_target_seen = False
+        self.assertFalse(controller._depth_recheck_fallback_available())
+
+        controller.recheck_target_seen = True
+        self.assertTrue(controller._depth_recheck_fallback_available())
 
     def test_aruco_only_target_has_no_depth_fallback(self):
         controller = self._controller(source="aruco(no-depth)")

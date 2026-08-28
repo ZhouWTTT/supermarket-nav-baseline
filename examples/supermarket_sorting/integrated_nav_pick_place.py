@@ -356,6 +356,10 @@ TRANSIT_SLIDE_DEGRADED_MAX_ERROR_M = 0.050
 # and dual grasps are already at the 0.0 limit.  Spheres use the gentler
 # explicit 0.06 target below to avoid excessive squeeze.
 TRANSPORT_GRIP_PRELOAD_COMMAND = 0.04
+# 途中矩阵冲突防抖：记忆矩阵在行驶中持续更新，单次“同槽位出现其他
+# 品类主证据”可能只是瞬时误检/观察抖动；连续两次（约 0.5s）确认才
+# 丢弃当前直达目标，避免目标反复切换导致抓错槽位、抓不牢。
+DIRECT_TRANSIT_CONFLICT_CONFIRMATIONS = 2
 SPHERE_TRANSPORT_GRIP_COMMAND = 0.06
 # The measured gripper is the only feedback that remains available after the
 # shelf cameras no longer see the carried product.  Require a sustained empty
@@ -510,11 +514,13 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             place_creep_m: float = PLACE_CREEP_DISTANCE_M,
             close_recheck: bool = True,
             return_west_after_place: bool = False,
-            return_start_after_place: bool = False):
+            return_start_after_place: bool = False,
+            wrist_center: bool = False):
         super().__init__(
             target_kind, max_scan_cycles,
             tcp_diagnostic_ground_truth, scan_skip_lower,
-            close_recheck=close_recheck)
+            close_recheck=close_recheck,
+            wrist_center=wrist_center)
 
         # Wall-clock phase telemetry is intentionally observational only.  It
         # makes the next formal run actionable without changing any motion,
@@ -532,10 +538,6 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_slot = place_slot
         self.place_world = np.array(
             [place_x, place_y, place_z], dtype=float)
-        if target_kind == "zhijin":
-            # 纸巾固定放东侧专用位，避免最深槽位双臂 IK 无解。
-            self.place_world[0] = TISSUE_DEDICATED_PLACE_XY[0]
-            self.place_world[1] = TISSUE_DEDICATED_PLACE_XY[1]
         self.place_min_approach_z = float(place_z)
         self.place_release_dwell_s = place_release_dwell_s
         self.place_retreat_dwell_s = place_retreat_dwell_s
@@ -543,6 +545,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.return_start_after_place = bool(return_start_after_place)
         self.placement_completed = False
         self.post_delivery_warnings: list[str] = []
+        self._apply_place_world_for_kind(target_kind)
         self.delivery_completed_by_drop = False
         self.drop_event = None
         self.terminal_error = None
@@ -692,6 +695,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.direct_transit_started_at = None
         self.memory_reroute_not_before = time.time()
         self._memory_last_reroute_check = 0.0
+        self._direct_conflict_slot = None
+        self._direct_conflict_count = 0
         self._memory_consumed = False
 
         self.get_logger().info(
@@ -706,6 +711,26 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             f"retreat_dwell={place_retreat_dwell_s}s "
             f"return_west_after_place="
             f"{int(self.return_west_after_place)}")
+
+    def _set_pregrasp_target_kind(self, kind: str) -> None:
+        """品类切换时同步更新放置位（纸巾固定专用位）。"""
+        super()._set_pregrasp_target_kind(kind)
+        self._apply_place_world_for_kind(kind)
+
+    def _apply_place_world_for_kind(self, kind: str) -> None:
+        """纸巾固定放东侧专用位，其他品类恢复订单槽位坐标。"""
+        if kind == "zhijin":
+            self.place_world[0] = TISSUE_DEDICATED_PLACE_XY[0]
+            self.place_world[1] = TISSUE_DEDICATED_PLACE_XY[1]
+            self.get_logger().info(
+                "[tissue-place] using dedicated tissue place "
+                f"({TISSUE_DEDICATED_PLACE_XY[0]:.3f},"
+                f"{TISSUE_DEDICATED_PLACE_XY[1]:.3f})")
+            return
+        if self.place_slot is not None:
+            slot_xy = DELIVERY_PLACE_SLOTS_XY[self.place_slot]
+            self.place_world[0] = float(slot_xy[0])
+            self.place_world[1] = float(slot_xy[1])
 
     def set_state(self, new_state: str) -> None:
         """Accumulate parent pick-state wall time without altering its FSM."""
@@ -948,6 +973,12 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         """Switch to the pending class selected by a matrix route hint."""
         kind = str(hint.get("target_kind", self.target_kind))
         if kind == self.target_kind:
+            return self.target_kind
+        if self.target_kind == "zhijin":
+            # 纸巾订单必须始终用双臂：不切到其他品类（避免单臂抓纸巾）。
+            self.get_logger().warn(
+                "[order-select] zhijin order is dual-arm locked; refusing "
+                f"switch zhijin->{kind} reason={reason}")
             return self.target_kind
         previous = self.target_kind
         self._set_pregrasp_target_kind(kind)
@@ -1235,6 +1266,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             for candidate in primary_candidates_from_document(
                 document, self.target_kind))
         if active_still_primary:
+            self._direct_conflict_slot = None
+            self._direct_conflict_count = 0
             return
         replacement_kind = None
         for kind in self.opportunistic_target_kinds:
@@ -1251,6 +1284,23 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         # different pending class at the same slot is explicit stale-memory
         # evidence and is safe to act on while still in transit.
         if replacement_kind is None:
+            self._direct_conflict_slot = None
+            self._direct_conflict_count = 0
+            return
+        # 防抖：同一槽位冲突需连续多次确认才丢弃目标，避免行驶中矩阵
+        # 瞬时抖动反复切换（实测曾导致抓错槽位/抓不牢）。
+        if self._direct_conflict_slot != slot_key:
+            self._direct_conflict_slot = slot_key
+            self._direct_conflict_count = 0
+        self._direct_conflict_count += 1
+        if (self._direct_conflict_count
+                < DIRECT_TRANSIT_CONFLICT_CONFIRMATIONS):
+            self.get_logger().info(
+                f"[order-select] in-transit matrix conflict candidate "
+                f"slot={slot_key} expected={self.target_kind} "
+                f"observed={replacement_kind} "
+                f"count={self._direct_conflict_count}/"
+                f"{DIRECT_TRANSIT_CONFLICT_CONFIRMATIONS}; holding route")
             return
 
         stale_kind = self.target_kind
@@ -1266,6 +1316,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.direct_transit_started_at = None
         self.memory_active_hint = None
         self.memory_rerouted = False
+        self._direct_conflict_slot = None
+        self._direct_conflict_count = 0
         self.set_state(pick.STATE_GO_SCAN)
         next_hint = self._select_live_memory_hint(
             reliable_only=True, require_direct=True)
@@ -4766,6 +4818,13 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             not (odom_stale or joints_stale or laser_stale)
             and ((self.flow_phase == "grab" and stable_perception_state)
                  or stable_return_scan))
+        # 腕部对中（默认关闭）：开启后在 DEPLOY 保持感知在线，否则
+        # persistent perception 会在抓取阶段被关掉，腕部 YOLO 帧不到达。
+        wrist_center_needed = (
+            self.wrist_center_enabled
+            and self.flow_phase == "grab"
+            and self.state in pick.WRIST_GRASP_STATES)
+        perception_needed = perception_needed or wrist_center_needed
         self._publish_perception_request(perception_needed)
         if odom_stale or joints_stale or laser_stale:
             self._stop_for_stale_feedback(
@@ -5001,6 +5060,10 @@ def parse_args() -> argparse.Namespace:
         "--no-close-recheck", action="store_true",
         help="disable close-range class verification before grasping")
     parser.add_argument(
+        "--wrist-center", action="store_true",
+        help="use the active wrist camera to centre the contact target once "
+             "before the forward grasp (default: off)")
+    parser.add_argument(
         "--place-x", type=float, default=DELIVERY_TABLE_PLACE_WORLD[0])
     parser.add_argument(
         "--place-y", type=float, default=DELIVERY_TABLE_PLACE_WORLD[1])
@@ -5178,7 +5241,8 @@ def main() -> int:
             place_creep_m=args.place_creep_distance,
             close_recheck=not args.no_close_recheck,
             return_west_after_place=args.return_west_after_place,
-            return_start_after_place=args.return_start_after_place)
+            return_start_after_place=args.return_start_after_place,
+            wrist_center=args.wrist_center)
         controller.perception_always_on = bool(args.perception_always_on)
         controller.dynamic_direct_enabled = bool(args.dynamic_direct)
         controller.configure_external_perception(args.external_perception)
