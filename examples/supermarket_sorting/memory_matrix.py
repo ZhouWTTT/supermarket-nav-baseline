@@ -95,6 +95,9 @@ OVERWRITE_CONF_MARGIN = 0.02
 # 也允许作为一次近处局部核验目标。导航仍只使用货架+层，不使用列。
 MEMORY_CLOSE_OBSERVATION_M = 1.35
 MEMORY_CLOSE_CONFIDENCE_MIN = 0.70
+# 直达槽位提示的最低样本数：远距或短暂观测（个位数帧）算出的列/层
+# 容易偏一格，必须凑够多帧确认后才允许作为可靠直达目标。
+MEMORY_MIN_SAMPLES = 12
 MEMORY_REROUTE_SAVING_M = 0.30
 MEMORY_CONSUME_TOPIC = "/supermarket_sorting/memory_consume"
 SCAN_STATION_Y = 2.475
@@ -203,7 +206,8 @@ def select_memory_hint(
         candidates, base_xy, conf_threshold: float,
         exclude_slots=(), exclude_shelves=(), exclude_shelf_levels=(),
         min_last_seen: float | None = None,
-        reliable_only: bool = False) -> dict[str, Any] | None:
+        reliable_only: bool = False,
+        min_sample_count: int = 0) -> dict[str, Any] | None:
     """Choose the nearest reliable shelf/level hint from matrix evidence."""
     if base_xy is None:
         base_xy = (float("nan"), float("nan"))
@@ -238,6 +242,10 @@ def select_memory_hint(
             observed_distance = float(candidate.get("closest_distance"))
         except (TypeError, ValueError):
             observed_distance = float("inf")
+        try:
+            sample_count = int(candidate.get("sample_count") or 0)
+        except (TypeError, ValueError):
+            sample_count = 0
         travel = distance_to(x)
         item = {
             "x": x,
@@ -251,7 +259,7 @@ def select_memory_hint(
             "world_x": candidate.get("world_x"),
             "world_y": candidate.get("world_y"),
             "world_z": candidate.get("world_z"),
-            "sample_count": candidate.get("sample_count"),
+            "sample_count": sample_count,
             "last_seen": candidate.get("last_seen"),
             "travel": travel,
             "close_relaxed": False,
@@ -262,10 +270,12 @@ def select_memory_hint(
         fallback_key = (travel, -confidence, observed_distance, x, z)
         if fallback is None or fallback_key < fallback[0]:
             fallback = (fallback_key, item)
+        sample_ok = sample_count >= min_sample_count
         close_reliable = (
-            observed_distance <= MEMORY_CLOSE_OBSERVATION_M
+            sample_ok
+            and observed_distance <= MEMORY_CLOSE_OBSERVATION_M
             and confidence >= MEMORY_CLOSE_CONFIDENCE_MIN)
-        if confidence >= conf_threshold or close_reliable:
+        if (sample_ok and confidence >= conf_threshold) or close_reliable:
             item = dict(item)
             item["close_relaxed"] = (
                 close_reliable and confidence < conf_threshold)
@@ -361,6 +371,7 @@ def select_memory_route_hint(
         exclude_shelf_levels=(),
         min_last_seen: float | None = None,
         reliable_only: bool = False,
+        min_sample_count: int = 0,
         require_direct: bool = False,
         nearest_hidden_bonus_m: float = 0.60) -> dict[str, Any] | None:
     """Snapshot-parity two-tier memory routing selection.
@@ -389,6 +400,7 @@ def select_memory_route_hint(
         "exclude_shelves": exclude_shelves,
         "exclude_shelf_levels": exclude_shelf_levels,
         "min_last_seen": min_last_seen,
+        "min_sample_count": min_sample_count,
     }
     selected = select_memory_hint(
         primary, base_xy, conf_threshold,

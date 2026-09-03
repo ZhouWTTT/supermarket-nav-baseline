@@ -29,6 +29,10 @@ from path_memory import PathMemory
 FREE = 0
 LETHAL = 100
 
+# 随机走廊障碍的摆放范围（world frame，xmin, ymin, xmax, ymax）。卡住退回后
+# 的“小横移”脱困只在此区域内生效，货架区/配送区等区域保持原有导航行为。
+OBSTACLE_CORRIDOR_ZONE = (-1.51, -2.71, 1.46, 2.71)
+
 # Key locations in world frame
 START_POSE = (1.92, -3.17, math.pi / 2.0)
 # Delivery approach — close enough for the arm to place items on the table.
@@ -1447,8 +1451,14 @@ class NavigationController:
             -math.radians(60.0),
             min(math.radians(60.0), desired_delta))
         if abs(desired_delta) <= self._rotate_recovery_tolerance:
-            self._rotate_recovery_search_exhausted = True
-            return False
+            if not self._in_obstacle_corridor(bx, by):
+                self._rotate_recovery_search_exhausted = True
+                return False
+            # 障碍走廊内前方被顶死且目标方向≈当前朝向时，不能直接放弃：
+            # 实测只差几度转开就能脱困（重开 worker 后旋转 ~4° 即恢复），
+            # 这里改成先试一个 ~5° 的小角度换线，不行再交给倒车/侧移。
+            desired_delta = math.copysign(
+                self._rotate_recovery_tolerance + math.radians(2.0), 1.0)
 
         preferred_sign = 1.0 if desired_delta > 0.0 else -1.0
         raw_candidates = [
@@ -1574,25 +1584,24 @@ class NavigationController:
         # 先旋转改变朝向找安全方向；旋转搜索耗尽/次数用尽再走倒车。
         if self._start_rotate_recovery(bx, by, byaw, now):
             return True
-        if (self._reverse_recovery_attempts
-                >= self._reverse_recovery_max_attempts):
-            if (self._lateral_escape_attempts
-                    >= self._lateral_escape_max_attempts):
-                return False
-            if self._install_lateral_escape_path(bx, by, byaw, now):
-                self._lateral_escape_attempts += 1
-                self._reverse_recovery_blocked_time = 0.0
-                self._reverse_recovery_block_anchor_x = float(bx)
-                self._reverse_recovery_block_anchor_y = float(by)
-                self._reverse_recovery_cooldown_until = float(now) + 3.0
-                self.cur_lin = 0.0
-                self.cur_ang = 0.0
-                self._recovery_action = "lateral_escape_replan"
-                return True
-            return False
+        # 障碍走廊区内：只要已经退过一次仍被卡住，就先试非常小的左/右横移
+        # （换个几厘米的入线），而不是反复原地重试；区外保持原“退满次数才
+        # 侧移”的行为。
+        in_corridor = self._in_obstacle_corridor(bx, by)
+        lateral_min_attempts = (
+            1 if in_corridor
+            else self._reverse_recovery_max_attempts)
+        if (self._reverse_recovery_attempts >= lateral_min_attempts):
+            return self._start_lateral_escape(bx, by, byaw, now)
         if not self._rear_scan_available(laser_msg):
+            if in_corridor:
+                # 走廊内倒车传感器不可用时不能干等：直接试几厘米的侧移换线。
+                return self._start_lateral_escape(bx, by, byaw, now)
             return False
         if self.rear_clearance <= self._reverse_recovery_rear_stop_m:
+            if in_corridor:
+                # 后方被顶死（倒车无空间）时同样转侧移，避免原地卡到超时。
+                return self._start_lateral_escape(bx, by, byaw, now)
             return False
 
         signed_distance = -self._reverse_recovery_distance_m
@@ -1614,40 +1623,79 @@ class NavigationController:
         self.cur_ang = 0.0
         return True
 
+    def _start_lateral_escape(self, bx, by, byaw, now) -> bool:
+        """规划一条带侧向 waypoint 的绕行路径；失败/次数用尽返回 False。"""
+        if self._lateral_escape_attempts >= self._lateral_escape_max_attempts:
+            return False
+        if not self._install_lateral_escape_path(bx, by, byaw, now):
+            # 侧移也无解：加短冷却，避免每个控制周期都重复做多次 A* 规划。
+            self._reverse_recovery_cooldown_until = float(now) + 1.5
+            return False
+        self._lateral_escape_attempts += 1
+        self._reverse_recovery_blocked_time = 0.0
+        self._reverse_recovery_block_anchor_x = float(bx)
+        self._reverse_recovery_block_anchor_y = float(by)
+        self._reverse_recovery_cooldown_until = float(now) + 3.0
+        self.cur_lin = 0.0
+        self.cur_ang = 0.0
+        self._recovery_action = "lateral_escape_replan"
+        return True
+
+    def _in_obstacle_corridor(self, wx, wy) -> bool:
+        """Whether the pose lies inside the randomized obstacle corridor.
+
+        卡住退回后的小横移脱困只在随机障碍走廊内启用；该矩形之外（起始区、
+        货架通道、配送区）保持原有导航行为不变。
+        """
+        x0, y0, x1, y1 = OBSTACLE_CORRIDOR_ZONE
+        return (x0 <= float(wx) <= x1
+                and y0 <= float(wy) <= y1)
+
     def _install_lateral_escape_path(self, bx, by, byaw, now):
         """Plan through a side waypoint after straight backup repeats.
 
         A straight reverse creates turning room but does not change which side
         of the obstacle the follower approaches.  Evaluate both sides in the
         current costmap and install a complete via-waypoint route so the next
-        command necessarily contains lateral motion.
+        command necessarily contains lateral motion.  In the obstacle corridor
+        the candidate offsets start very small (the robot usually only needs
+        to change its approach line a few centimetres); elsewhere the original
+        single offset is used.
         """
         heading_x = math.cos(byaw)
         heading_y = math.sin(byaw)
         left_x = -heading_y
         left_y = heading_x
         candidates = []
-        for sign in (1, -1):
-            wx = (
-                bx - self._lateral_escape_backoff_m * heading_x
-                + sign * self._lateral_escape_offset_m * left_x)
-            wy = (
-                by - self._lateral_escape_backoff_m * heading_y
-                + sign * self._lateral_escape_offset_m * left_y)
-            if not self.cm.is_free_world(wx, wy):
-                continue
-            first = self._try_plan_with_fallback(bx, by, wx, wy)
-            if not first:
-                continue
-            second = self._try_plan_with_fallback(
-                wx, wy, self.goal_x, self.goal_y)
-            if not second:
-                continue
-            path = list(first) + list(second[1:])
-            score = self._polyline_length(path)
-            if sign == self._last_lateral_escape_sign:
-                score += 0.25
-            candidates.append((score, sign, path))
+        in_zone = self._in_obstacle_corridor(bx, by)
+        offsets = (
+            (0.08, 0.14, 0.20, 0.28, self._lateral_escape_offset_m)
+            if in_zone else (self._lateral_escape_offset_m,))
+        for offset_m in offsets:
+            for sign in (1, -1):
+                wx = (
+                    bx - self._lateral_escape_backoff_m * heading_x
+                    + sign * offset_m * left_x)
+                wy = (
+                    by - self._lateral_escape_backoff_m * heading_y
+                    + sign * offset_m * left_y)
+                if not self.cm.is_free_world(wx, wy):
+                    continue
+                first = self._try_plan_with_fallback(bx, by, wx, wy)
+                if not first:
+                    continue
+                second = self._try_plan_with_fallback(
+                    wx, wy, self.goal_x, self.goal_y)
+                if not second:
+                    continue
+                path = list(first) + list(second[1:])
+                score = self._polyline_length(path)
+                if in_zone:
+                    # 相同可行路径里优先小偏移，避免一上来就大幅横移。
+                    score += offset_m
+                if sign == self._last_lateral_escape_sign:
+                    score += 0.25
+                candidates.append((score, sign, path))
 
         if not candidates:
             return False

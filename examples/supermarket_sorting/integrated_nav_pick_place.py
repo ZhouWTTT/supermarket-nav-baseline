@@ -132,23 +132,21 @@ DELIVERY_TABLE_TOP_Z_M = 0.767
 
 # Five deterministic delivery slots.  The robot approaches from +Y and faces
 # south, so more-negative Y is deeper on the table.  Three staggered inner
-# slots are filled first, followed by two outer slots.  A literal five-item
-# depth-only row would leave less than 90 mm between centres on this 440 mm
-# deep table and would overlap the larger products.  All slots are shifted
-# 50 mm south from the original layout so the fourth and fifth products are
-# not released at the north edge of the tabletop.  A further 50 mm south shift
-# pushed the deepest inner slot out of arm reach (IK no-solution), so the inner
-# slots are reverted to the original depth while the outer slots stay shifted.
+# slots are filled first, followed by two outer slots.  The whole row is kept
+# toward the deep side of the referee delivery box (y∈[-3.630,-3.190]) so
+# goods are not released near the near (north) table edge; the deepest inner
+# slot must still stay within arm IK reach, so slot 1 is deepened only
+# modestly while the shallower slots are pulled deeper toward it.
 DELIVERY_PLACE_SLOTS_XY = (
-    (-2.20, -3.50),  # 1: deepest, inner-left
-    (-1.94, -3.48),  # 2: inner-centre
-    (-1.68, -3.46),  # 3: inner-right
-    (-2.07, -3.39),  # 4: outer-left
-    (-1.81, -3.37),  # 5: outer-right / nearest
+    (-2.20, -3.52),  # 1: deepest, inner-left
+    (-1.94, -3.51),  # 2: inner-centre
+    (-1.68, -3.49),  # 3: inner-right
+    (-2.07, -3.45),  # 4: outer-left
+    (-1.81, -3.43),  # 5: outer-right / nearest
 )
 # 纸巾专用放置位：桌子最东侧。最深内排槽位会超出双臂前伸可达范围
 # （IK 无解），故纸巾固定放东侧较浅处，机器人导航到对应 x 后直接下降。
-TISSUE_DEDICATED_PLACE_XY = (-1.55, -3.30)
+TISSUE_DEDICATED_PLACE_XY = (-1.55, -3.34)
 PLACE_SLOT_IK_NUDGE_M = 0.020
 PLACE_SLOT_XY_TOLERANCE_M = 0.020
 
@@ -196,7 +194,9 @@ PLACE_PRODUCT_BOTTOM_CLEARANCE_BY_KIND_M = {
     "pingguo": 0.003,
 }
 PLACE_APPROACH_CLEARANCE_M = 0.060
-PLACE_DESCENT_SLIDE_STEP_M = 0.0015
+# 放货垂直下降的 slide 步进（m/tick）。适当提高缩短下降时间；触桌顶住
+# 检测（slide stall）仍会立即停止下压，安全性不变。
+PLACE_DESCENT_SLIDE_STEP_M = 0.0024
 PLACE_BASE_SETTLE_S = 0.35
 PLACE_ARM_SETTLE_TOLERANCE_RAD = 0.025
 PLACE_SLIDE_SETTLE_TOLERANCE_M = 0.004
@@ -206,10 +206,14 @@ PLACE_SLIDE_SETTLE_TOLERANCE_M = 0.004
 # 停留 18s 等待收敛）。approach 只是把 slide 放到 overhead 高度，触桌卡位
 # 6mm 不影响后续 stage1 水平精修（slide 不动）与 stage2 下降（触桌检测
 # 依力矩饱和触发松爪），故单独放宽到 8mm，全局常量保持不变。
-PLACE_APPROACH_SLIDE_TOLERANCE_M = 0.008
-PLACE_XY_REFINE_STEP_M = 0.020
-PLACE_XY_REFINE_SETTLE_S = 0.30
-PLACE_XY_REFINE_TIMEOUT_S = 12.0
+# 进一步放宽到 12mm：实测 slide 末端按指数规律缓慢收敛，最后 8mm 需要约
+# 6s；剩余几毫米会在 stage1 水平精修/下降期间自然补上，对 XY 放置无影响。
+PLACE_APPROACH_SLIDE_TOLERANCE_M = 0.012
+PLACE_XY_REFINE_STEP_M = 0.025
+PLACE_XY_REFINE_SETTLE_S = 0.25
+# 水平精修最长等待：超过后按既有超时恢复逻辑锁实测位姿就地下降释放，
+# 不再长时间等待精修收敛。
+PLACE_XY_REFINE_TIMEOUT_S = 5.0
 PLACE_XY_COMMAND_MIN_WAIT_S = 0.75
 PLACE_XY_STATIONARY_SETTLE_S = 0.30
 PLACE_XY_STATIONARY_ARM_RAD_S = 0.020
@@ -219,6 +223,11 @@ PLACE_XY_STATIONARY_SLIDE_MPS = 0.005
 # 4 mm command-ready gate above, but let the Cartesian refinement consume a
 # genuinely stationary loaded pose inside this separate safety envelope.
 PLACE_XY_STATIONARY_SLIDE_ERROR_M = 0.012
+# 精修稳定门控的残差放行阈值：实测机械臂已静止、且关节残差不超过该值
+# （0.05–0.08 rad 区间取中值）时，不再等 0.3s 稳定窗口，直接视为本步到位，
+# 从实测 TCP 继续下一步笛卡尔修正。严格 0.025 rad 的 commands_ready 仍优
+# 先判定；该放行只处理“仿真关节跟踪残差不收敛、但臂已停稳”的情况。
+PLACE_XY_REFINE_RESIDUAL_ACCEPT_RAD = 0.060
 # A placement timeout must end by lowering onto the table, never by sweeping a
 # clamped product back through the table edge.  This envelope is only a last
 # resort; normal refinement still targets the 20 mm assigned-slot tolerance.
@@ -256,7 +265,8 @@ PLACE_CONTACT_BOTTOM_HIGH_TOL_BY_KIND_M = {
     "pingguo": 0.008,
 }
 PLACE_CLEAR_TABLE_MARGIN_M = 0.060
-PLACE_CLEAR_TABLE_SPEED_MPS = 0.60
+# 放货后离桌/收臂时的底盘速度：此时货物已放下或为空载，适当提高。
+PLACE_CLEAR_TABLE_SPEED_MPS = 0.65
 PLACE_CLEAR_TABLE_TIMEOUT_S = 15.0
 # Keep the fast, obstacle-aware navigator active until its 0.10 m coarse
 # tolerance.  The parent controller is retained only for the final few
@@ -304,17 +314,19 @@ BACKUP_TIMEOUT_S = 8.0
 # every other product and all later delivery/return turns retain the normal
 # navigator limits.
 POST_GRAB_SLOW_TURN_WATCHDOG_GRACE_S = 10.0
-HEWEIDAO_LOADED_TURN_MAX_RPS = 0.55
-# Product-specific loaded transit limits.  These are not blanket navigation
-# slowdowns: they apply only after a successful grasp and before delivery.
-# Kouxiangtang slipped in two independent runs exactly as the route requested
-# 1.0--2.0 rad/s turns; limiting yaw removes that lateral impulse while the
-# 0.75 m/s straight cap keeps the match-time cost modest.
+# 取货后载货转向的角速度上限。原 0.55 rad/s 偏保守，180° 调向要 5s+；
+# 提高到 0.80 仍明显低于曾导致口香糖滑脱的 1.0–2.0 rad/s 区间。
+HEWEIDAO_LOADED_TURN_MAX_RPS = 0.80
+# 取货后载货转向限速：只保留纸巾的角速度上限（双臂侧夹夹持，限 1.8 rad/s
+# 防止纸盒在快速转向中在指间滑动）；其余货物不再限制转向角速度，直接走
+# 导航自身的 2.5 rad/s 上限。口香糖/球体仍保留直线限速，防止运输中惯性
+# 前滑（此前口香糖在 1.0–2.0 rad/s 转向下滑脱，现仅解除转向限制）。
+DUAL_TISSUE_LOADED_TURN_MAX_RPS = 1.8
 LOADED_TRANSPORT_LIMITS = {
-    "kouxiangtang": (0.75, 0.55),
-    "heweidao": (None, HEWEIDAO_LOADED_TURN_MAX_RPS),
-    "chengzi": (0.80, 0.55),
-    "pingguo": (0.80, 0.55),
+    "kouxiangtang": (0.75, None),
+    "chengzi": (0.80, None),
+    "pingguo": (0.80, None),
+    "zhijin": (None, DUAL_TISSUE_LOADED_TURN_MAX_RPS),
 }
 TRANSIT_SLIDE_TARGET_M = 0.006
 TRANSIT_SLIDE_TOLERANCE_M = 0.010
@@ -342,7 +354,9 @@ TRANSPORT_DROP_FAILURE_SETTLE_S = 0.15
 # low-speed hand-off.  The physical chassis front remains clear of the table
 # at the nominal endpoint.
 PLACE_CREEP_DISTANCE_M = 0.25
-PLACE_CREEP_SPEED_MPS = 0.50
+# 到桌前的最后蠕行速度（默认档）。球体/口香糖等弱抓握货物仍有独立慢速
+# 覆盖，不随此值变化。
+PLACE_CREEP_SPEED_MPS = 0.55
 # The final 25 cm is driven while the product is extended over the tabletop.
 # Reduce only that short segment for weak lateral and spherical grasps; the
 # route to the table retains the limits above.
@@ -359,12 +373,16 @@ PLACE_BASE_TO_SLOT_LONGITUDINAL_M = 0.62
 PLACE_CREEP_GOAL_TOLERANCE_M = 0.01
 PLACE_CREEP_YAW_GAIN = 2.0
 PLACE_CREEP_MAX_ANGULAR_RPS = 0.30
-# The parent limiter permits 0.022 rad every 20 ms (about 1.1 rad/s) and can
+# The parent limiter permits 0.026 rad every 20 ms (about 1.3 rad/s) and can
 # apply that full step as soon as placement starts.  Ramp the loaded arm from
 # rest and cap it at the gentler shelf-contact rate so the held product is not
 # shocked loose.  Empty-arm recovery after release keeps the normal speed.
-PLACE_LOADED_ARM_MAX_STEP_RAD = 0.006
-PLACE_LOADED_ARM_STEP_RAMP_RAD = 0.00025
+# 默认档适当提高，缩短载货摆臂到放置姿态的时间；球体/纸巾仍有独立半速
+# 上限覆盖，不受影响。
+# 默认档适当提高，缩短载货摆臂到放置姿态的时间；球体/纸巾仍有独立半速
+# 上限覆盖，不受影响。
+PLACE_LOADED_ARM_MAX_STEP_RAD = 0.009
+PLACE_LOADED_ARM_STEP_RAMP_RAD = 0.00045
 # Round products can remain secure for long chassis transit yet slip when a
 # large multi-joint placement reconfiguration accelerates the fingers.  Give
 # spheres a product-specific quarter-speed cap; correctness is worth the
@@ -392,6 +410,21 @@ SPHERE_TRANSPORT_HELD_MINIMUM = {
 PLACE_RELEASE_TABLE_MARGIN_M = 0.04
 PLACE_APPROACH_HARD_TIMEOUT_S = 30.0
 PLACE_APPROACH_PROGRESS_LOG_S = 2.0
+# 载货摆臂预定位（slide 发出前的“臂先到运输高度”）专用快速放行：左右臂
+# 可能因关节限位在离目标 0.05–0.1 rad 处彻底停住不再收敛（实测 kele slot4
+# 卡在 0.093 rad，关节速度归零）。此时 TCP 通常已位于槽位附近，与其干等
+# 30s 硬超时，不如在“已等够时间 且 误差不再改善 且 实测 TCP 已在桌面安全
+# 容差内”时锁实测姿态直接下降释放。仍在正常收敛时不会被提前打断；本阶段
+# 尚未发出 slide 命令，与滑轨慢收敛是两条不同路径，不会重演可乐早降事故。
+PLACE_ARM_PREPOSITION_MAX_S = 4.0
+PLACE_ARM_PREPOSITION_PROGRESS_GATE_S = 2.0
+# 纸巾（双臂）放置 overhead 摆臂的专用快速放行：双臂常因关节限位停在
+# ~0.13 rad 残差无法继续收敛，等满 30s 硬超时纯属浪费。纸巾固定放东侧
+# 专用槽位，slide 行程短、底盘离配送桌 keep-out 远，按实测姿态锁臂直接
+# 下降再逆挤开爪已被多轮日志验证安全。放行条件是“已等待上限时间 且 误差
+# 不再改善”，因此仍在正常收敛时不会被提前打断（可乐单臂不在本路径）。
+DUAL_TISSUE_PLACE_ARM_SETTLE_MAX_S = 3.0
+DUAL_TISSUE_PLACE_ARM_SETTLE_PROGRESS_GATE_S = 1.5
 # 慢速仿真/高负载下载货摆臂可能超过旧的 15 s 上限但仍在正常收敛。硬超时
 # 只作为最终上限：超过后若手臂误差仍在改善（窗口内改善 ≥ 阈值）就继续等，
 # 只有"超时且长时间无改善"（真卡死）才判失败。
@@ -406,10 +439,10 @@ PLACE_MOTION_LOG_PERIOD_S = 0.25
 # unconditional 3 s dwell accumulated once per order without adding safety.
 FLOW_DONE_SETTLE_S = 0.25
 
-# After the first delivered item, the runner may ask this worker to return to
-# shelf A and record a complete stationary inventory view before it exits.
-# Use every normal shelf view, but finish at the high overview posture so the
-# next worker does not inherit a lowered camera assembly for long transit.
+# After the first delivered item, the runner asks this worker to return to
+# shelf A so the second worker starts from the A side.  The stationary
+# full-view scan is disabled (persistent perception records shelf views
+# during transit); the poses below are kept for reference/re-enabling.
 RETURN_WEST_SCAN_POSES = (
     pick.SCAN_CAMERA_POSES[1:] + pick.SCAN_CAMERA_POSES[:1])
 RETURN_WEST_GOAL = (pick.SCAN_X[-1], pick.SCAN_Y, pick.YAW_NORTH)
@@ -447,7 +480,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
       "nav_to_delivery" — navigator to DELIVERY_APPROACH with goods held.
       "place"           — extend, descend near the table, release, retreat.
       "return_to_west"  — after the first delivery, navigate back to shelf A.
-      "return_west_scan" — hold at A and record all shelf camera views.
+      "return_west_scan" — (disabled) hold at A and record shelf camera views.
       "return_west_recover" — restore the neutral transit posture.
       "drop_success_recover" — low slot release detected; clear vertically.
       "drop_failed_recover" — premature product loss; recover before retry.
@@ -491,6 +524,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_slot = place_slot
         self.place_world = np.array(
             [place_x, place_y, place_z], dtype=float)
+        # Delivery slot assigned by the runner for this worker; used to
+        # restore the generic position when an opportunistic order switch
+        # leaves the tissue-dedicated placement.
+        self._place_xy_base = (float(place_x), float(place_y))
         if target_kind == "zhijin":
             # 纸巾固定放东侧专用位，避免最深槽位双臂 IK 无解。
             self.place_world[0] = TISSUE_DEDICATED_PLACE_XY[0]
@@ -631,7 +668,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         # process boundaries; this controller only reads it and publishes an
         # immediate consume event after the product leaves the shelf.
         self.memory_file = None
-        self.memory_confidence_threshold = 0.90
+        self.memory_confidence_threshold = 0.95
+        self.memory_min_samples = 12
         self.memory_active_hint = None
         self.memory_failed_hint = None
         self.memory_failed_hint_levels = set()
@@ -643,6 +681,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.direct_transit_started_at = None
         self.memory_reroute_not_before = time.time()
         self._memory_last_reroute_check = 0.0
+        # Number of other pending orders reported by the runner at spawn.
+        # A worker only requests a dynamic *order* reroute when this is > 0;
+        # otherwise the historical same-order fallback (full scan / retry)
+        # is kept so the last remaining order still gets its chance.
+        self.other_pending_orders = 0
         self._memory_consumed = False
 
         self.get_logger().info(
@@ -680,12 +723,12 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             })
 
     def _post_grab_slow_turn_active(self) -> bool:
-        """Whether the initial slow-turn watchdog grace is still active."""
-        until = float(getattr(self, "_post_grab_slow_turn_until", 0.0))
-        return (
-            until > 0.0
-            and self._heweidao_loaded_turn_limit_active()
-            and self.now() < until)
+        """Whether the initial slow-turn watchdog grace is still active.
+
+        Disabled: heweidao's post-grab turn now uses the normal navigator
+        angular limit like every other non-tissue product.
+        """
+        return False
 
     def _loaded_transport_limits(
             self) -> tuple[float | None, float | None]:
@@ -814,12 +857,14 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
     def configure_memory_routing(
             self, path: str | None, confidence_threshold: float,
+            min_samples: int = 12,
             initial_x: float | None = None,
             initial_z: float | None = None) -> None:
         """Read runner-owned matrix hints without sharing process state."""
         self.memory_file = (
             None if not path else pathlib.Path(path).expanduser().resolve())
         self.memory_confidence_threshold = float(confidence_threshold)
+        self.memory_min_samples = max(0, int(min_samples))
         self.memory_reroute_not_before = time.time()
         if initial_x is not None:
             shelf = shelf_for_scan_x(initial_x)
@@ -835,6 +880,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.get_logger().info(
             f"[memory] routing file={self.memory_file} "
             f"threshold={self.memory_confidence_threshold:.2f} "
+            f"min_samples={self.memory_min_samples} "
             f"initial_hint={self.memory_active_hint}")
 
     def _select_live_memory_hint(
@@ -857,7 +903,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             exclude_shelves=self.memory_exhausted_shelves,
             exclude_shelf_levels=self.memory_failed_hint_levels,
             min_last_seen=min_last_seen,
-            reliable_only=reliable_only)
+            reliable_only=reliable_only,
+            min_sample_count=self.memory_min_samples)
 
     def configure_direct_slot_target(
             self, shelf: str, level: str, column: str,
@@ -955,12 +1002,17 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         hint_x = float(hint["x"])
         column = str(hint.get("column", ""))
         confidence = float(hint.get("confidence", 0.0) or 0.0)
+        try:
+            sample_count = int(hint.get("sample_count") or 0)
+        except (TypeError, ValueError):
+            sample_count = 0
         # Snapshot 直达门槛：隐藏历史候选不直达；纸巾三列均由双臂流程
-        # 支持；动态直达还需置信度门槛。close-recheck 由调用方按需开启
+        # 支持；动态直达还需置信度与样本数门槛。close-recheck 由调用方按需开启
         # （关闭时不再作为直达的强制前置条件，抓取直接进入 ALIGN→grasp）。
         if (not hint.get("hidden_fallback")
                 and column in {"1", "2", "3"}
                 and confidence >= DYNAMIC_DIRECT_CONF_MIN
+                and sample_count >= self.memory_min_samples
                 and self.configure_direct_slot_target(
                     str(hint["shelf"]), str(hint["level"]), column,
                     product_y=hint.get("world_y"),
@@ -1042,6 +1094,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                     f"[memory] hint {failed_hint} failed; matrix failover "
                     f"-> {self.memory_active_hint} x={hint_x:.3f}")
                 return
+            if self._reroute_on_hint_exhausted(failed_hint):
+                return
             self.get_logger().info(
                 f"[memory] hint {failed_hint} failed; no reliable matrix "
                 "candidate remains, resuming fallback scan")
@@ -1088,6 +1142,70 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             f"dynamic reroute {current_x:.3f}->{float(refreshed['x']):.3f}")
         self.memory_rerouted = True
         self.memory_reroute_not_before = time.time()
+
+    def _reroute_on_hint_exhausted(self, failed_hint) -> bool:
+        """No reliable matrix evidence remains after a shelf hint failure.
+
+        The memory directed this worker to a shelf/level and that target was
+        not localised there, with no further evidence candidate to fail over
+        to.  When other pending orders exist, abandon this product and let
+        the runner dispatch the nearest other order instead of launching a
+        full store-wide scan for a product the matrix has lost track of.
+        """
+        if self.other_pending_orders <= 0:
+            return False
+        self.abort_reason = (
+            f"reroute:hint_exhausted:kind={self.target_kind}"
+            f":hint={failed_hint}")
+        self.get_logger().error(
+            f"[reroute] memory hint {failed_hint} failed and no reliable "
+            f"matrix candidate remains for kind={self.target_kind}; "
+            f"other pending orders={self.other_pending_orders}; "
+            "abandoning this order for a dynamic order reroute")
+        self.set_state(pick.STATE_ABORT)
+        return True
+
+    def _on_target_kind_changed(self, kind: str) -> None:
+        """Follow the product target in the delivery plan.
+
+        An opportunistic order switch changes not only the grasp profile but
+        also where the product is placed: tissue goes to its dedicated
+        two-arm slot, everything else back to the runner-assigned slot.
+        """
+        if kind == "zhijin":
+            self.place_world[0] = TISSUE_DEDICATED_PLACE_XY[0]
+            self.place_world[1] = TISSUE_DEDICATED_PLACE_XY[1]
+            self.get_logger().info(
+                f"[order-switch] delivery moved to tissue-dedicated slot "
+                f"xy={TISSUE_DEDICATED_PLACE_XY}")
+        else:
+            self.place_world[0] = self._place_xy_base[0]
+            self.place_world[1] = self._place_xy_base[1]
+
+    def _reroute_on_missing_direct_slot(self) -> bool:
+        """Direct-slot hint pointed at the wrong place: switch orders.
+
+        Close-recheck already failed and the bounded adjacent-column retry
+        found nothing, so the memory hint is stale.  When other pending
+        orders exist, abandon this product and let the runner dispatch the
+        nearest other order instead of scanning this shelf (and later the
+        whole store) for a product that is not there.
+        """
+        if (not self.direct_slot_target_active
+                or self.other_pending_orders <= 0):
+            return False
+        slot = self.target_slot_key()
+        self.abort_reason = (
+            f"reroute:direct_slot_missing:kind={self.target_kind}"
+            f":slot={slot}")
+        self.direct_slot_target_active = False
+        self.get_logger().error(
+            "[reroute] direct-slot target missing at close-recheck "
+            f"kind={self.target_kind} slot={slot}; other pending orders="
+            f"{self.other_pending_orders}; abandoning this order for a "
+            "dynamic order reroute")
+        self.set_state(pick.STATE_ABORT)
+        return True
 
     def _restore_full_scan_after_inventory_hint(self) -> None:
         """Expose a failed matrix shelf/level to immediate route failover."""
@@ -3008,13 +3126,23 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         if not stationary:
             self._place_refine_motion_stable_since = None
             return False
+        residual = self.dual_arm_error() if dual else self.selected_arm_error()
+        if residual <= PLACE_XY_REFINE_RESIDUAL_ACCEPT_RAD:
+            # 实测已静止且残差小于阈值：不需要再等稳定窗口，直接视为本步
+            # 到位，从实测 TCP 继续下一步笛卡尔修正。
+            self._place_refine_motion_stable_since = None
+            self.get_logger().info(
+                "[place] refine settled: arm stationary with residual "
+                f"{residual:.4f}rad <= "
+                f"{PLACE_XY_REFINE_RESIDUAL_ACCEPT_RAD:.3f}rad; "
+                "continuing Cartesian correction from measured TCP")
+            return True
         if self._place_refine_motion_stable_since is None:
             self._place_refine_motion_stable_since = now
             return False
         if (now - self._place_refine_motion_stable_since
                 < PLACE_XY_STATIONARY_SETTLE_S):
             return False
-        residual = self.dual_arm_error() if dual else self.selected_arm_error()
         self.get_logger().warn(
             "[place] refine actuator stationary with residual joint error; "
             "continuing Cartesian correction from measured TCP "
@@ -3468,13 +3596,51 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                         "[place] loaded arm pre-positioned at transport "
                         f"height; lowering slide vertically "
                         f"{self.cmd_slide:.3f}->{self.des_slide:.3f}")
-                elif (now - self._place_stage0_wait_log
-                        >= PLACE_APPROACH_PROGRESS_LOG_S):
-                    self._place_stage0_wait_log = now
-                    self.get_logger().info(
-                        "[place] waiting for loaded arm pre-position "
-                        f"arm_error={arm_error:.4f}rad "
-                        f"slide={self.joints.get('slide_joint')}")
+                else:
+                    pre_elapsed = now - self.place_t0
+                    if (arm_error
+                            <= self._place_approach_best_error
+                            - PLACE_APPROACH_PROGRESS_IMPROVEMENT_RAD):
+                        self._place_approach_best_error = arm_error
+                        self._place_approach_best_error_at = now
+                    if (pre_elapsed >= PLACE_ARM_PREPOSITION_MAX_S
+                            and now - self._place_approach_best_error_at
+                            >= PLACE_ARM_PREPOSITION_PROGRESS_GATE_S):
+                        # 摆臂已停住不再收敛：若实测 TCP 已在槽位安全容差内
+                        # （桌面上方），直接锁实测姿态、滑轨垂直下降释放，
+                        # 避免在 30s 硬超时前干等；不在安全区则沿用下方超时。
+                        stalled_tcp = self.selected_tcp_world()
+                        if (stalled_tcp is not None
+                                and self._place_timeout_fallback_safe(
+                                    stalled_tcp)):
+                            self.get_logger().warn(
+                                "[place] loaded arm pre-position stalled "
+                                "without progress for "
+                                f"{PLACE_ARM_PREPOSITION_PROGRESS_GATE_S:.1f}s "
+                                f"(arm_error={arm_error:.4f}rad tcp="
+                                f"{np.round(stalled_tcp, 3)}); locking "
+                                "measured arm pose and descending in place")
+                            self._begin_single_place_descent(
+                                now, stalled_tcp)
+                            return
+                    if (pre_elapsed >= PLACE_APPROACH_HARD_TIMEOUT_S
+                            and now - self._place_approach_best_error_at
+                            >= PLACE_APPROACH_PROGRESS_GATE_S):
+                        # 与阶段 2 一致：臂长期无法到达运输预定位时不再干等
+                        # 超时。fatal recovery 对已位于槽位上空的负载臂会
+                        # 冻结实测姿态、改用滑轨垂直下降完成安全放置。
+                        raise RuntimeError(
+                            "[place] loaded arm did not reach transport "
+                            f"pre-position within "
+                            f"{PLACE_APPROACH_HARD_TIMEOUT_S:.0f}s "
+                            f"(arm_error={arm_error:.4f}rad)")
+                    if (now - self._place_stage0_wait_log
+                            >= PLACE_APPROACH_PROGRESS_LOG_S):
+                        self._place_stage0_wait_log = now
+                        self.get_logger().info(
+                            "[place] waiting for loaded arm pre-position "
+                            f"arm_error={arm_error:.4f}rad "
+                            f"slide={self.joints.get('slide_joint')}")
                 return
             # 商品底部已触桌（slide 被顶住）：不必等 approach 到位，就地松爪。
             if self._place_slide_stalled(now):
@@ -3748,6 +3914,22 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                         - PLACE_APPROACH_PROGRESS_IMPROVEMENT_RAD):
                     self._place_approach_best_error = dual_error
                     self._place_approach_best_error_at = now
+                if (self.target_kind == "zhijin"
+                        and now - self.place_t0
+                        >= DUAL_TISSUE_PLACE_ARM_SETTLE_MAX_S
+                        and now - self._place_approach_best_error_at
+                        >= DUAL_TISSUE_PLACE_ARM_SETTLE_PROGRESS_GATE_S):
+                    release_world = self._dual_release_world()
+                    if release_world is not None:
+                        self.get_logger().warn(
+                            "[place-dual] tissue overhead arm did not "
+                            f"settle within "
+                            f"{DUAL_TISSUE_PLACE_ARM_SETTLE_MAX_S:.0f}s and "
+                            "no longer improving "
+                            f"(dual_error={dual_error:.4f}rad); locking "
+                            "measured arms and lowering to release")
+                        self._begin_dual_place_descent(now, release_world)
+                        return
                 if (now - self._place_stage0_wait_log
                         >= PLACE_APPROACH_PROGRESS_LOG_S):
                     self._place_stage0_wait_log = now
@@ -4024,7 +4206,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             return
 
         # The route navigator has a deliberately broad arrival tolerance.
-        # Refine position and north-facing yaw before recording shelf A.
+        # Refine position and north-facing yaw before finishing at shelf A.
         arrived = pick.ShelfPickController.drive_to(
             self, target, RETURN_WEST_GOAL[2], 0.08)
         if not arrived:
@@ -4032,13 +4214,13 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.set_twist(0.0, 0.0)
         self.cmd_linear = 0.0
         self.cmd_angular = 0.0
-        self._set_flow_phase("return_west_scan")
-        self.return_scan_pose_index = 0
-        self.return_scan_pose_started_at = now
-        self.return_scan_camera_ready_since = None
+        # 用户要求：只把下一单“带”到 A 货架，不再在 A 原地做整轮库存扫描
+        # （常开感知在回程途中已持续记录货架视图）。到站即收尾，下个
+        # worker 会从 A 侧出发。
         self.get_logger().info(
-            "[return-west] stopped at shelf A; starting stationary full-view "
-            f"inventory scan ({len(RETURN_WEST_SCAN_POSES)} poses)")
+            "[return-west] stopped at shelf A; skipping stationary inventory "
+            "scan (perception already recorded shelf views)")
+        self._finish_after_return_scan(now)
 
     def _advance_return_scan_pose(self, now: float) -> None:
         completed_name = RETURN_WEST_SCAN_POSES[
@@ -4505,11 +4687,17 @@ def parse_args() -> argparse.Namespace:
         "--memory-file",
         help="runner-owned atomic memory-matrix JSON used for live routing")
     parser.add_argument(
-        "--memory-confidence-threshold", type=float, default=0.90)
+        "--memory-confidence-threshold", type=float, default=0.95)
+    parser.add_argument(
+        "--memory-min-samples", type=int, default=12)
     parser.add_argument(
         "--dynamic-direct", action="store_true",
         help="allow one fresh memory candidate to redirect this worker "
              "directly to a guarded fixed slot")
+    parser.add_argument(
+        "--other-pending-orders", type=int, default=0,
+        help="number of other pending orders known to the runner; the "
+             "worker may request a dynamic order reroute only when > 0")
     parser.add_argument(
         "--perception-always-on", action="store_true",
         help="ignore state-level perception disable requests so a formal "
@@ -4584,8 +4772,9 @@ def parse_args() -> argparse.Namespace:
              "the first in a match")
     parser.add_argument(
         "--return-west-after-place", action="store_true",
-        help="after a successful placement, return to shelf A and perform "
-             "one stationary full-view inventory scan before exiting")
+        help="after a successful placement, return to shelf A before exiting "
+             "so the next order starts from the A side (travel only, no "
+             "stationary inventory scan)")
     parser.add_argument(
         "--return-start-after-place", action="store_true",
         help="after the final placement of a match, return to the start pose "
@@ -4603,6 +4792,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--confidence must be in [0, 1]")
     if not 0.0 <= args.memory_confidence_threshold <= 1.0:
         parser.error("--memory-confidence-threshold must be in [0, 1]")
+    if args.memory_min_samples < 0:
+        parser.error("--memory-min-samples must be >= 0")
     if not 0.0 < args.max_inference_hz < float("inf"):
         parser.error("--max-inference-hz must be finite and positive")
     if args.max_scan_cycles < 1:
@@ -4719,6 +4910,7 @@ def main() -> int:
         controller.configure_external_perception(args.external_perception)
         controller.configure_opportunistic_targets(args.candidate_kind)
         controller.scan_prefer_west_start = args.scan_start_west
+        controller.other_pending_orders = max(0, int(args.other_pending_orders))
         if args.scan_start_x is not None:
             controller.configure_inventory_scan_hint(
                 args.scan_start_x, args.scan_marker_z)
@@ -4727,6 +4919,7 @@ def main() -> int:
         controller.configure_memory_routing(
             args.memory_file,
             args.memory_confidence_threshold,
+            min_samples=args.memory_min_samples,
             initial_x=args.scan_start_x,
             initial_z=args.scan_marker_z)
         if args.memory_initial_shelf is not None:

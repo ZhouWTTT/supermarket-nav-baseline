@@ -185,6 +185,22 @@ def marker_arguments(marker_ids: Iterable[int]) -> list[str]:
     return arguments
 
 
+def prefer_non_rerouted(
+        candidates: list[Order], rerouted_order_ids: Iterable[str]) -> list[Order]:
+    """Prefer orders that were not just abandoned after a wrong localisation.
+
+    A mislocalised order is deferred instead of retried immediately, so the
+    next worker grabs the nearest *other* pending product.  The deferred
+    order is still returned when it is the only candidate left, so it is
+    never permanently lost.
+    """
+    excluded = set(rerouted_order_ids or ())
+    if not excluded:
+        return candidates
+    fresh = [order for order in candidates if order.id not in excluded]
+    return fresh if fresh else candidates
+
+
 def associate_detection_marker(
         detection: dict[str, Any], markers: Iterable[dict[str, Any]]) -> dict | None:
     """Associate one YOLO box with the shelf marker directly below it.

@@ -33,6 +33,7 @@ from competition_task import (
     GRASP_COST,
     TaskMessageError,
     marker_arguments,
+    prefer_non_rerouted,
 )
 from memory_matrix import MemoryMatrixTracker, select_memory_route_hint
 
@@ -127,6 +128,11 @@ class CompetitionRunner(Node):
         self.selected_memory_hint: dict | None = None
         self.immediate_retry_order_id: str | None = None
         self.failed_memory_slots: dict[str, set[str]] = {}
+        # Orders whose memory hint routed the worker to the wrong slot.  They
+        # are deferred while any other pending order remains, so the next
+        # dispatch grabs the nearest *other* product instead of re-digging
+        # into the mislocalised one.
+        self.rerouted_order_ids: set[str] = set()
         self.memory_path = Path(self.args.runtime_dir) / (
             f"memory_matrix_waiting_{os.getpid()}.json")
         self.order_first_started: dict[str, tuple[float, str]] = {}
@@ -192,6 +198,7 @@ class CompetitionRunner(Node):
         self.selected_memory_hint = None
         self.immediate_retry_order_id = None
         self.failed_memory_slots.clear()
+        self.rerouted_order_ids.clear()
         self.worker_candidate_kinds.clear()
         self.order_first_started.clear()
         self.order_active_elapsed_s.clear()
@@ -284,10 +291,14 @@ class CompetitionRunner(Node):
 
         same_order_drop_retry = (
             self.immediate_retry_order_id == order.id)
-        # Nearest/sequence selection belongs to the runner.  Letting a worker
-        # opportunistically change class after dispatch would invalidate the
-        # selected memory hint, retry bookkeeping and failed-slot ownership.
-        candidate_kinds = [order.kind]
+        # Every pending class is offered as an opportunistic single-trip
+        # target: if close-recheck (or the scan) finds another pending
+        # order's product instead of the dispatched one, the worker grabs
+        # that product and the grasp/placement follow the new kind.  The
+        # dispatched kind keeps priority; retry bookkeeping stays safe
+        # because _resolve_worker_order attributes the result to the pending
+        # order of the delivered kind and failed slots are learned per kind.
+        candidate_kinds = self._candidate_kinds_for(order)
         self.immediate_retry_order_id = None
         command = [
             sys.executable,
@@ -325,24 +336,31 @@ class CompetitionRunner(Node):
             "--memory-file", str(self.memory_path),
             "--memory-confidence-threshold",
             str(self.args.memory_confidence_threshold),
+            "--memory-min-samples",
+            str(self.args.memory_min_samples),
         ])
         if self.args.dynamic_direct:
             command.append("--dynamic-direct")
-        # 默认关闭抓前 close-recheck：记忆直达/扫描命中后直接 ALIGN→grasp，
-        # 流程更丝滑；需要恢复核验时用 --close-recheck 重新开启（代码保留）。
+        # 默认给面向货架的 close-recheck 一次短暂 ArUco 优先观察机会；
+        # Marker 被遮挡/无法解码时，worker 仍会自动回退 YOLO + depth，
+        # 因此不会把 ArUco 变成抓取硬门槛。
         if not self.args.close_recheck:
             command.append("--no-close-recheck")
         if self.args.perception_always_on:
             command.append("--perception-always-on")
-        # The first physically delivered item always occupies slot zero.
-        # Keep that worker alive after placement so it returns to shelf A and
-        # records a stationary inventory sweep before the next order starts.
+        # The first physically delivered item occupies slot zero.  Keep that
+        # worker alive after placement so it travels back to shelf A before
+        # the next order starts — the second worker therefore begins from the
+        # A side.  Only the travel is required now: 回 A 后不再做整轮库存
+        # 扫描（常开感知在回程中已持续记录），到 A 即收尾。
         return_west_after_place = place_slot == 0
         # The last pending order returns to the start pose after placement;
-        # this takes precedence over the shelf-A inventory return.
+        # this takes precedence over the shelf-A repositioning.
         remaining_pending = sum(
             1 for item in self.task.orders
             if item.status == "pending" and item.id != order.id)
+        command.extend([
+            "--other-pending-orders", str(remaining_pending)])
         return_start_after_place = remaining_pending == 0
         if return_start_after_place:
             command.append("--return-start-after-place")
@@ -451,13 +469,14 @@ class CompetitionRunner(Node):
 
     def _select_direct_hint(
             self, order, excluded_slots: list[str] | set[str]):
-        """Snapshot 直达语义：仅主证据可直达槽位，隐藏候选只做扫描。
+        """Snapshot 直达语义：仅可靠的主证据可直达槽位，隐藏候选只做扫描。
 
         直达槽位必须重新从主证据（primary_candidates）选择，而不是沿用
         订单排序时的混合提示：被同格其他品类盖住的历史候选（hidden
         fallback）绝不直达，避免追着误检/旧记录跑。纸巾三列均由双臂
-        抓取流程支持。与 snapshot 初始直达一致，不再额外要求置信度
-        门槛——primary 主证据本身已含多帧确认与样本数门槛。
+        抓取流程支持。直达还要求 evidence 达到置信度与样本数门槛
+        （--memory-confidence-threshold / --memory-min-samples），避免
+        远距或短暂观测算偏的列/层把机器人带到错误槽位反复 close-recheck。
         """
         memory_candidates, observer_xy = (
             self.memory_tracker.routing_snapshot(order.kind))
@@ -469,6 +488,8 @@ class CompetitionRunner(Node):
             observer_xy,
             self.args.memory_confidence_threshold,
             exclude_slots=excluded_slots,
+            reliable_only=True,
+            min_sample_count=self.args.memory_min_samples,
             require_direct=True)
         if hint is None or hint.get("hidden_fallback"):
             return None
@@ -724,6 +745,11 @@ class CompetitionRunner(Node):
         fatal_match = (
             isinstance(result_error, str)
             and result_error.startswith("fatal-match:"))
+        reroute_requested = (
+            not delivered
+            and order is not None
+            and isinstance(result_error, str)
+            and result_error.startswith("reroute:"))
         finish_max_attempts = (
             1 if (no_middle_tissue or fatal_match) else self.args.max_attempts)
 
@@ -761,6 +787,12 @@ class CompetitionRunner(Node):
                     self.failed_memory_slots.setdefault(
                         order.kind, set()).add(
                             f"{level}|{shelf}|{column}")
+            if reroute_requested and order.status == "pending":
+                self.rerouted_order_ids.add(order.id)
+                self.get_logger().info(
+                    f"[reroute] order id={order.id} kind={order.kind} "
+                    f"slot={result_slot} localisation was wrong; deferring it "
+                    "and switching to the nearest other pending order")
             self._ensure_order_timing_started(order)
             self._record_order_timing(order, result)
             summary = (
@@ -844,6 +876,13 @@ class CompetitionRunner(Node):
             GRASP_COST.get(order.kind, 10.0),
             order.source_index,
         ))
+        # 非纸巾行程不允许把纸巾当顺手候选抓走：纸巾一旦提前上桌，后续
+        # 单臂放置就可能撞到它。只有派出纸巾本身（此时其余订单通常已完成）
+        # 才把纸巾列入候选；_select_order 已保证纸巾不会在还有非纸巾待办
+        # 时被派出，这里再兜底挡掉跨订单的顺手抓取。
+        if dispatch_order.kind != "zhijin":
+            eligible = [
+                order for order in eligible if order.kind != "zhijin"]
         kinds = []
         for order in eligible:
             if order.kind not in kinds:
@@ -933,6 +972,24 @@ class CompetitionRunner(Node):
                 candidates = [retry]
             else:
                 self.immediate_retry_order_id = None
+        if self.rerouted_order_ids:
+            deferred = sorted(self.rerouted_order_ids)
+            filtered = prefer_non_rerouted(candidates, deferred)
+            if len(filtered) < len(candidates):
+                self.get_logger().info(
+                    f"[reroute] deferring mislocalised order(s) "
+                    f"{deferred}; choosing nearest among the others")
+                candidates = filtered
+        # 纸巾固定放配送桌东侧专用位（双臂可达性决定），与单臂槽位 3/5
+        # 相邻。若纸巾先上桌，后续单臂放置的摆臂/水平退让轨迹可能蹭到它
+        # （实测 slot3 退让最近仅距纸巾外廓 ~5cm）。只要还有非纸巾待办，
+        # 就把纸巾押到最后；纸巾成为唯一待办时才正常派出。
+        non_zhijin = [order for order in candidates
+                      if order.kind != "zhijin"]
+        if non_zhijin and len(non_zhijin) < len(candidates):
+            self.get_logger().info(
+                "[orders] deferring zhijin while other pending orders remain")
+            candidates = non_zhijin
 
         evaluated = []
         for order in candidates:
@@ -948,6 +1005,7 @@ class CompetitionRunner(Node):
                 self.args.memory_confidence_threshold,
                 exclude_slots=self.failed_memory_slots.get(
                     order.kind, set()),
+                min_sample_count=self.args.memory_min_samples,
                 # 严格模式保留在这里，若 snapshot 兜底实跑效果不好，
                 # 注释下一行并恢复这一行即可：
                 # reliable_only=True)
@@ -1036,8 +1094,11 @@ def parse_args() -> argparse.Namespace:
         help="YOLO frames required by the memory matrix; the inventory name "
              "is retained as a compatibility alias")
     parser.add_argument(
-        "--memory-confidence-threshold", type=float, default=0.90,
-        help="minimum confidence for normal memory-directed shelf routing")
+        "--memory-confidence-threshold", type=float, default=0.95,
+        help="minimum confidence for a reliable memory-directed routing hint")
+    parser.add_argument(
+        "--memory-min-samples", type=int, default=12,
+        help="minimum matrix samples for a reliable direct-slot hint")
     parser.add_argument(
         "--grab-policy", choices=["nearest", "sequence"],
         default="nearest",
@@ -1051,12 +1112,15 @@ def parse_args() -> argparse.Namespace:
         "--dynamic-direct", action="store_true",
         help="allow a worker to use a fresh in-run memory candidate for one "
              "guarded direct-slot reroute")
-    parser.add_argument(
-        "--close-recheck", action="store_true",
-        help="re-enable close-range class verification before grasp "
-             "(default off: the grasp flow skips close-recheck for a "
-             "smoother ALIGN->grasp sequence; the recheck code is retained "
-             "and can be turned back on with this flag)")
+    recheck_group = parser.add_mutually_exclusive_group()
+    recheck_group.add_argument(
+        "--close-recheck", dest="close_recheck", action="store_true",
+        help="prefer ArUco during a level-aligned close view, then fall back "
+             "to YOLO + depth (default)")
+    recheck_group.add_argument(
+        "--no-close-recheck", dest="close_recheck", action="store_false",
+        help="skip the pre-grasp close view and grasp immediately after align")
+    parser.set_defaults(close_recheck=True)
     parser.add_argument(
         "--perception-always-on", action="store_true",
         help="keep persistent or worker-local perception enabled throughout "
@@ -1084,6 +1148,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--confidence must be in [0, 1]")
     if not 0.0 <= args.memory_confidence_threshold <= 1.0:
         parser.error("--memory-confidence-threshold must be in [0, 1]")
+    if args.memory_min_samples < 0:
+        parser.error("--memory-min-samples must be >= 0")
     if not 0.0 < args.inference_hz < float("inf"):
         parser.error("--inference-hz must be finite and positive")
     if (args.max_scan_cycles < 1 or args.max_attempts < 1
