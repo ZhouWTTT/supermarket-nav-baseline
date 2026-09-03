@@ -146,6 +146,9 @@ class Referee:
         """两指同时接触 = 夹持。"""
         return all(self._touch(pairs, [f], obj) for f in self.cfg["grasp_fingers"])
 
+    def _pos(self, mj_data, obj):
+        return mj_data.body(obj).xpos
+
     def _tilt_deg(self, mj_data, obj):
         R = Rotation.from_quat(mj_data.body(obj).xquat[[1, 2, 3, 0]]).as_matrix()
         return float(np.degrees(np.arccos(np.clip(R[2, 2], -1.0, 1.0))))
@@ -156,8 +159,7 @@ class Referee:
         return float(np.linalg.norm(mj_data.qvel[dof:dof + 3]))
 
     def _xy_shift(self, mj_data, obj):
-        return float(np.linalg.norm(
-            mj_data.body(obj).xpos[:2] - self.init_pos[obj][:2]))
+        return float(np.linalg.norm(self._pos(mj_data, obj)[:2] - self.init_pos[obj][:2]))
 
     # ---------- 主循环 ----------
     def update(self, mj_data):
@@ -201,8 +203,7 @@ class Referee:
 
         # --- 掉落判定(S3 之后、S5 之前) ---
         if f.step in (3, 4) and f.target is not None:
-            if ((not self._gripped(pairs, f.target))
-                    and mj_data.body(f.target).xpos[2] < thr["drop_z"]):
+            if (not self._gripped(pairs, f.target)) and self._pos(mj_data, f.target)[2] < thr["drop_z"]:
                 f.dropped = True
                 self._settle_flow(t, completed=False)
                 return
@@ -230,9 +231,7 @@ class Referee:
                 f.t["s4"] = t
                 self._log(t, "S4 携物到达配送区")
         elif f.step == 4:  # 等 S5 准确放置
-            in_box = self._in(
-                self.cfg["zones"]["delivery_box"],
-                mj_data.body(f.target).xpos)
+            in_box = self._in(self.cfg["zones"]["delivery_box"], self._pos(mj_data, f.target))
             if in_box and (not self._gripped(pairs, f.target)) and self._speed(mj_data, f.target) < thr["settle_speed"]:
                 f.upright = self._tilt_deg(mj_data, f.target) <= thr["upright_tol_deg"]
                 f.t["s5"] = t
