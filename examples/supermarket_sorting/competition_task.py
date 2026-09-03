@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
 from typing import Any, Iterable
 
 
@@ -159,6 +160,19 @@ class CompetitionTask:
         order.status = (
             "failed" if order.attempts >= max_attempts else "pending")
 
+    def defer_order(self, order: Order, error: str | None = None) -> None:
+        """Keep a mislocalised order pending without spending a grasp attempt.
+
+        A worker can reach a stale memory slot and deliberately yield to a
+        nearer pending product before it has moved either arm.  Counting that
+        navigation-only reroute as a failed grasp makes two bad observations
+        permanently fail an otherwise untouched order.  Preserve the reason
+        for diagnostics, but leave the attempt budget for an actual grasp.
+        """
+        if error:
+            order.errors.append(str(error))
+        order.status = "pending"
+
     @property
     def terminal(self) -> bool:
         return all(order.status in {"delivered", "failed"}
@@ -199,6 +213,41 @@ def prefer_non_rerouted(
         return candidates
     fresh = [order for order in candidates if order.id not in excluded]
     return fresh if fresh else candidates
+
+
+def select_nearest_candidate(
+        candidates: Iterable[dict[str, Any]],
+        origin_xy: Iterable[float]) -> dict[str, Any] | None:
+    """Choose the nearest finite candidate target, then highest confidence.
+
+    ``target_xy`` is the candidate's grasp-side navigation point.  Keeping
+    this small policy ROS-free lets the close-recheck controller and host-side
+    tests share exactly the same definition of "nearest other order".
+    Malformed perception records are ignored instead of becoming motion goals.
+    """
+    try:
+        origin = tuple(float(value) for value in origin_xy)
+    except (TypeError, ValueError):
+        return None
+    if len(origin) != 2 or not all(math.isfinite(value) for value in origin):
+        return None
+
+    ranked = []
+    for index, candidate in enumerate(candidates):
+        try:
+            target = tuple(float(value) for value in candidate["target_xy"])
+            confidence = float(candidate.get("confidence", 0.0))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (len(target) != 2
+                or not all(math.isfinite(value) for value in target)):
+            continue
+        if not math.isfinite(confidence):
+            confidence = 0.0
+        distance = math.hypot(
+            target[0] - origin[0], target[1] - origin[1])
+        ranked.append(((distance, -confidence, index), candidate))
+    return min(ranked, default=(None, None), key=lambda item: item[0])[1]
 
 
 def associate_detection_marker(

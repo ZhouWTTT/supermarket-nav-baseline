@@ -42,6 +42,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import yolo_aruco_shelf_pick as pick  # noqa: E402  (parent pipeline, unmodified)
+from competition_task import select_nearest_candidate  # noqa: E402
 from memory_matrix import (  # noqa: E402
     LEVEL_MARKER_Z,
     MEMORY_CONSUME_TOPIC,
@@ -177,7 +178,11 @@ HEWEIDAO_PLACE_HALF_HEIGHT_M = 0.0525
 # product touches the table before reaching that target.
 HEWEIDAO_PLACE_CONTACT_OVERTRAVEL_M = 0.006
 HEWEIDAO_PLACE_RELEASE_RAISE_M = 0.020
-HEWEIDAO_PLACE_DESCENT_SLIDE_STEP_M = 0.0004
+# Keep the wide tapered cup substantially slower than the shared descent, but
+# the latest successful run showed that 0.4 mm/tick spent another 2.36 s on a
+# 38 mm move.  A 0.6 mm/tick cap remains four times gentler than the generic
+# path while removing about 0.8 s from that bounded vertical motion.
+HEWEIDAO_PLACE_DESCENT_SLIDE_STEP_M = 0.0006
 HEWEIDAO_PLACE_DESCENT_TIMEOUT_S = 20.0
 # Product bottom clearance above the delivery table top at release: the arm
 # lowers until the held product bottom is 1 cm above the table, then opens the
@@ -245,6 +250,15 @@ HEWEIDAO_RELEASE_GRIP_OPEN_MIN = 0.85
 HEWEIDAO_RELEASE_BASE_BACKUP_DISTANCE_M = 0.100
 HEWEIDAO_RELEASE_BASE_BACKUP_SPEED_MPS = 0.10
 HEWEIDAO_RELEASE_BASE_BACKUP_TIMEOUT_S = 5.0
+# Normal products used to wait a fixed two seconds after the open command.
+# Joint feedback shows boxes open in 0.14--0.28 s and spheres in about 1.1 s,
+# so leave the configurable dwell as a hard fallback and proceed once the
+# measured gripper has been stably open for a short, safe interval.  Heweidao
+# retains its longer one-second minimum because its tapered shoulder can keep
+# the fingers apparently open while it is still between them.
+PLACE_RELEASE_MIN_DWELL_S = 0.40
+PLACE_RELEASE_GRIP_OPEN_MIN = 0.97
+PLACE_RELEASE_GRIP_OPEN_STABLE_S = 0.10
 # 下降接触检测：长商品/夹持偏低导致商品底部先触桌时，slide 被桌面顶住、
 # 反馈不再跟随命令（实测卡死时 slide 力矩饱和 ≈ -306 N·m，正常运动时 ≈ 0）。
 # 检测到"slide 力矩饱和 + 位置停滞"后停止下压并就地释放（商品底部已在桌面，
@@ -377,26 +391,28 @@ PLACE_CREEP_MAX_ANGULAR_RPS = 0.30
 # apply that full step as soon as placement starts.  Ramp the loaded arm from
 # rest and cap it at the gentler shelf-contact rate so the held product is not
 # shocked loose.  Empty-arm recovery after release keeps the normal speed.
-# 默认档适当提高，缩短载货摆臂到放置姿态的时间；球体/纸巾仍有独立半速
-# 上限覆盖，不受影响。
-# 默认档适当提高，缩短载货摆臂到放置姿态的时间；球体/纸巾仍有独立半速
-# 上限覆盖，不受影响。
+# 默认档适当提高，缩短载货摆臂到放置姿态的时间；易滚球体和纸巾仍有
+# 独立慢速上限。
 PLACE_LOADED_ARM_MAX_STEP_RAD = 0.009
 PLACE_LOADED_ARM_STEP_RAMP_RAD = 0.00045
 # Round products can remain secure for long chassis transit yet slip when a
-# large multi-joint placement reconfiguration accelerates the fingers.  Give
-# spheres a product-specific quarter-speed cap; correctness is worth the
-# roughly 15--20 s controlled move and other products keep the faster rate.
+# large multi-joint placement reconfiguration accelerates the fingers.  The
+# successful orange run spent 10.18 s at 0.003 rad/tick; a still-conservative
+# 0.0045 cap is half the generic rate and cuts that move by roughly one third.
 PLACE_LOADED_ARM_MAX_STEP_BY_KIND_RAD = {
-    "chengzi": 0.0030,
-    "pingguo": 0.0030,
+    "chengzi": 0.0045,
+    "pingguo": 0.0045,
+    # Heweidao's latest placement rotated one wrist by 2.95 rad.  This small
+    # per-kind increase avoids changing the proven speed of all box products.
+    "heweidao": 0.0105,
     # 纸巾双臂在精校准 XY 平移时，左右臂关节路径不对称会撕扯纸盒导致
     # 掉落；用半速上限压低每 tick 关节步长，减小双臂笛卡尔轨迹差异。
     "zhijin": 0.0030,
 }
 PLACE_LOADED_ARM_STEP_RAMP_BY_KIND_RAD = {
-    "chengzi": 0.00010,
-    "pingguo": 0.00010,
+    "chengzi": 0.00015,
+    "pingguo": 0.00015,
+    "heweidao": 0.00055,
     "zhijin": 0.00010,
 }
 # The capture gate remains deliberately strict while lifting from the shelf.
@@ -430,6 +446,12 @@ DUAL_TISSUE_PLACE_ARM_SETTLE_PROGRESS_GATE_S = 1.5
 # 只有"超时且长时间无改善"（真卡死）才判失败。
 PLACE_APPROACH_PROGRESS_GATE_S = 6.0
 PLACE_APPROACH_PROGRESS_IMPROVEMENT_RAD = 0.01
+# A live all-order direct target remains provisional until the robot reaches
+# its grasp handoff.  Re-route only when a newly reliable order item saves a
+# meaningful amount of travel, preventing two nearly equal slots from
+# oscillating as odometry and matrix samples move by a few centimetres.
+DYNAMIC_DIRECT_RETARGET_MARGIN_M = 0.10
+DYNAMIC_DIRECT_RETARGET_MIN_HOLD_S = 0.50
 # 放置阶段逐关节运动诊断日志：基座/两臂六关节(measured/command/desired)/
 # slide/夹爪/TCP/商品底部高度，每 PLACE_MOTION_LOG_PERIOD_S 一条
 # [place-motion]，用于排查“商品掉落/被挤压到桌面”等放置问题。
@@ -465,6 +487,12 @@ PLACE_RETREAT_ARM_L = [0.0, -0.166, 0.032, 0.0, 1.571, 2.223]
 PLACE_RETREAT_ARM_R = [0.0, -0.166, 0.032, 0.0, -1.571, -2.223]
 PLACE_RETREAT_HEAD_YAW_PITCH = [0.0, 0.0]
 PLACE_RETREAT_HEAD_TOLERANCE_RAD = 0.05
+# Side-rolled tissue is limited to 0.005 rad/tick while loaded.  After the
+# release, vertical raise and full chassis clearance have all completed, that
+# limit no longer protects a payload and made neutral recovery take 8.46 s in
+# the latest run.  Recover the empty synchronized arms at a still-moderate
+# rate below the normal single-arm 0.026 rad/tick command cap.
+PLACE_EMPTY_DUAL_RECOVERY_MAX_STEP_RAD = 0.015
 
 
 class IntegratedNavPickPlace(pick.ShelfPickController):
@@ -618,6 +646,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._place_refine_stable_since = None
         self._place_refine_iterations = 0
         self._place_release_started_at = None
+        self._place_grip_open_since = None
         self._heweidao_release_phase = None
         self._heweidao_release_phase_started_at = 0.0
         self._heweidao_release_base_start_xy = None
@@ -906,6 +935,163 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             reliable_only=reliable_only,
             min_sample_count=self.memory_min_samples)
 
+    def _direct_hint_grasp_xy(
+            self, kind: str, hint: dict) -> tuple[float, float]:
+        """Approximate the final grasp parking point for cross-kind ranking."""
+        shelf = str(hint["shelf"])
+        level = str(hint["level"])
+        column = str(hint["column"])
+        shelf_x = float(hint["x"])
+        product_x = shelf_x + {"1": -0.22, "2": 0.0, "3": 0.22}[column]
+        if kind == "zhijin":
+            align_x = product_x
+            if align_x < -pick.DUAL_TISSUE_WALL_CLEAR_X_THRESHOLD_M:
+                align_x += pick.DUAL_TISSUE_WEST_WALL_SHIFT_M
+            elif align_x > pick.DUAL_TISSUE_WALL_CLEAR_X_THRESHOLD_M:
+                align_x -= pick.DUAL_TISSUE_EAST_WALL_SHIFT_M
+        elif shelf == "A":
+            align_x = product_x + pick.ARM_LATERAL_BIAS_M
+        else:
+            align_x = product_x - pick.ARM_LATERAL_BIAS_M
+        align_x = float(np.clip(align_x, pick.NAV_X_MIN, pick.NAV_X_MAX))
+
+        level_name = {"L3": "top", "L2": "middle", "L1": "lower"}[level]
+        if level == "L3":
+            align_y = (
+                pick.SHELF_PRODUCT_CENTER_Y_M
+                - pick.TOP_GRASP_CENTER_DISTANCE_M)
+            if kind == "zhijin":
+                align_y += pick.DUAL_TISSUE_ALIGN_FORWARD_M
+        elif kind == "zhijin":
+            align_y = (
+                pick.SCAN_Y + pick.GENERIC_EXTENSION_ALIGN_FORWARD_M
+                + pick.DUAL_TISSUE_ALIGN_FORWARD_M)
+        elif kind in pick.SPHERE_RADIUS_M:
+            align_y = pick.SCAN_Y
+        else:
+            align_y = pick.SCAN_Y + pick.GENERIC_EXTENSION_ALIGN_FORWARD_M
+        return float(align_x), float(align_y)
+
+    def _select_live_order_direct_hint(
+            self, *, min_last_seen: float | None = None):
+        """Find the nearest reliable direct slot among every pending kind.
+
+        The worker may start before the persistent matrix has enough samples.
+        Keep evaluating all runner-approved order kinds during GO_SCAN so a
+        shelf-level fallback can be promoted to a final grasp pose while the
+        robot is still in transit.
+        """
+        if self.memory_file is None:
+            return None
+        document = read_memory_document(self.memory_file)
+        candidates = []
+        for kind in self.opportunistic_target_kinds:
+            same_kind = str(kind) == self.target_kind
+            kind_excluded_slots = (
+                set(self.global_excluded_slot_keys)
+                | set(self.excluded_slot_keys_by_kind.get(kind, ())))
+            hint = select_memory_route_hint(
+                kind,
+                primary_candidates_from_document(document, kind),
+                candidates_from_document(document, kind),
+                self.base_xy,
+                self.memory_confidence_threshold,
+                exclude_slots=kind_excluded_slots,
+                # A shelf exhausted for the original kind can still hold a
+                # different pending order; do not carry kind-specific search
+                # failures across an opportunistic order switch.
+                exclude_shelves=(
+                    self.memory_exhausted_shelves if same_kind else ()),
+                exclude_shelf_levels=(
+                    self.memory_failed_hint_levels if same_kind else ()),
+                min_last_seen=min_last_seen,
+                reliable_only=True,
+                min_sample_count=self.memory_min_samples,
+                require_direct=True)
+            if hint is None or hint.get("hidden_fallback"):
+                continue
+            try:
+                target_xy = self._direct_hint_grasp_xy(str(kind), hint)
+            except (KeyError, TypeError, ValueError):
+                continue
+            candidate = dict(hint)
+            candidate["kind"] = str(kind)
+            candidate["target_xy"] = target_xy
+            candidates.append(candidate)
+        return select_nearest_candidate(candidates, self.base_xy)
+
+    def _try_apply_direct_order_hint(self, hint: dict, reason: str) -> bool:
+        """Switch kind if needed, then set a provisional direct transit."""
+        kind = str(hint.get("kind", self.target_kind))
+        previous = self.target_kind
+        if kind != previous:
+            self._apply_target_kind(kind)
+        if self._try_apply_direct_memory_hint(hint, reason):
+            self.opportunistic_yolo_frames.clear()
+            self.opportunistic_target_pairs.clear()
+            if kind != previous:
+                self.get_logger().info(
+                    f"[order-switch] live matrix provisionally selected "
+                    f"nearest pending "
+                    f"kind={kind} instead of {previous}; grasp and placement "
+                    "plans now follow the new kind")
+            return True
+        if kind != previous:
+            self._apply_target_kind(previous)
+        return False
+
+    def _direct_retarget_is_better(self, hint: dict) -> bool:
+        """Whether a fresh matrix target is worth replacing the active leg."""
+        if (self.state != pick.STATE_DIRECT_TRANSIT
+                or self.direct_transit_slot is None):
+            return True
+        candidate_slot = (
+            str(hint.get("shelf", "")).upper(),
+            str(hint.get("level", "")).upper(),
+            str(hint.get("column", ""))[-1:])
+        candidate_kind = str(hint.get("kind", self.target_kind))
+        if (candidate_kind == self.target_kind
+                and candidate_slot == self.direct_transit_slot):
+            return False
+        held_s = (
+            0.0 if self.direct_transit_started_at is None
+            else max(0.0, time.monotonic() - self.direct_transit_started_at))
+        if held_s < DYNAMIC_DIRECT_RETARGET_MIN_HOLD_S:
+            return False
+        try:
+            candidate_xy = np.asarray(hint["target_xy"], dtype=float)
+        except (KeyError, TypeError, ValueError):
+            return False
+        if candidate_xy.shape != (2,) or not np.all(np.isfinite(candidate_xy)):
+            return False
+        candidate_distance = float(np.linalg.norm(candidate_xy - self.base_xy))
+        current_distance = float(np.linalg.norm(
+            np.asarray([self.align_base_x, self.align_base_y], dtype=float)
+            - self.base_xy))
+        hint["retarget_candidate_distance"] = candidate_distance
+        hint["retarget_current_distance"] = current_distance
+        return bool(
+            candidate_distance + DYNAMIC_DIRECT_RETARGET_MARGIN_M
+            < current_distance)
+
+    def _retarget_direct_order_from_memory(self, hint: dict) -> bool:
+        """Replace a provisional direct leg with a nearer pending product."""
+        if not self._direct_retarget_is_better(hint):
+            return False
+        previous_kind = self.target_kind
+        previous_slot = self.direct_transit_slot
+        candidate_distance = hint.get("retarget_candidate_distance")
+        current_distance = hint.get("retarget_current_distance")
+        if not self._try_apply_direct_order_hint(
+                hint, "continuous nearest-order retarget"):
+            return False
+        self.get_logger().info(
+            "[order-retarget] memory matrix found a nearer pending product; "
+            f"{previous_kind}@{previous_slot} -> "
+            f"{self.target_kind}@{self.direct_transit_slot} "
+            f"distance={current_distance:.2f}->{candidate_distance:.2f}m")
+        return True
+
     def configure_direct_slot_target(
             self, shelf: str, level: str, column: str,
             marker_id: int | None = None,
@@ -978,6 +1164,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         slot = self.direct_transit_slot
         self.direct_transit_slot = None
         self.direct_transit_started_at = None
+        # The continuously ranked route is provisional only while driving.
+        # Freeze the final class/slot before close verification or arm motion.
+        self.opportunistic_target_locked = True
         self.set_twist(0.0, 0.0)
         self.cmd_linear = 0.0
         self.cmd_angular = 0.0
@@ -1066,9 +1255,28 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             "suppressing dynamic revisit for this order")
 
     def _memory_route_tick(self) -> None:
-        if self.memory_file is None or self.state != pick.STATE_GO_SCAN:
+        if (self.memory_file is None
+                or self.state not in {
+                    pick.STATE_GO_SCAN, pick.STATE_DIRECT_TRANSIT}):
             return
-        if self.target_world is not None:
+        if (self.state == pick.STATE_GO_SCAN
+                and self.target_world is not None):
+            return
+
+        # A direct leg is still only a route proposal: keep ranking every
+        # reliable pending-order slot as the matrix fills.  The memory file is
+        # per-run, so all unconsumed candidates in it are valid for this
+        # comparison; requiring a post-switch timestamp would hide a nearer
+        # item that was already observed just before the previous switch.
+        if self.state == pick.STATE_DIRECT_TRANSIT:
+            now = time.monotonic()
+            if now - self._memory_last_reroute_check < 0.25:
+                return
+            self._memory_last_reroute_check = now
+            if self.dynamic_direct_enabled:
+                direct = self._select_live_order_direct_hint()
+                if direct is not None:
+                    self._retarget_direct_order_from_memory(direct)
             return
 
         if self.memory_failed_hint is not None:
@@ -1102,10 +1310,28 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
         self._update_memory_scan_progress()
         now = time.monotonic()
-        if (self.memory_rerouted
-                or now - self._memory_last_reroute_check < 0.25):
+        if now - self._memory_last_reroute_check < 0.25:
             return
         self._memory_last_reroute_check = now
+
+        # A coarse shelf redirect is not terminal.  The latest run observed a
+        # reliable sanmingzhi slot metres before arrival, but memory_rerouted
+        # suppressed all later checks, so the robot stopped at shelf centre
+        # and then moved 17 cm in ALIGN.  Always allow a fresh, reliable slot
+        # from any pending order kind to promote the active leg to the final
+        # grasp parking pose.
+        if self.dynamic_direct_enabled:
+            direct = self._select_live_order_direct_hint(
+                min_last_seen=self.memory_reroute_not_before)
+            if (direct is not None
+                    and self._try_apply_direct_order_hint(
+                        direct, "live all-order promotion")):
+                self.memory_rerouted = True
+                self.memory_reroute_not_before = time.time()
+                return
+
+        if self.memory_rerouted:
+            return
         refreshed = self._select_live_memory_hint(
             reliable_only=not self.dynamic_direct_enabled,
             min_last_seen=self.memory_reroute_not_before)
@@ -2778,11 +3004,58 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_stage = 3
         self.place_t0 = now
         self._place_release_started_at = now
+        self._place_grip_open_since = None
         self._place_slide_stall_snapshot = None
         self.get_logger().warn(
             "[place] verified low table release; locking the measured arms, "
             "stopping descent and releasing in place tcp="
             f"{None if tcp is None else np.round(tcp, 3)}")
+
+    def _single_place_release_ready(self, now: float) -> bool:
+        """Return true once the selected gripper is verifiably open.
+
+        The configured release dwell remains the no-feedback fallback.  With
+        healthy feedback we only keep the loaded arm stationary for the
+        product-specific minimum and a short continuous open confirmation.
+        """
+        if self._place_release_started_at is None:
+            return False
+        elapsed = max(0.0, now - self._place_release_started_at)
+        measured_grip = self.selected_gripper_position()
+        grip_open = (
+            measured_grip is not None
+            and math.isfinite(float(measured_grip))
+            and float(measured_grip) >= PLACE_RELEASE_GRIP_OPEN_MIN)
+        if grip_open:
+            if self._place_grip_open_since is None:
+                self._place_grip_open_since = now
+        else:
+            self._place_grip_open_since = None
+
+        minimum_dwell = (
+            HEWEIDAO_RELEASE_OPEN_MIN_S
+            if self.target_kind == "heweidao"
+            else PLACE_RELEASE_MIN_DWELL_S)
+        stable_elapsed = (
+            0.0 if self._place_grip_open_since is None
+            else now - self._place_grip_open_since)
+        if (elapsed >= minimum_dwell
+                and stable_elapsed >= PLACE_RELEASE_GRIP_OPEN_STABLE_S):
+            self.get_logger().info(
+                "[place] gripper-open feedback confirmed; ending release "
+                f"dwell early elapsed={elapsed:.2f}s "
+                f"stable={stable_elapsed:.2f}s grip={float(measured_grip):.3f}")
+            return True
+
+        fallback_dwell = max(float(self.place_release_dwell_s), minimum_dwell)
+        if elapsed < fallback_dwell:
+            return False
+        if not grip_open:
+            self.get_logger().warn(
+                "[place] gripper-open feedback was not confirmed; using "
+                f"release fallback elapsed={elapsed:.2f}s "
+                f"measured_grip={measured_grip}")
+        return True
 
     def _compute_place_arm_joints(self) -> np.ndarray | None:
         """Solve an approach pose with enough slide travel for a low release.
@@ -3774,12 +4047,12 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             self.place_stage = 3
             self.place_t0 = now
             self._place_release_started_at = now
+            self._place_grip_open_since = None
             self._place_slide_stall_snapshot = None
         elif self.place_stage == 3:
             # Keep arm and slide fixed while the gripper opens.
             self._set_selected_grip(pick.GRIP_OPEN)
-            if (now - self._place_release_started_at
-                    >= self.place_release_dwell_s):
+            if self._single_place_release_ready(now):
                 self._start_place_vertical_clear(now)
         elif self.place_stage == 4:
             self._place_vertical_clear_tick(now)
@@ -4366,6 +4639,23 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 self.cmd_right_arm = self.synchronized_slew(
                     previous_right_arm, self.des_right_arm, arm_step)
 
+        # The parent preserves the 0.005 rad/tick side-rolled tissue limit for
+        # the controller's whole lifetime.  Once the table is fully cleared,
+        # there is no payload and no nearby table edge, so replace only this
+        # final recovery command with the faster empty-arm synchronized cap.
+        empty_dual_place_recovery = (
+            self.flow_phase == "place"
+            and self.place_stage == 5
+            and self._place_retreat_sent
+            and self.use_dual_tissue_grasp)
+        if empty_dual_place_recovery:
+            combined = self.synchronized_slew(
+                np.concatenate((previous_left_arm, previous_right_arm)),
+                np.concatenate((self.des_left_arm, self.des_right_arm)),
+                PLACE_EMPTY_DUAL_RECOVERY_MAX_STEP_RAD)
+            self.cmd_left_arm = combined[:6]
+            self.cmd_right_arm = combined[6:]
+
         # NavigationController already applies acceleration ramps during
         # normal motion.  Do not apply the parent's second ramp in the unsafe
         # direction when the navigator has explicitly requested a stop: at
@@ -4488,7 +4778,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         laser_stale = self._laser_stale(now)
         memory_corridor_transit = (
             self.memory_file is not None
-            and self.state == pick.STATE_GO_SCAN
+            and self.state in {
+                pick.STATE_GO_SCAN, pick.STATE_DIRECT_TRANSIT}
             and STATION_Y_MIN <= float(self.base_xy[1]) <= STATION_Y_MAX)
         stable_perception_state = (
             self.state == pick.STATE_SCAN
@@ -4684,6 +4975,10 @@ def parse_args() -> argparse.Namespace:
         "--exclude-slot-key", action="append", default=[],
         help="ignore a failed YOLO-only slot formatted as Lx|Shelf|Column")
     parser.add_argument(
+        "--exclude-kind-slot", action="append", default=[],
+        metavar="KIND=Lx|Shelf|Column",
+        help="ignore a failed YOLO-only slot only for one product kind")
+    parser.add_argument(
         "--memory-file",
         help="runner-owned atomic memory-matrix JSON used for live routing")
     parser.add_argument(
@@ -4751,7 +5046,8 @@ def parse_args() -> argparse.Namespace:
              "--place-x/--place-y")
     parser.add_argument(
         "--place-release-dwell", type=float, default=2.0,
-        help="seconds the gripper stays open before retreating")
+        help="maximum seconds to wait for gripper-open feedback before the "
+             "placement fallback continues")
     parser.add_argument(
         "--place-retreat-dwell", type=float, default=1.0)
     parser.add_argument(
@@ -4845,6 +5141,23 @@ def parse_args() -> argparse.Namespace:
             invalid_slots.append(value)
     if invalid_slots:
         parser.error(f"invalid memory slot keys: {invalid_slots}")
+    args.exclude_kind_slot_map = {}
+    invalid_kind_slots = []
+    for value in args.exclude_kind_slot:
+        kind, separator, slot_key = str(value).partition("=")
+        parts = slot_key.split("|")
+        if (not separator
+                or kind not in pick.PRODUCT_CENTER_ABOVE_MARKER_M
+                or len(parts) != 3
+                or parts[0] not in {"L1", "L2", "L3"}
+                or parts[1] not in {"A", "B", "C", "D", "E"}
+                or parts[2] not in {"1", "2", "3"}):
+            invalid_kind_slots.append(value)
+            continue
+        args.exclude_kind_slot_map.setdefault(kind, set()).add(slot_key)
+    if invalid_kind_slots:
+        parser.error(
+            f"invalid class-scoped memory slot keys: {invalid_kind_slots}")
     return args
 
 
@@ -4915,7 +5228,8 @@ def main() -> int:
             controller.configure_inventory_scan_hint(
                 args.scan_start_x, args.scan_marker_z)
         controller.excluded_marker_ids = set(args.exclude_marker_id)
-        controller.excluded_slot_keys = set(args.exclude_slot_key)
+        controller.configure_excluded_slots(
+            args.exclude_slot_key, args.exclude_kind_slot_map)
         controller.configure_memory_routing(
             args.memory_file,
             args.memory_confidence_threshold,
@@ -5052,7 +5366,13 @@ def main() -> int:
             "elapsed_s": round(time.monotonic() - started_at, 3),
             "formal_mode": bool(args.formal_mode),
             "place_slot": args.place_slot,
-            "place_xy": [place_x, place_y],
+            # Report the effective plan, which may have changed when close
+            # recheck switched the trip to/from the tissue-specific target.
+            "place_xy": (
+                [place_x, place_y]
+                if controller is None
+                else [float(controller.place_world[0]),
+                      float(controller.place_world[1])]),
             "return_west_after_place": bool(
                 args.return_west_after_place),
             "post_delivery_warnings": (

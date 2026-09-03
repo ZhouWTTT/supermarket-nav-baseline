@@ -33,6 +33,9 @@ The entry script supports these optional environment variables:
 - `SUPERMARKET_ORDER_TIMEOUT`: per-order timeout in seconds, default `300`;
   `0` disables it.
 - `SUPERMARKET_MATCH_TIMEOUT`: safe match deadline, default `3600`.
+- `SUPERMARKET_DYNAMIC_DIRECT=1`: send reliable memory-matrix slots directly
+  to the final grasp parking pose, default `1`; set `0` to retain shelf-scan
+  routing.
 - `SUPERMARKET_CLOSE_RECHECK=1`: give the level-aligned camera a short ArUco
   preference window before falling back to YOLO + depth; default `1`.
 - `SUPERMARKET_SHOW=1`: request the optional OpenCV result window.
@@ -40,6 +43,17 @@ The entry script supports these optional environment variables:
 Runtime summaries are written below `/tmp/supermarket_competition/<run_prefix>`
 inside the Client container.  The formal path never enables fixed-layout or
 ground-truth diagnostic options.
+
+When close recheck proves that a remembered slot contains another pending
+order's product, the worker selects the nearest visible alternative, rebuilds
+the grasp and placement plan for its actual kind, and attributes delivery to
+that order.  If no visible alternative is safe to grasp, the stale order is
+deferred without consuming a grasp attempt and the runner selects the nearest
+remaining order from the matrix.  Until close recheck or grasp motion starts,
+the worker continuously re-ranks every reliable pending-order slot from its
+current base position.  A meaningfully nearer product replaces the provisional
+direct target, rebuilding the route, grasp profile, and placement plan; the
+final kind/slot is locked only at the shelf handoff.
 
 ## GUI launcher
 

@@ -325,13 +325,21 @@ class CompetitionRunner(Node):
             for marker_id in self.task.excluded_markers(kind)
         })
         command.extend(marker_arguments(excluded_markers))
-        excluded_slots = sorted({
-            slot_key
+        dispatch_excluded_slots = sorted(
+            self.failed_memory_slots.get(order.kind, set()))
+        # Keep failures scoped to the class that failed there.  A stale
+        # sanmingzhi record can point at a perfectly valid chengzi product in
+        # the same physical slot; globally excluding that slot would defeat
+        # the cross-kind fallback we are trying to enable.
+        excluded_slots_by_kind = {
+            kind: sorted(self.failed_memory_slots.get(kind, set()))
             for kind in candidate_kinds
-            for slot_key in self.failed_memory_slots.get(kind, set())
-        })
-        for slot_key in excluded_slots:
-            command.extend(["--exclude-slot-key", slot_key])
+            if self.failed_memory_slots.get(kind)
+        }
+        for kind, kind_slots in excluded_slots_by_kind.items():
+            for slot_key in kind_slots:
+                command.extend([
+                    "--exclude-kind-slot", f"{kind}={slot_key}"])
         command.extend([
             "--memory-file", str(self.memory_path),
             "--memory-confidence-threshold",
@@ -380,7 +388,8 @@ class CompetitionRunner(Node):
             # Snapshot 直达语义：直达槽位必须重新从"主证据"选择，隐藏历史
             # 候选只允许做扫描提示。失败槽位排除后，若直达不可用则保留
             # scan_hint_x 作为扫描兜底（worker 会从同一货架开始）。
-            direct_hint = self._select_direct_hint(order, excluded_slots)
+            direct_hint = self._select_direct_hint(
+                order, dispatch_excluded_slots)
         if scan_hint_x is not None:
             command.extend(["--scan-start-x", str(scan_hint_x)])
             if scan_marker_z is not None:
@@ -440,7 +449,7 @@ class CompetitionRunner(Node):
             f"persistent_perception={int(external_perception)} "
             f"single_item_candidates={candidate_kinds} "
             f"excluded_markers={excluded_markers} "
-            f"excluded_slots={excluded_slots}")
+            f"excluded_slots_by_kind={excluded_slots_by_kind}")
         try:
             self.worker = subprocess.Popen(
                 command,
@@ -759,13 +768,19 @@ class CompetitionRunner(Node):
                     f"single-item worker selected visible pending order "
                     f"id={order.id} kind={order.kind} instead of dispatch "
                     f"id={dispatch_order.id} kind={dispatch_order.kind}")
-            self.task.finish_attempt(
-                order,
-                delivered=delivered,
-                marker_id=marker_id,
-                error=None if delivered else str(error),
-                max_attempts=finish_max_attempts,
-            )
+            if reroute_requested:
+                # A wrong memory slot was rejected before grasping.  Defer
+                # this order and spend the next trip on another nearby order,
+                # but do not consume one of the original order's grasp tries.
+                self.task.defer_order(order, str(error))
+            else:
+                self.task.finish_attempt(
+                    order,
+                    delivered=delivered,
+                    marker_id=marker_id,
+                    error=None if delivered else str(error),
+                    max_attempts=finish_max_attempts,
+                )
             if (not delivered
                     and isinstance(drop_event, dict)
                     and drop_event.get("outcome") == "retry"
@@ -1108,10 +1123,15 @@ def parse_args() -> argparse.Namespace:
         "--record-everywhere", action="store_true",
         help="record every geometrically valid YOLO world observation for "
              "the entire match, including transit and delivery")
-    parser.add_argument(
-        "--dynamic-direct", action="store_true",
-        help="allow a worker to use a fresh in-run memory candidate for one "
-             "guarded direct-slot reroute")
+    direct_group = parser.add_mutually_exclusive_group()
+    direct_group.add_argument(
+        "--dynamic-direct", dest="dynamic_direct", action="store_true",
+        help="navigate a reliable memory slot directly to its grasp pose "
+             "(default)")
+    direct_group.add_argument(
+        "--no-dynamic-direct", dest="dynamic_direct", action="store_false",
+        help="use memory only as a shelf/level scan hint")
+    parser.set_defaults(dynamic_direct=True)
     recheck_group = parser.add_mutually_exclusive_group()
     recheck_group.add_argument(
         "--close-recheck", dest="close_recheck", action="store_true",

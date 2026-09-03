@@ -64,6 +64,7 @@ if str(PERCEPTION_DIR) not in sys.path:
     sys.path.insert(0, str(PERCEPTION_DIR))
 
 from discoverse.robots.mmk2.mmk2_fik import MMK2FIK
+from competition_task import select_nearest_candidate
 from mmk2_kdl import MMK2Kdl
 from memory_matrix import SLOT_BY_MARKER, fixed_slot_from_world
 from perception.aruco_detect import ArucoDetectNode
@@ -686,7 +687,8 @@ DUAL_TISSUE_SIDE_ROLLED_ENABLED = True
 # 侧列（左右两列）预抓/接触 TCP 相对板面的抬升：比中列更高，给闭合前
 # 的额外下降留出空间（闭合目标仍受板面净空约束）。
 DUAL_TISSUE_SIDE_ROLLED_TCP_CLEARANCE_M = 0.110
-DUAL_TISSUE_SIDE_ROLLED_SQUEEZE_M = 0.025
+# 侧列（C1/C3）侧滚腕预压与中列同步加到 30mm/侧，加大夹紧力。
+DUAL_TISSUE_SIDE_ROLLED_SQUEEZE_M = 0.030
 DUAL_TISSUE_SIDE_ROLLED_MAX_SEGMENT_JOINT_DELTA_RAD = 0.90
 # 手背（outward）探入到位后，旋转 90° 到“手侧面”夹持姿态的路径长度
 # 与速度。旋转点位于纸盒后侧之外，不会扫到立柱/邻货。
@@ -737,14 +739,15 @@ DUAL_TISSUE_CONTACT_ENDPOINT_TOLERANCE_M = 0.003
 # A closed unloaded gripper tracks 0.08 in prior runs; side contact in the
 # successful-but-unstable run forced both measured joints down near 0.012.
 DUAL_TISSUE_GRIP_CONTACT_MAX = 0.045
-# 侧夹预压拉到 25mm（接近压力上限）：双臂合拢后继续内压，纸盒挡住即由
-# 位置控制器持续加压，扭矩到执行器上限封顶，不会导致物理发散。
+# 侧夹预压拉大：双臂合拢后继续内压，纸盒挡住即由位置控制器持续加压。
+# 用户反馈最新一次抓纸巾没抓稳，从 25mm 加到 30mm/侧（仍在执行器力矩
+# 上限内封顶，不会物理发散）。
 # 双臂闭合时的单侧预压量（米）：从实测接触位置再向内压入的量。加大后
 # 两侧钳爪对纸盒的夹紧力更强，纸盒不易在抬/撤过程中滑动。
-# The previous 30 mm/side position preload kept driving after contact and
-# toppled a tissue box.  25 mm keeps the clamp firm without toppling;
-# the following clamp pose retains roughly 4 mm/side geometric interference.
-DUAL_TISSUE_SQUEEZE_M = 0.025
+# The old 30 mm/side preload once toppled a tissue box under the legacy flow;
+# the current side-rolled three-point flow keeps the box square, so 30 mm is
+# retried here per user request for a firmer hold.
+DUAL_TISSUE_SQUEEZE_M = 0.030
 DUAL_TISSUE_SQUEEZE_SPEED_MPS = 0.012
 DUAL_TISSUE_RETREAT_SPEED_MPS = 0.036
 DUAL_TISSUE_MIN_MOTION_DURATION_S = 1.5
@@ -760,7 +763,8 @@ DUAL_TISSUE_DEPLOY_DWELL_S = 1.5
 DUAL_TISSUE_DEPLOY_TIMEOUT_S = 5.0
 # 侧夹预压保持时长：预压动作本身已有收敛/稳定门控，保持时间从 4s 降到
 # 3s，缩短提拉前等待。
-DUAL_TISSUE_CLAMP_DWELL_S = 3.0
+# 预压保持时长略增，让接触力在提拉前稳定建立（力度加大后多给 1s 收敛）。
+DUAL_TISSUE_CLAMP_DWELL_S = 4.0
 DUAL_TISSUE_LIFT_M = 0.060
 # The slide cannot raise a top-shelf grasp, so the arms perform a shorter
 # guarded lift before retreating at the raised height.
@@ -1121,6 +1125,8 @@ class ShelfPickController(Node):
         # YOLO-only localisation has no decoded marker identity.  Failed
         # attempts therefore blacklist the fixed matrix slot instead.
         self.excluded_slot_keys = set()
+        self.global_excluded_slot_keys = set()
+        self.excluded_slot_keys_by_kind = {}
         self.close_recheck = bool(close_recheck)
         self.recheck_marker_skips = set()
         self.recheck_confirmation_times = deque(maxlen=12)
@@ -1132,6 +1138,7 @@ class ShelfPickController(Node):
         # target (kind, grasp profile and delivery plan all follow it).
         self.recheck_switch_kind = None
         self.recheck_switch_world = None
+        self.recheck_switch_slot = None
         self.recheck_switch_count = 0
         self.recheck_started_at = 0.0
         self.recheck_pose_started_at = 0.0
@@ -1477,6 +1484,18 @@ class ShelfPickController(Node):
                 f"priority={ordered} confirmations="
                 f"{OPPORTUNISTIC_TARGET_CONFIRMATIONS}")
 
+    def configure_excluded_slots(self, global_slots=(), by_kind=None) -> None:
+        """Install global and class-scoped failed memory-slot exclusions."""
+        self.global_excluded_slot_keys = set(global_slots or ())
+        self.excluded_slot_keys_by_kind = {
+            str(kind): set(slots or ())
+            for kind, slots in dict(by_kind or {}).items()
+        }
+        self.excluded_slot_keys = (
+            set(self.global_excluded_slot_keys)
+            | set(self.excluded_slot_keys_by_kind.get(
+                self.target_kind, ())))
+
     def _maybe_lock_opportunistic_target_locked(self) -> None:
         """Commit once to a repeatedly associated class/marker pair."""
         if (self.opportunistic_target_locked
@@ -1564,12 +1583,6 @@ class ShelfPickController(Node):
         if (self.state != STATE_SCAN or self.target_marker_id is not None):
             raise RuntimeError("target kind can only change during initial scan")
         self._apply_target_kind(kind)
-        self.default_scan_poses = (
-            SCAN_OVERVIEW_POSES
-            if self.scan_skip_lower and kind_never_on_lower_shelf(kind)
-            else SCAN_CAMERA_POSES)
-        if not self.inventory_scan_hint_active:
-            self.scan_poses = self.default_scan_poses
         self.scan_unlocked_markers.clear()
         self.scan_unlocked_boxes.clear()
         self.yolo_frames.clear()
@@ -1586,6 +1599,10 @@ class ShelfPickController(Node):
         opportunistic switch; keeps any already-measured localisation state.
         """
         self.target_kind = kind
+        self.excluded_slot_keys = (
+            set(getattr(self, "global_excluded_slot_keys", ()))
+            | set(getattr(self, "excluded_slot_keys_by_kind", {}).get(
+                kind, ())))
         self.product_height = PRODUCT_CENTER_ABOVE_MARKER_M[kind]
         self.product_grasp_width = PRODUCT_GRASP_WIDTH_M[kind]
         self.grip_preshape_command = float(np.clip(
@@ -1597,6 +1614,16 @@ class ShelfPickController(Node):
         self.no_middle_tissue = False
         self.skipped_tissue_markers.clear()
         self.skipped_tissue_slots.clear()
+        # A direct target can later fail close verification and return to a
+        # normal scan.  Keep that fallback's camera plan tied to the switched
+        # kind as well, rather than leaking the originally dispatched kind's
+        # lower-shelf policy into the new order.
+        self.default_scan_poses = (
+            SCAN_OVERVIEW_POSES
+            if self.scan_skip_lower and kind_never_on_lower_shelf(kind)
+            else SCAN_CAMERA_POSES)
+        if not self.inventory_scan_hint_active:
+            self.scan_poses = self.default_scan_poses
         self._on_target_kind_changed(kind)
 
     def _on_target_kind_changed(self, kind: str) -> None:
@@ -2322,6 +2349,7 @@ class ShelfPickController(Node):
         self.recheck_marker_candidate_count = 0
         self.recheck_switch_kind = None
         self.recheck_switch_world = None
+        self.recheck_switch_slot = None
         self.recheck_switch_count = 0
         self.scan_camera_ready_since = None
         self.yolo_frames.clear()
@@ -2399,7 +2427,7 @@ class ShelfPickController(Node):
         if len(self.opportunistic_target_kinds) <= 1:
             self._reset_recheck_switch_locked()
             return
-        candidate = None
+        candidates = []
         for detection in sorted(
                 detections,
                 key=lambda item: float(item.get("conf", 0.0)),
@@ -2412,13 +2440,37 @@ class ShelfPickController(Node):
             world = self._detection_world(detection)
             if world is None:
                 continue
-            candidate = (kind, np.asarray(world, dtype=float))
-            break
+            # Only shelf-grid products can become navigation targets.  This
+            # also rejects a detection on the floor or a carried/delivered
+            # item that happens to enter the wide close-view image.
+            slot = fixed_slot_from_world(float(world[0]), float(world[2]))
+            if slot is None:
+                continue
+            shelf, level, column = slot
+            if f"{level}|{shelf}|{column}" in self.excluded_slot_keys:
+                continue
+            if abs(float(world[1]) - SHELF_PRODUCT_CENTER_Y_M) > 0.55:
+                continue
+            shelf_x = SCAN_X[self._scan_x_index_for_shelf(shelf)]
+            column_offset = {"1": -0.22, "2": 0.0, "3": 0.22}[column]
+            candidates.append({
+                "kind": kind,
+                "world": np.asarray(world, dtype=float),
+                "slot": slot,
+                # Rank by the actual shelf-side destination, not confidence
+                # or task-list order.  Confidence remains only a tie-breaker.
+                "target_xy": (shelf_x + column_offset, SCAN_Y),
+                "confidence": detection.get("conf", 0.0),
+            })
+        candidate = select_nearest_candidate(candidates, self.base_xy)
         if candidate is None:
             self._reset_recheck_switch_locked()
             return
-        kind, world = candidate
+        kind = str(candidate["kind"])
+        world = np.asarray(candidate["world"], dtype=float)
+        slot = tuple(candidate["slot"])
         if (kind == self.recheck_switch_kind
+                and slot == self.recheck_switch_slot
                 and self.recheck_switch_world is not None
                 and np.all(np.abs(self.recheck_switch_world - world)
                            <= np.array([
@@ -2429,67 +2481,84 @@ class ShelfPickController(Node):
         else:
             self.recheck_switch_kind = kind
             self.recheck_switch_world = world.copy()
+            self.recheck_switch_slot = slot
             self.recheck_switch_count = 1
         if self.recheck_switch_count < CLOSE_RECHECK_CONFIRMATIONS:
             return
-        self._switch_recheck_target(kind, world)
+        self._switch_recheck_target(kind, world, slot)
 
     def _reset_recheck_switch_locked(self) -> None:
         """Forget any partial opportunistic recheck switch candidate."""
         self.recheck_switch_kind = None
         self.recheck_switch_world = None
+        self.recheck_switch_slot = None
         self.recheck_switch_count = 0
 
-    def _switch_recheck_target(self, kind: str, world: np.ndarray) -> None:
-        """Adopt a different pending-order product found at this slot."""
+    def _switch_recheck_target(
+            self, kind: str, world: np.ndarray,
+            slot: tuple[str, str, str] | None = None) -> None:
+        """Adopt the nearest other pending product and rebuild its plan."""
         previous = self.target_kind
         self._apply_target_kind(kind)
-        # The close-view depth point is the visible front surface, so build
-        # the product centre the same way the YOLO-only lock does: recover
-        # the centre with the kind half-depth and clamp Z by shelf geometry.
-        x = float(world[0])
-        y = float(world[1]) + PRODUCT_HALF_DEPTH_M.get(kind, 0.0)
-        z = float(world[2])
-        self.target_world = np.array([x, y, z], dtype=float)
-        committed = fixed_slot_from_world(x, z)
-        if committed is not None:
-            self.committed_slot = committed
-            _shelf, level, _column = committed
-            level_name = {"L3": "top", "L2": "middle", "L1": "lower"}[level]
-            surface_z = SHELF_SURFACE_Z_M[level_name]
-            half_height = PRODUCT_HALF_HEIGHT_M.get(kind, 0.0)
-            self.target_world[2] = min(
-                z,
-                surface_z + half_height + PRODUCT_CENTER_Z_TOLERANCE_M)
-        if self.target_world[2] >= TOP_SHELF_Z_M:
-            self.shelf_level = "top"
-        elif self.target_world[2] >= MIDDLE_SHELF_Z_MIN_M:
-            self.shelf_level = "middle"
-        else:
-            self.shelf_level = "lower"
-        self.object_geometry = (
-            "sphere" if kind in SPHERE_RADIUS_M else "generic")
-        self.is_top_shelf = self.shelf_level == "top"
-        self.use_sphere_grasp = bool(
-            self.object_geometry == "sphere"
-            and self.shelf_level in ("top", "middle"))
+        committed = (
+            fixed_slot_from_world(float(world[0]), float(world[2]))
+            if slot is None else tuple(slot))
+        if committed is None:
+            self.get_logger().warn(
+                f"[order-switch] rejected {kind}: no fixed shelf slot")
+            self._apply_target_kind(previous)
+            self._reset_recheck_switch_locked()
+            return
+        shelf, level, column = committed
+        level_name = {"L3": "top", "L2": "middle", "L1": "lower"}[level]
+        surface_z = float(SHELF_SURFACE_Z_M[level_name])
+        half_height = float(PRODUCT_HALF_HEIGHT_M.get(kind, 0.0))
+        target_z = surface_z + half_height
         if kind in SPHERE_RADIUS_M:
-            # 球体中心高由板面几何决定，避免深度测到下半球的低 z。
-            self.target_world[2] = (
-                SHELF_SURFACE_Z_M[self.shelf_level]
-                + SPHERE_RADIUS_M[kind])
+            target_z = surface_z + SPHERE_RADIUS_M[kind]
+        else:
+            target_z = min(
+                float(world[2]),
+                target_z + PRODUCT_CENTER_Z_TOLERANCE_M)
+            target_z = max(target_z, surface_z + 0.005)
+        shelf_x = SCAN_X[self._scan_x_index_for_shelf(shelf)]
+        target_x = shelf_x + {"1": -0.22, "2": 0.0, "3": 0.22}[column]
+        # Re-run the common localisation commit after changing kind.  This is
+        # what updates arm choice, sphere/tissue profile, slide height and the
+        # kind-specific final base pose; retaining the old kind's align pose
+        # is unsafe when a box turns into a sphere or dual-arm tissue grasp.
+        self._commit_localised_target(
+            np.array([
+                target_x, SHELF_PRODUCT_CENTER_Y_M, target_z], dtype=float),
+            None,
+            "close_recheck_switch",
+            extra=f" previous={previous} slot={committed}",
+            shelf=shelf,
+            enter_align=False)
         self.target_marker_id = None
         self.target_physical_marker_id = None
         self._recheck_passed = False
-        self.recheck_poses = self._verification_poses_for_z(
-            float(self.target_world[2]))
-        self._reset_recheck_state_locked()
+        position_error = float(np.linalg.norm(
+            self.base_xy - np.array([
+                self.align_base_x, self.align_base_y], dtype=float)))
+        yaw_error = abs(wrap_to_pi(YAW_NORTH - self.base_yaw))
+        needs_realign = (
+            position_error > 0.025 or yaw_error > NAV_YAW_DEADBAND_RAD)
+        if needs_realign:
+            self._reset_recheck_state_locked()
+            self.set_state(STATE_ALIGN)
+        else:
+            self.recheck_poses = self._verification_poses_for_z(
+                float(self.target_world[2]))
+            self._reset_recheck_state_locked()
         self.get_logger().info(
-            f"[order-switch] close-recheck: slot holds {kind} instead of "
-            f"{previous}; switching target kind, grasp profile="
+            f"[order-switch] close-recheck selected nearest pending kind="
+            f"{kind} instead of {previous}; grasp profile="
             f"{self.grasp_profile_name()} and delivery plan "
             f"world={np.round(self.target_world, 3)} "
-            f"slot={self.committed_slot}; re-verifying before grasp")
+            f"slot={self.committed_slot} pose_error={position_error:.3f}m/"
+            f"{yaw_error:.3f}rad realign={int(needs_realign)}; "
+            "re-verifying before grasp")
 
     def _recheck_detection_matches(
             self, detection: dict,
@@ -2527,6 +2596,18 @@ class ShelfPickController(Node):
             and abs(float(world[1] - target[1])) <= CLOSE_RECHECK_XY_MAX_M
             and abs(float(world[2] - target[2])) <= CLOSE_RECHECK_Z_MAX_M)
         if not matched:
+            # 深度单点常有系统性偏移：商品明明在预期槽位，但世界点离记忆
+            # 中心差 0.12–0.16m 就被误判为“槽位无货”，随后整单改道/重试。
+            # 零耗时兜底：只要类别一致且世界点映射到同一 (shelf, level,
+            # column) 固定槽位格，同样视为近距复核命中（仍要求 2 个独立
+            # 帧，不增加驻停时间）。
+            slot = fixed_slot_from_world(
+                float(world[0]), float(world[2]))
+            expected = self.target_slot()
+            if (detection.get("class") == self.target_kind
+                    and slot is not None and expected is not None
+                    and tuple(slot) == tuple(expected)):
+                return True, "depth(slot-grid)"
             return False, "depth"
 
         marker_adoptable = (
@@ -2595,6 +2676,7 @@ class ShelfPickController(Node):
         self.recheck_marker_candidate_count = 0
         self.recheck_switch_kind = None
         self.recheck_switch_world = None
+        self.recheck_switch_slot = None
         self.recheck_switch_count = 0
         self.scan_camera_ready_since = None
         with self.lock:
@@ -3926,7 +4008,9 @@ class ShelfPickController(Node):
             if self.dual_side_rolled
             else DUAL_TISSUE_INSERT_FORWARD_M)
         self.dual_top_wrist_rolled = self.dual_side_rolled
-        self.dual_top_wrist_inward = False
+        # A/B 试验 v2（用户要求）：侧列再次改试另一种旋转朝向，并同步加大
+        # 闭合预压（30mm/侧）以补偿抓持力。若仍夹不稳/推离纸盒，改回 False。
+        self.dual_top_wrist_inward = True
         self.dual_contact_push_side = (
             "right" if column == "3" else "left")
         self.dual_overhead_route = False

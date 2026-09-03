@@ -597,11 +597,14 @@ class LauncherApp:
         for enabled, flag in (
             (self.record_everywhere_var.get(), "--record-everywhere"),
             (self.perception_always_var.get(), "--perception-always-on"),
-            (self.dynamic_direct_var.get(), "--dynamic-direct"),
             (self.yolo_window_var.get(), "--show"),
         ):
             if enabled:
                 runner.append(flag)
+        runner.append(
+            "--dynamic-direct"
+            if self.dynamic_direct_var.get()
+            else "--no-dynamic-direct")
         runner.append(
             "--close-recheck"
             if self.close_recheck_var.get()

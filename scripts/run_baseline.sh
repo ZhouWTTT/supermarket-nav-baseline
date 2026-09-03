@@ -38,6 +38,8 @@ fi
 
 if [ "${SUPERMARKET_DYNAMIC_DIRECT:-1}" = "1" ]; then
     runner+=(--dynamic-direct)
+else
+    runner+=(--no-dynamic-direct)
 fi
 
 if [ "${SUPERMARKET_PERCEPTION_ALWAYS_ON:-1}" = "1" ]; then
