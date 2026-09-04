@@ -32,30 +32,45 @@ The entry script supports these optional environment variables:
   before reusing a kind-to-ArUco mapping, default `3`.
 - `SUPERMARKET_ORDER_TIMEOUT`: per-order timeout in seconds, default `300`;
   `0` disables it.
-- `SUPERMARKET_MATCH_TIMEOUT`: safe match deadline, default `570`.
+- `SUPERMARKET_MATCH_TIMEOUT`: safe match deadline, default `3600`.
+- `SUPERMARKET_DYNAMIC_DIRECT=1`: send reliable memory-matrix slots directly
+  to the final grasp parking pose, default `1`; set `0` to retain shelf-scan
+  routing.
+- `SUPERMARKET_CLOSE_RECHECK=1`: give the level-aligned camera a short ArUco
+  preference window before falling back to YOLO + depth; default `1`.
 - `SUPERMARKET_SHOW=1`: request the optional OpenCV result window.
 
 Runtime summaries are written below `/tmp/supermarket_competition/<run_prefix>`
 inside the Client container.  The formal path never enables fixed-layout or
 ground-truth diagnostic options.
 
+When close recheck proves that a remembered slot contains another pending
+order's product, the worker selects the nearest visible alternative, rebuilds
+the grasp and placement plan for its actual kind, and attributes delivery to
+that order.  If no visible alternative is safe to grasp, the stale order is
+deferred without consuming a grasp attempt and the runner selects the nearest
+remaining order from the matrix.  Until close recheck or grasp motion starts,
+the worker continuously re-ranks every reliable pending-order slot from its
+current base position.  A meaningfully nearer product replaces the provisional
+direct target, rebuilding the route, grasp profile, and placement plan; the
+final kind/slot is locked only at the shelf handoff.
+
 ## GUI launcher
 
-宿主机运行项目根目录的 `gui_launcher_continuous.py` 可一键启动 Server 与
-连续多单客户端（界面与主仓库 `gui_launcher_continuous.py` 完全一致，固定
-使用官方 final 镜像）：
+宿主机运行项目根目录的 `gui_competition_runner.py`，可一键启动官方 Server
+与当前正式比赛入口，并实时查看双方日志、3×15 记忆矩阵、每格观测证据和
+比赛摘要：
 
 ```bash
-python3 gui_launcher_continuous.py
+python3 gui_competition_runner.py
 ```
 
-它会挂载本目录到客户端容器的 `/workspace/supermarket_sorting_task` 并执行
-`examples/supermarket_sorting/continuous_goods_client.py`：每单执行
-「抓货区抓取 → 导航到终点 → 直接扔货 → 返回抓货区」。GUI 在宿主机生成
-订单列表并通过 `--orders` 传给客户端。
-
-正式比赛入口（任务话题驱动、带完整放桌流程）仍可通过 `scripts/run_baseline.sh`
-运行，两者互不影响。
+GUI 会把本目录挂载到 Client 容器的 `/workspace/baseline`，执行
+`examples/supermarket_sorting/competition_runner.py`，并将运行产物写到
+`logs/competition_runner/<run_prefix>/`，便于宿主机每秒刷新。需要宿主机已
+安装 `python3-tk` 与 Docker，并已拉取官方 final `:server` / `:client`
+镜像。也可用 `SUPERMARKET_GUI_SERVER_IMAGE` 和
+`SUPERMARKET_GUI_CLIENT_IMAGE` 环境变量覆盖镜像名。
 
 ## Submission image
 

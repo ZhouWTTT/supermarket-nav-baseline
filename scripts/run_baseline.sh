@@ -39,10 +39,18 @@ fi
 
 if [ "${SUPERMARKET_DYNAMIC_DIRECT:-1}" = "1" ]; then
     runner+=(--dynamic-direct)
+else
+    runner+=(--no-dynamic-direct)
 fi
 
 if [ "${SUPERMARKET_PERCEPTION_ALWAYS_ON:-1}" = "1" ]; then
     runner+=(--perception-always-on)
+fi
+
+if [ "${SUPERMARKET_CLOSE_RECHECK:-1}" = "1" ]; then
+    runner+=(--close-recheck)
+else
+    runner+=(--no-close-recheck)
 fi
 
 if [ "${SUPERMARKET_SHOW:-0}" = "1" ]; then
