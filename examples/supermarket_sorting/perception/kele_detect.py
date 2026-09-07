@@ -221,9 +221,9 @@ def foreground_depth_estimate(depth_img, bbox_xyxy, K, T_cam_world):
 
 
 class KeleDetectNode(Node):
-    def __init__(self, backend="blob", pub_res_img=True, device="auto",
-                 weights=None, target_kind=None, confidence=0.45, show=False,
-                 camera_names=("head",), max_inference_hz=0.0):
+    def __init__(self, backend="blob", pub_res_img=True, device="cuda",
+                 weights=None, target_kind=None, confidence=0.90, show=False,
+                 camera_names=("head",), max_inference_hz=8.0):
         super().__init__("kele_detect")
         self.bridge = CvBridge()
         self.pub_res_img = pub_res_img
@@ -584,22 +584,22 @@ def main():
                         help="2-D detector backend (default: blob)")
     parser.add_argument("--no-result-image", action="store_true",
                         help="disable /kele/result_image publishing")
-    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
-                        help="YOLO inference device (default: auto)")
+    parser.add_argument("--device", default="cuda", choices=["auto", "cpu", "cuda"],
+                        help="YOLO inference device (default: cuda)")
     parser.add_argument("--weights", default=DEFAULT_GOODS_CKPT,
                         help="Ultralytics checkpoint (default: repository best.pt)")
     parser.add_argument("--target-kind",
                         help="publish only this checkpoint class name")
-    parser.add_argument("--confidence", type=float, default=0.45,
-                        help="minimum YOLO confidence (default: 0.45)")
+    parser.add_argument("--confidence", type=float, default=0.90,
+                        help="minimum YOLO confidence (default: 0.90)")
     parser.add_argument("--show", action="store_true",
                         help="show a live window containing YOLO boxes")
     parser.add_argument("--cameras", nargs="+", choices=CAMERAS,
                         default=["head"],
                         help="RGB cameras used by the shared YOLO model")
     parser.add_argument(
-        "--max-inference-hz", type=float, default=0.0,
-        help="YOLO source-frame rate limit; 0 processes every received frame")
+        "--max-inference-hz", type=float, default=8.0,
+        help="YOLO source-frame rate limit (default: 8 Hz; 0 is unlimited)")
     args = parser.parse_args()
 
     rclpy.init()

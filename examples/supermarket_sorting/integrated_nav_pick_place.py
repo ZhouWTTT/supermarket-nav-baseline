@@ -336,6 +336,10 @@ HEWEIDAO_LOADED_TURN_MAX_RPS = 0.80
 # 导航自身的 2.5 rad/s 上限。口香糖/球体仍保留直线限速，防止运输中惯性
 # 前滑（此前口香糖在 1.0–2.0 rad/s 转向下滑脱，现仅解除转向限制）。
 DUAL_TISSUE_LOADED_TURN_MAX_RPS = 1.8
+# The faster 1.15 m/s navigator cruise applies only while empty.  Preserve the
+# previous 0.90 m/s ceiling whenever an item is being carried; weak grasps keep
+# their still-lower product-specific caps below.
+LOADED_TRANSPORT_LINEAR_MAX_MPS = 0.90
 LOADED_TRANSPORT_LIMITS = {
     "kouxiangtang": (0.75, None),
     "chengzi": (0.80, None),
@@ -402,6 +406,10 @@ PLACE_LOADED_ARM_STEP_RAMP_RAD = 0.00045
 PLACE_LOADED_ARM_MAX_STEP_BY_KIND_RAD = {
     "chengzi": 0.0045,
     "pingguo": 0.0045,
+    # The latest maidong run retained a stable 0.812 grip throughout chassis
+    # transit, then slipped only during the large multi-joint table approach.
+    # Give the tall bottle the same proven gentle placement motion as spheres.
+    "maidong": 0.0045,
     # Heweidao's latest placement rotated one wrist by 2.95 rad.  This small
     # per-kind increase avoids changing the proven speed of all box products.
     "heweidao": 0.0105,
@@ -412,6 +420,7 @@ PLACE_LOADED_ARM_MAX_STEP_BY_KIND_RAD = {
 PLACE_LOADED_ARM_STEP_RAMP_BY_KIND_RAD = {
     "chengzi": 0.00015,
     "pingguo": 0.00015,
+    "maidong": 0.00015,
     "heweidao": 0.00055,
     "zhijin": 0.00010,
 }
@@ -452,6 +461,13 @@ PLACE_APPROACH_PROGRESS_IMPROVEMENT_RAD = 0.01
 # oscillating as odometry and matrix samples move by a few centimetres.
 DYNAMIC_DIRECT_RETARGET_MARGIN_M = 0.10
 DYNAMIC_DIRECT_RETARGET_MIN_HOLD_S = 0.50
+# Adjacent columns on one shelf differ by only 0.22 m.  A same-kind slot
+# correction may therefore use a small margin while the base is approaching,
+# but changing product kind must still save the full global margin; otherwise
+# centimetre-scale matrix/odometry noise can reorder two pending products.
+# Lock every chosen slot before final braking to prevent target chatter.
+DYNAMIC_DIRECT_SAME_LEVEL_RETARGET_MARGIN_M = 0.01
+DYNAMIC_DIRECT_FINAL_TARGET_LOCK_M = 0.45
 # 放置阶段逐关节运动诊断日志：基座/两臂六关节(measured/command/desired)/
 # slide/夹爪/TCP/商品底部高度，每 PLACE_MOTION_LOG_PERIOD_S 一条
 # [place-motion]，用于排查“商品掉落/被挤压到桌面”等放置问题。
@@ -565,9 +581,6 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_retreat_dwell_s = place_retreat_dwell_s
         self.return_west_after_place = bool(return_west_after_place)
         self.return_start_after_place = bool(return_start_after_place)
-        self.completion_file: str | None = None
-        self.completion_order_id: str | None = None
-        self._all_orders_completion_signalled = False
         self.placement_completed = False
         self.post_delivery_warnings: list[str] = []
         self.delivery_completed_by_drop = False
@@ -768,8 +781,23 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         if getattr(self, "flow_phase", None) not in {
                 "backup", "restore_height", "nav_to_delivery"}:
             return None, None
-        return LOADED_TRANSPORT_LIMITS.get(
+        linear_cap, angular_cap = LOADED_TRANSPORT_LIMITS.get(
             getattr(self, "target_kind", None), (None, None))
+        if linear_cap is None:
+            linear_cap = LOADED_TRANSPORT_LINEAR_MAX_MPS
+        else:
+            linear_cap = min(
+                float(linear_cap), LOADED_TRANSPORT_LINEAR_MAX_MPS)
+        return linear_cap, angular_cap
+
+    def _target_is_sphere_product(self) -> bool:
+        """Identify fruit independently of the shelf-specific grasp path.
+
+        Lower-shelf fruit deliberately uses the reachable lower-front arm
+        trajectory rather than the middle/top sphere trajectory.  Transport,
+        drop monitoring and delivery routing must still treat it as a sphere.
+        """
+        return getattr(self, "target_kind", None) in pick.SPHERE_RADIUS_M
 
     def set_twist(self, linear: float, angular: float) -> None:
         """Apply normal limits plus product-specific loaded transit caps."""
@@ -1073,6 +1101,18 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             - self.base_xy))
         hint["retarget_candidate_distance"] = candidate_distance
         hint["retarget_current_distance"] = current_distance
+        same_shelf_level = (
+            candidate_slot[:2] == self.direct_transit_slot[:2])
+        if same_shelf_level:
+            if current_distance <= DYNAMIC_DIRECT_FINAL_TARGET_LOCK_M:
+                return False
+            margin = (
+                DYNAMIC_DIRECT_RETARGET_MARGIN_M
+                if candidate_kind != self.target_kind
+                else DYNAMIC_DIRECT_SAME_LEVEL_RETARGET_MARGIN_M)
+            return bool(
+                candidate_distance
+                + margin < current_distance)
         return bool(
             candidate_distance + DYNAMIC_DIRECT_RETARGET_MARGIN_M
             < current_distance)
@@ -2020,8 +2060,20 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             f"direct_single_leg=True")
 
     def _delivery_slot_goal(self) -> tuple[float, float, float]:
+        # A carried sphere remains about 0.70 m in front of the base.  Driving
+        # the chassis directly toward the westmost slot makes that protruding
+        # payload sweep to x=-2.40 while the base is still turning diagonally,
+        # which matches the repeated orange losses beside the west wall.  Aim
+        # every sphere at the proven table-centre approach instead, including
+        # lower-shelf fruit that uses the lower-front grasp path.  After the
+        # base faces south, placement IK moves the arm laterally to the assigned
+        # slot.  Non-spherical products retain their per-slot chassis target.
+        approach_x = (
+            float(DELIVERY_APPROACH[0])
+            if self._target_is_sphere_product()
+            else float(self.place_world[0]))
         return (
-            float(self.place_world[0]),
+            approach_x,
             DELIVERY_APPROACH[1],
             DELIVERY_APPROACH[2],
         )
@@ -2320,7 +2372,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         grasp_command = float(
             self.des_right_grip
             if self.grasp_arm == "r" else self.des_left_grip)
-        if self.use_sphere_grasp:
+        if self._target_is_sphere_product():
             self._transport_grip_command = SPHERE_TRANSPORT_GRIP_COMMAND
         else:
             self._transport_grip_command = float(np.clip(
@@ -2380,7 +2432,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         measured = self.selected_gripper_position()
         if measured is None:
             return False, {"mode": "single", "feedback": "missing"}
-        if self.use_sphere_grasp:
+        if self._target_is_sphere_product():
             threshold = float(SPHERE_TRANSPORT_HELD_MINIMUM.get(
                 self.target_kind, self.sphere_capture_minimum()))
             return (
@@ -4422,7 +4474,6 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
     def _start_return_to_start(self, now: float) -> None:
         """Start the final-delivery return from the table to the start pose."""
-        self._signal_all_orders_completed(now)
         self._set_flow_phase("return_to_start")
         self._nav_goal = None
         self._nav_last_log = 0.0
@@ -4432,47 +4483,6 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             "[return-start] final delivery complete; returning to start "
             f"goal=({START_POSE[0]:.3f},{START_POSE[1]:.3f},"
             f"{math.degrees(START_POSE[2]):.0f}deg)")
-
-    def configure_all_orders_completion_signal(
-            self, order_id: str, completion_file: str | None) -> None:
-        """Configure the atomic hand-off from delivery to final return."""
-        self.completion_order_id = str(order_id)
-        self.completion_file = completion_file
-
-    def _signal_all_orders_completed(self, now: float) -> None:
-        """Persist final delivery before entering the independent return."""
-        if self._all_orders_completion_signalled:
-            return
-        if not self.completion_file:
-            # Manual single-worker runs have no supervising runner.  They
-            # still retain the same phase boundary and human-facing log, but
-            # do not need the file handshake used to disable the runner's
-            # per-order timeout.
-            self._all_orders_completion_signalled = True
-            self.get_logger().info("All order completed")
-            return
-        slot = self.target_slot()
-        document = {
-            "schema_version": 1,
-            "milestone": "all_orders_completed",
-            "status": "delivered",
-            "order_id": self.completion_order_id,
-            "kind": self.target_kind,
-            "marker_id": self.target_marker_id,
-            "slot": None if slot is None else list(slot),
-            "slot_key": self.target_slot_key(),
-            "flow_phase": "return_to_start",
-            "signalled_at_monotonic": round(float(now), 3),
-        }
-        destination = pathlib.Path(self.completion_file)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_suffix(destination.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(document, ensure_ascii=False, indent=2),
-            encoding="utf-8")
-        temporary.replace(destination)
-        self._all_orders_completion_signalled = True
-        self.get_logger().info("All order completed")
 
     def _return_to_start_tick(self, now: float) -> None:
         target = np.asarray(START_POSE[:2], dtype=float)
@@ -5014,9 +5024,6 @@ def parse_args() -> argparse.Namespace:
         "--result-file",
         help="write a machine-readable worker result for competition_runner")
     parser.add_argument(
-        "--completion-file",
-        help="atomically signal final delivery before independent return")
-    parser.add_argument(
         "--exclude-marker-id", action="append", type=int, default=[],
         help="ignore a marker already delivered or failed in this match")
     parser.add_argument(
@@ -5063,12 +5070,12 @@ def parse_args() -> argparse.Namespace:
         "--weights", default=str(REPO_ROOT / "examples" / "supermarket_sorting" / "perception" / "checkpoints" / "best.pt"),
         help="multi-class Ultralytics checkpoint (default: repository best.pt)")
     parser.add_argument(
-        "--confidence", type=float, default=0.45)
+        "--confidence", type=float, default=0.90)
     parser.add_argument(
-        "--max-inference-hz", type=float, default=12.0,
+        "--max-inference-hz", type=float, default=8.0,
         help="maximum YOLO source-frame rate during active scan states")
     parser.add_argument(
-        "--device", choices=["auto", "cpu", "cuda"], default="auto")
+        "--device", choices=["auto", "cpu", "cuda"], default="cuda")
     parser.add_argument(
         "--show", action="store_true", help="show the YOLO result window")
     parser.add_argument(
@@ -5266,8 +5273,6 @@ def main() -> int:
             close_recheck=not args.no_close_recheck,
             return_west_after_place=args.return_west_after_place,
             return_start_after_place=args.return_start_after_place)
-        controller.configure_all_orders_completion_signal(
-            args.order_id, args.completion_file)
         controller.perception_always_on = bool(args.perception_always_on)
         controller.dynamic_direct_enabled = bool(args.dynamic_direct)
         controller.configure_external_perception(args.external_perception)

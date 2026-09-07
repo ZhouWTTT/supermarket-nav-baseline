@@ -269,7 +269,7 @@ TOP_LEFT_GRASP_X_BIAS_M = 0.000
 # while correcting heading once the error is moderate, keep a minimum approach
 # speed, and accept the final heading with a deadband so odom yaw noise cannot
 # stall the phase.
-NAV_LINEAR_MAX_MPS = 0.90
+NAV_LINEAR_MAX_MPS = 1.15
 NAV_LINEAR_MIN_MPS = 0.10
 # 货架对齐的最后一段使用更低的进给下限：对齐容差只有 2.5cm，高速停车
 # 过冲会偏移抓取位姿。仅提高距离比例增益，最后 50mm 仍保持原 0.10m/s
@@ -324,14 +324,28 @@ MARKER_SAMPLE_SPREAD_MAX_M = 0.04
 # Close-range verification before committing the arm.  Far-view YOLO and
 # ArUco association remains the localisation source; this second view only
 # verifies that the requested class is still present at the selected slot.
-CLOSE_RECHECK_CONFIRMATIONS = 2
+# Close verification is only a final presence guard after the matrix/direct
+# route has already localised the slot.  Requiring two close-range frames made
+# brief occlusion look like an empty slot and kept the robot scanning in front
+# of the shelf.  One fresh class-and-depth-consistent frame is sufficient; the
+# class equality check in _recheck_detection_matches remains mandatory.
+CLOSE_RECHECK_CONFIRMATIONS = 1
+# Passing the already-selected class and abandoning it are deliberately
+# asymmetric decisions.  A single class-and-depth-consistent frame is enough
+# to avoid the old close-recheck stall, but a different pending class must be
+# stable across several fresh frames before it can redirect the robot.
+CLOSE_RECHECK_SWITCH_CONFIRMATIONS = 3
 CLOSE_RECHECK_WINDOW_S = 2.0
-CLOSE_RECHECK_POSE_TIMEOUT_S = 3.0
+# Observation time starts only after the slide/head have reached the requested
+# pose.  Keep a separate actuator-motion ceiling so a slow 0.60 m lower-shelf
+# slide move cannot consume the entire camera observation window.
+CLOSE_RECHECK_POSE_TIMEOUT_S = 1.0
+CLOSE_RECHECK_CAMERA_MOTION_TIMEOUT_S = 4.0
 # Give the level-aligned camera a short opportunity to decode/associate a
 # marker before accepting the existing YOLO + depth fallback.  This is a
 # preference window, not a hard requirement: an occluded or unreadable marker
 # must never prevent a geometrically consistent target from being grasped.
-CLOSE_RECHECK_ARUCO_PREFERENCE_S = 0.75
+CLOSE_RECHECK_ARUCO_PREFERENCE_S = 0.25
 REVISIT_POSE_COMMAND_TIMEOUT_S = 5.0
 CLOSE_RECHECK_XY_MAX_M = 0.12
 CLOSE_RECHECK_Z_MAX_M = 0.16
@@ -358,13 +372,17 @@ TOP_PREGRASP_BACKOFF_M = 0.12
 # are therefore unchanged.
 TOP_SHELF_SURFACE_Z_M = 1.189
 TOP_MIN_TCP_TARGET_CLEARANCE_M = 0.070
+# Spheres need the jaws near their equator rather than across the upper cap.
+# Keep a separate top-shelf floor 10 mm below the generic wrist clearance;
+# this preserves rail clearance without forcing a ball into a high grasp.
+TOP_SPHERE_MIN_TCP_TARGET_CLEARANCE_M = 0.060
 LOWER_PREGRASP_BACKOFF_M = 0.16
 LOWER_GRASP_TCP_FORWARD_M = 0.035
 # Every supported profile first reaches its established close point with the
 # gripper open, then keeps the same endpoint orientation and executes one
-# additional monotonic 50 mm arm segment before closing.  Generic profiles
-# solve both endpoints during configuration; sphere profiles build the second
-# endpoint once from the measured physical-contact pose.
+# additional monotonic arm segment before closing.  Generic profiles use the
+# 50 mm default below; sphere profiles use their own deeper, slower seating
+# move built once from the measured physical-contact pose.
 GENERIC_POST_CONTACT_EXTENSION_M = 0.050
 # 按货物类型覆盖接触后前伸量（米）：薯片罐用 25mm——既让罐子坐进夹爪
 # 更深、夹得更稳，又避免 50mm 长前伸把罐子推倒。
@@ -426,6 +444,13 @@ SPHERE_TERMINAL_SPEED_MPS = 0.060
 SPHERE_TERMINAL_ZONE_M = 0.045
 SPHERE_OPEN_GRIP_DROP_CONTACT = 0.08
 SPHERE_CONTACT_CREEP_SPEED_MPS = 0.020
+# Seat the sphere 15 mm deeper than the generic 50 mm continuation so it is
+# held by the useful inner finger region instead of the tips.  This happens
+# after the sphere is already close enough to roll away from a sharp command,
+# so keep it at the same gentle speed as contact creep.  Generic/cylindrical
+# goods retain their original distance and faster fixed-trajectory setting.
+SPHERE_POST_CONTACT_EXTENSION_M = 0.065
+SPHERE_POST_EXTEND_SPEED_MPS = 0.020
 SPHERE_CONTACT_CREEP_TIMEOUT_S = 1.5
 SPHERE_CREEP_CAPTURE_GRIP_DROP = 0.15
 SPHERE_CREEP_MIN_ADVANCE_M = 0.002
@@ -761,6 +786,16 @@ DUAL_TISSUE_MOTION_MIN_SETTLE_S = 0.20
 # 后还要空等。
 DUAL_TISSUE_DEPLOY_DWELL_S = 1.5
 DUAL_TISSUE_DEPLOY_TIMEOUT_S = 5.0
+# Five seconds remains the normal/soft deadline.  A top side-column rolled
+# pregrasp can, however, start several radians away from the neutral posture;
+# under a slow simulator it is still visibly converging when that deadline is
+# reached.  Continue only while measured arm/slide feedback makes progress,
+# and retain both a stall deadline and a finite hard ceiling.
+DUAL_TISSUE_DEPLOY_HARD_TIMEOUT_S = 35.0
+DUAL_TISSUE_DEPLOY_STALL_TIMEOUT_S = 4.0
+DUAL_TISSUE_DEPLOY_ARM_PROGRESS_RAD = 0.030
+DUAL_TISSUE_DEPLOY_SLIDE_PROGRESS_M = 0.002
+DUAL_TISSUE_DEPLOY_PROGRESS_LOG_PERIOD_S = 5.0
 # 侧夹预压保持时长：预压动作本身已有收敛/稳定门控，保持时间从 4s 降到
 # 3s，缩短提拉前等待。
 # 预压保持时长略增，让接触力在提拉前稳定建立（力度加大后多给 1s 收敛）。
@@ -860,15 +895,13 @@ GENERIC_TCP_FINGER_CLEARANCE_M = 0.06
 GENERIC_TCP_FINGER_CLEARANCE_BY_KIND_M = {
     "kouxiangtang": 0.050,
 }
-# 所有货物抓取姿态的目标 Z 统一抬升 1cm：让指尖略高于测得的货物中心，
-# 避免指尖落在货架导轨/前缘高度（D 架苹果指尖撞导轨问题），对深度测量
-# 的偏低误差更宽容。对球体（苹果/橙子）与普通货物、各层货架一致生效。
+# 普通货物抓取姿态的目标 Z 统一抬升 1cm：让指尖略高于测得的货物中心，
+# 避免指尖落在货架导轨/前缘高度，并对深度测量的偏低误差更宽容。球体
+# 使用下方独立高度策略，不走这个通用抬升。
 GRASP_TCP_Z_RAISE_M = 0.010
-# 球体（苹果/橙子）抓取 TCP 相对货物中心的目标抬升。通用 10mm 抬升对球体
-# 偏保守，指尖会落在球体上半部、夹持不稳；球体改为 5mm，让指尖更贴近赤道
-# （最大截面）夹得更稳，同时仍保留少量净抬升以避开货架导轨/前缘。
-# 顶层球体仍走 top_grasp_tcp_z 的最低净空规则，不受此值影响。
-SPHERE_GRASP_TCP_Z_RAISE_M = 0.005
+# 球体（苹果/橙子）的目标 TCP 下移到球心下方 5mm，使夹爪落在赤道附近的
+# 最大截面，而不是夹住上半球。顶层另由较低但仍安全的独立净空下限保护。
+SPHERE_GRASP_TCP_Z_RAISE_M = -0.005
 # 按货物类型的抓取高度额外偏移（米）：负值降低。可乐、核桃味刀调低 1cm。
 GRASP_TCP_Z_OFFSET_BY_KIND = {"kele": -0.010, "heweidao": -0.010}
 # KDL/仿真运动学的 X 方向执行偏差：普通货物右臂 TCP 实测比指令偏东约
@@ -908,6 +941,18 @@ def generic_post_extend_world(
         target_kind, GENERIC_POST_CONTACT_EXTENSION_M)
     extended[2] -= GENERIC_POST_EXTEND_Z_DROP_M_BY_KIND.get(target_kind, 0.0)
     return extended
+
+
+def sphere_grasp_tcp_z(
+        product_center_z: float, shelf_level: str) -> float:
+    """Return the lower, shelf-safe TCP height for a spherical product."""
+    target_z = float(product_center_z) + SPHERE_GRASP_TCP_Z_RAISE_M
+    if shelf_level == "top":
+        target_z = max(
+            target_z,
+            TOP_SHELF_SURFACE_Z_M
+            + TOP_SPHERE_MIN_TCP_TARGET_CLEARANCE_M)
+    return target_z
 
 
 def wrap_to_pi(angle: float) -> float:
@@ -1150,11 +1195,16 @@ class ShelfPickController(Node):
         self.target_physical_marker_id = None
         self.target_world = None
         self.committed_slot = None
-        # 记忆直达槽位复核失败后的同货架相邻列重试（方案 B）：
-        # 列证据通常只差一格，相邻列命中可省掉整轮“回货架中心全量扫描”。
+        # Legacy bounded adjacent-column retry state.  Keep the mechanism for
+        # explicit experiments, but disable it in the production default below.
         self.direct_slot_target_active = False
         self.direct_slot_adjacent_retries = 0
-        self.direct_slot_adjacent_max_retries = 2
+        # A failed close verification means the direct-memory proposal is no
+        # longer trustworthy.  Do not spend another 12--30 seconds blindly
+        # walking across adjacent columns; the integrated worker can return a
+        # reroute result so the runner immediately selects another pending
+        # order.  Standalone/last-order mode still falls back to a full scan.
+        self.direct_slot_adjacent_max_retries = 0
         self.grasp_arm = "r"
         self.align_base_x = None
         self.align_base_y = SCAN_Y
@@ -1189,6 +1239,7 @@ class ShelfPickController(Node):
         self.post_extend_arm_joints = None
         self.post_extend_start_joints = None
         self.post_extend_duration_s = 0.0
+        self.post_extend_speed_mps = GENERIC_DIRECT_FORWARD_SPEED_MPS
         self.post_extend_endpoint_ready_since = None
         self.generic_top_lift_arm_joints = None
         self.generic_top_retreat_arm_joints = None
@@ -1256,6 +1307,10 @@ class ShelfPickController(Node):
         self.dual_motion_path_distances = None
         self.dual_motion_path_left = None
         self.dual_motion_path_right = None
+        self.dual_deploy_best_arm_error = None
+        self.dual_deploy_best_slide_error = None
+        self.dual_deploy_last_progress_at = None
+        self.dual_deploy_extension_last_log = None
         self.dual_contact_start_left_joints = None
         self.dual_contact_start_right_joints = None
         self.dual_contact_target_left_joints = None
@@ -1395,9 +1450,15 @@ class ShelfPickController(Node):
             self.opportunistic_yolo_frames.append(
                 (stamp_ns, head_records))
             self._maybe_lock_opportunistic_target_locked()
-            records = [
+            target_records = [
                 record for record in head_records
                 if record.get("class") == self.target_kind]
+            # Close recheck can opportunistically switch to another pending
+            # order, so it must see the all-class frame.  Normal scan and
+            # association paths intentionally retain target-only records.
+            records = (
+                head_records if self.state == STATE_RECHECK
+                else target_records)
             if not records:
                 return
             self.yolo_frames.append((stamp_ns, records))
@@ -1408,7 +1469,7 @@ class ShelfPickController(Node):
             if collect_yolo_only:
                 # 有框无码候选：记录 YOLO 目标类框（按世界 x/z 或像素归并），
                 # 让"检测到但没解到码"的货物也能触发定点补拍。
-                for record in records:
+                for record in target_records:
                     world = self._detection_world(record)
                     slot = None
                     if world is not None:
@@ -2483,7 +2544,7 @@ class ShelfPickController(Node):
             self.recheck_switch_world = world.copy()
             self.recheck_switch_slot = slot
             self.recheck_switch_count = 1
-        if self.recheck_switch_count < CLOSE_RECHECK_CONFIRMATIONS:
+        if self.recheck_switch_count < CLOSE_RECHECK_SWITCH_CONFIRMATIONS:
             return
         self._switch_recheck_target(kind, world, slot)
 
@@ -2572,6 +2633,13 @@ class ShelfPickController(Node):
         marker appears during the short preference window, retain the proven
         YOLO + depth fallback.
         """
+        # The geometry check below historically accepted any class near the
+        # expected XYZ.  That becomes unsafe with a one-frame gate: a nearby
+        # product could release the arm.  Other pending classes are handled by
+        # _maybe_switch_recheck_target instead.
+        if detection.get("class") != self.target_kind:
+            return False, "class"
+
         marker = marker_below_yolo(detection, markers)
         marker_id = None
         if marker is not None:
@@ -2599,8 +2667,8 @@ class ShelfPickController(Node):
             # 深度单点常有系统性偏移：商品明明在预期槽位，但世界点离记忆
             # 中心差 0.12–0.16m 就被误判为“槽位无货”，随后整单改道/重试。
             # 零耗时兜底：只要类别一致且世界点映射到同一 (shelf, level,
-            # column) 固定槽位格，同样视为近距复核命中（仍要求 2 个独立
-            # 帧，不增加驻停时间）。
+            # column) 固定槽位格，同样视为近距复核命中；它仍须通过当前
+            # 一帧类别硬校验，不增加驻停时间。
             slot = fixed_slot_from_world(
                 float(world[0]), float(world[2]))
             expected = self.target_slot()
@@ -2610,6 +2678,10 @@ class ShelfPickController(Node):
                 return True, "depth(slot-grid)"
             return False, "depth"
 
+        aruco_preference_active = (
+            self.scan_camera_ready_since is not None
+            and self.now() - self.scan_camera_ready_since
+            < CLOSE_RECHECK_ARUCO_PREFERENCE_S)
         marker_adoptable = (
             marker_id is not None
             and self.target_marker_id is None
@@ -2622,10 +2694,9 @@ class ShelfPickController(Node):
             else:
                 self.recheck_marker_candidate_id = marker_id
                 self.recheck_marker_candidate_count = 1
-            # Require two consecutive associations before adopting an ID.
-            # The normal close-recheck still needs its own two confirmed
-            # frames after adoption, so a one-frame decode cannot identify a
-            # delivered item or accidentally blacklist a marker.
+            # Require two consecutive associations before adopting an ID.  The
+            # second association also satisfies the one-frame presence gate,
+            # so one stray marker decode cannot identify or blacklist an item.
             if self.recheck_marker_candidate_count >= 2:
                 self.target_marker_id = marker_id
                 self.get_logger().info(
@@ -2633,8 +2704,12 @@ class ShelfPickController(Node):
                     f"{marker_id} for depth-consistent kind="
                     f"{self.target_kind}")
                 return True, f"aruco(adopt={marker_id})"
-            return False, f"aruco(candidate={marker_id})"
-        if self.target_marker_id is None:
+            # ArUco is a short preference, not a hard dependency.  Once its
+            # small window expires, keep the candidate for a later ID adoption
+            # but let the already-matched YOLO + depth evidence pass now.
+            if aruco_preference_active:
+                return False, f"aruco(candidate={marker_id})"
+        if self.target_marker_id is None and marker_id is None:
             self.recheck_marker_candidate_id = None
             self.recheck_marker_candidate_count = 0
 
@@ -2642,9 +2717,7 @@ class ShelfPickController(Node):
         # detector has had a fair chance to publish a synchronized result.
         # Once the preference interval expires, this remains the original
         # non-blocking depth fallback.
-        if (self.scan_camera_ready_since is not None
-                and self.now() - self.scan_camera_ready_since
-                < CLOSE_RECHECK_ARUCO_PREFERENCE_S):
+        if aruco_preference_active:
             return False, "waiting-aruco"
         if marker_id is None:
             source = "depth(no-aruco)"
@@ -2688,8 +2761,7 @@ class ShelfPickController(Node):
         return True
 
     def _recheck_fail(self) -> None:
-        """Skip this slot and resume scanning (after bounded adjacent-column
-        retries for memory direct-slot targets)."""
+        """Skip this slot and reroute, or resume the standalone fallback scan."""
         marker_id = self.target_marker_id
         if marker_id is not None:
             self.recheck_marker_skips.add(marker_id)
@@ -2704,9 +2776,9 @@ class ShelfPickController(Node):
         self.recheck_marker_candidate_id = None
         self.recheck_marker_candidate_count = 0
         self.scan_camera_ready_since = None
-        # 方案 B：记忆直达槽位复核失败时，先试同货架相邻列（横向 0.22m 级），
-        # 而不是立刻回货架中心全量扫描。列证据通常只差一格，相邻列命中即可
-        # 省掉整轮扫描/补拍/重新定位/二次对齐（实测约 26s → 约 5s）。
+        # Optional legacy hook for experiments that explicitly enable adjacent
+        # retries.  The production default is zero, so integrated multi-order
+        # runs proceed directly to _reroute_on_missing_direct_slot().
         if (marker_id is None
                 and self.direct_slot_target_active
                 and self._try_adjacent_direct_slot()):
@@ -2907,7 +2979,8 @@ class ShelfPickController(Node):
             f"grip={gripper} preshape={self.grip_preshape_command:.3f}")
 
     def set_twist(self, linear: float, angular: float) -> None:
-        self.des_linear = float(np.clip(linear, -0.90, 0.90))
+        self.des_linear = float(np.clip(
+            linear, -NAV_LINEAR_MAX_MPS, NAV_LINEAR_MAX_MPS))
         self.des_angular = float(np.clip(angular, -2.50, 2.50))
 
     def begin_manip_base_hold(self) -> None:
@@ -4209,6 +4282,12 @@ class ShelfPickController(Node):
         self.des_left_grip = DUAL_TISSUE_GRIP_COMMAND
         self.des_right_grip = DUAL_TISSUE_GRIP_COMMAND
         self.des_slide = self.slide_grasp
+        # The deploy deadline is feedback-driven.  Reset its progress watcher
+        # for every freshly solved pregrasp (including an IK/base retry).
+        self.dual_deploy_best_arm_error = None
+        self.dual_deploy_best_slide_error = None
+        self.dual_deploy_last_progress_at = None
+        self.dual_deploy_extension_last_log = None
         self.get_logger().info(
             f"[dual-tissue-IK] tcp_z={tcp_z:.3f} "
             f"raise={tcp_z - self.target_world[2]:.3f}m "
@@ -4958,10 +5037,8 @@ class ShelfPickController(Node):
     def configure_sphere_grasp(self) -> bool:
         """Configure sphere geometry for the selected supported shelf layer."""
         pregrasp_world = self.target_world.copy()
-        grasp_tcp_z = float(
-            self.target_world[2] + SPHERE_GRASP_TCP_Z_RAISE_M)
-        if self.shelf_level == "top":
-            grasp_tcp_z = self.top_grasp_tcp_z()
+        grasp_tcp_z = sphere_grasp_tcp_z(
+            self.target_world[2], self.shelf_level)
         pregrasp_world[2] = grasp_tcp_z
         pregrasp_world[1] -= SPHERE_PREGRASP_BACKOFF_M
         contact_world = self.target_world.copy()
@@ -5402,6 +5479,38 @@ class ShelfPickController(Node):
             self.set_state(STATE_ABORT)
             return
 
+        now = self.now()
+        arm_error = self.dual_arm_error()
+        measured_slide = self.joints.get("slide_joint")
+        slide_error = (
+            float("inf") if measured_slide is None
+            else abs(float(measured_slide) - self.des_slide))
+
+        # Record real actuator progress rather than treating elapsed wall time
+        # as proof of a jam.  Updating only after a meaningful cumulative
+        # reduction rejects encoder jitter while still following a slow arm.
+        best_arm_error = self.dual_deploy_best_arm_error
+        best_slide_error = self.dual_deploy_best_slide_error
+        made_progress = False
+        if math.isfinite(arm_error):
+            if best_arm_error is None:
+                self.dual_deploy_best_arm_error = arm_error
+                made_progress = True
+            elif (arm_error <= best_arm_error
+                  - DUAL_TISSUE_DEPLOY_ARM_PROGRESS_RAD):
+                self.dual_deploy_best_arm_error = arm_error
+                made_progress = True
+        if math.isfinite(slide_error):
+            if best_slide_error is None:
+                self.dual_deploy_best_slide_error = slide_error
+                made_progress = True
+            elif (slide_error <= best_slide_error
+                  - DUAL_TISSUE_DEPLOY_SLIDE_PROGRESS_M):
+                self.dual_deploy_best_slide_error = slide_error
+                made_progress = True
+        if made_progress:
+            self.dual_deploy_last_progress_at = now
+
         deploy_ready = self.dual_commands_ready(
             ARM_REACHED_TOLERANCE_RAD + 0.015, 0.025)
         if (deploy_elapsed >= DUAL_TISSUE_DEPLOY_DWELL_S
@@ -5409,7 +5518,7 @@ class ShelfPickController(Node):
             self.get_logger().info(
                 f"[dual-tissue-deploy] measured pregrasp stable after "
                 f"{deploy_elapsed:.2f}s; dual_arm_error="
-                f"{self.dual_arm_error():.4f}rad; starting fixed surround "
+                f"{arm_error:.4f}rad; starting fixed surround "
                 "motion")
             self.start_dual_tissue_surround()
             return
@@ -5417,15 +5526,37 @@ class ShelfPickController(Node):
         if deploy_elapsed < DUAL_TISSUE_DEPLOY_TIMEOUT_S:
             return
 
-        measured_slide = self.joints.get("slide_joint")
-        slide_error = (
-            float("inf") if measured_slide is None
-            else abs(float(measured_slide) - self.des_slide))
+        last_progress_at = self.dual_deploy_last_progress_at
+        progress_age = (
+            float("inf") if last_progress_at is None
+            else max(0.0, now - last_progress_at))
+        hard_timeout = (
+            deploy_elapsed >= DUAL_TISSUE_DEPLOY_HARD_TIMEOUT_S)
+        stalled = (
+            progress_age >= DUAL_TISSUE_DEPLOY_STALL_TIMEOUT_S)
+        if not hard_timeout and not stalled:
+            last_log = self.dual_deploy_extension_last_log
+            if (last_log is None
+                    or deploy_elapsed - last_log
+                    >= DUAL_TISSUE_DEPLOY_PROGRESS_LOG_PERIOD_S):
+                self.dual_deploy_extension_last_log = deploy_elapsed
+                self.get_logger().warn(
+                    "[dual-tissue-deploy] soft deadline reached but "
+                    "measured pregrasp is still converging; "
+                    f"elapsed={deploy_elapsed:.2f}s "
+                    f"dual_arm_error={arm_error:.4f}rad "
+                    f"slide_error={slide_error:.4f}m "
+                    f"progress_age={progress_age:.2f}s; continuing")
+            return
+
+        reason = "hard timeout" if hard_timeout else "actuator stalled"
         self.get_logger().error(
             "[dual-tissue-deploy] measured pregrasp did not converge; "
             f"elapsed={deploy_elapsed:.2f}s "
-            f"dual_arm_error={self.dual_arm_error():.4f}rad "
-            f"slide_error={slide_error:.4f}m; aborting before insertion")
+            f"dual_arm_error={arm_error:.4f}rad "
+            f"slide_error={slide_error:.4f}m "
+            f"progress_age={progress_age:.2f}s reason={reason}; "
+            "aborting before insertion")
         self.set_state(STATE_ABORT)
 
     def advance_dual_tissue_surround_sequence(self) -> None:
@@ -6124,9 +6255,13 @@ class ShelfPickController(Node):
         extension_length = float(np.linalg.norm(
             self.post_extend_target_world
             - self.post_extend_nominal_world))
+        self.post_extend_speed_mps = (
+            SPHERE_POST_EXTEND_SPEED_MPS
+            if self.use_sphere_grasp
+            else GENERIC_DIRECT_FORWARD_SPEED_MPS)
         self.post_extend_duration_s = max(
             GENERIC_DIRECT_FORWARD_MIN_DURATION_S,
-            1.5 * extension_length / GENERIC_DIRECT_FORWARD_SPEED_MPS)
+            1.5 * extension_length / self.post_extend_speed_mps)
         self.post_extend_endpoint_ready_since = None
         # Snap the diagnostic target to the second endpoint before entering
         # the state.  The arm command itself starts from its measured joints,
@@ -6142,16 +6277,16 @@ class ShelfPickController(Node):
             f"{np.round(self.post_extend_target_world, 4)} "
             f"distance={extension_length:.3f}m "
             f"duration={self.post_extend_duration_s:.2f}s "
-            f"speed={GENERIC_DIRECT_FORWARD_SPEED_MPS:.3f}m/s "
+            f"speed={self.post_extend_speed_mps:.3f}m/s "
             "orientation=unchanged feedback_gates=0 replanning=0")
         self.set_state(STATE_POST_EXTEND)
 
     def prepare_sphere_post_extension(self) -> bool:
-        """Build the sphere's 50 mm endpoint from its measured close pose.
+        """Build the sphere's deeper endpoint from its measured close pose.
 
         Physical sphere contact may end the existing creep before its nominal
         Cartesian goal.  Starting from the measured TCP guarantees that the
-        requested continuation is 50 mm from the point where this run would
+        requested continuation is measured from the point where this run would
         previously have closed, while preserving measured X/Z and orientation.
         A one-shot IK failure falls back to closing at the established point;
         it never enters a retry/correction loop.
@@ -6164,7 +6299,7 @@ class ShelfPickController(Node):
             return False
         measured_joints = self.selected_arm_positions().copy()
         extended_world = actual_tcp.copy()
-        extended_world[1] += GENERIC_POST_CONTACT_EXTENSION_M
+        extended_world[1] += SPHERE_POST_CONTACT_EXTENSION_M
         try:
             extended_joints = self.solve_kdl_world(
                 extended_world, measured_joints)
@@ -6181,12 +6316,12 @@ class ShelfPickController(Node):
             f"[{self.shelf_level}-sphere-post-extend] prepared from measured "
             f"close point={np.round(actual_tcp, 4)} to "
             f"extended_close={np.round(extended_world, 4)} "
-            f"distance={GENERIC_POST_CONTACT_EXTENSION_M:.3f}m; "
+            f"distance={SPHERE_POST_CONTACT_EXTENSION_M:.3f}m; "
             "gripper remains open")
         return True
 
     def advance_post_extension(self) -> tuple[str, np.ndarray | None]:
-        """Play a profile's 50 mm extension, then permit closure."""
+        """Play a profile's configured extension, then permit closure."""
         elapsed = self.now() - self.state_t0
         duration = max(self.post_extend_duration_s, 1e-6)
         progress = float(np.clip(elapsed / duration, 0.0, 1.0))
@@ -6919,10 +7054,12 @@ class ShelfPickController(Node):
             _, slide_target, yaw_target, pitch_target = pose
             self.des_slide = slide_target
             self.des_head[:] = [yaw_target, pitch_target]
+            now = self.now()
             if self.scan_camera_ready(pose):
                 if self.scan_camera_ready_since is None:
-                    self.scan_camera_ready_since = self.now()
-                if (self.now() - self.scan_camera_ready_since
+                    self.scan_camera_ready_since = now
+                ready_elapsed = now - self.scan_camera_ready_since
+                if (ready_elapsed
                         >= SCAN_CAMERA_STABLE_S
                         and self._recheck_confirmed()):
                     self._recheck_passed = True
@@ -6933,14 +7070,27 @@ class ShelfPickController(Node):
                         f"{self.target_marker_id} kind={self.target_kind}; "
                         "proceeding to grasp")
                     self._start_grasp_settle()
+                elif (self.state == STATE_RECHECK
+                      and ready_elapsed
+                      >= (SCAN_CAMERA_STABLE_S
+                          + CLOSE_RECHECK_POSE_TIMEOUT_S)):
+                    self.get_logger().info(
+                        f"[close-recheck] pose={pose[0]} observation window "
+                        f"exhausted after camera-ready; trying next view")
+                    if not self._advance_recheck_pose():
+                        self._recheck_fail()
             else:
                 self.scan_camera_ready_since = None
-
-            if (self.state == STATE_RECHECK
-                    and self.now() - self.recheck_pose_started_at
-                    >= CLOSE_RECHECK_POSE_TIMEOUT_S):
-                if not self._advance_recheck_pose():
-                    self._recheck_fail()
+                if (self.state == STATE_RECHECK
+                        and now - self.recheck_pose_started_at
+                        >= CLOSE_RECHECK_CAMERA_MOTION_TIMEOUT_S):
+                    self.get_logger().warn(
+                        f"[close-recheck] pose={pose[0]} camera did not reach "
+                        f"its command within "
+                        f"{CLOSE_RECHECK_CAMERA_MOTION_TIMEOUT_S:.1f}s; "
+                        "trying next view")
+                    if not self._advance_recheck_pose():
+                        self._recheck_fail()
 
         elif self.state == STATE_TISSUE_ROTATE:
             self.des_slide = self.slide_grasp
@@ -7776,10 +7926,13 @@ def parse_args():
         "--weights", default=str(DEFAULT_WEIGHTS),
         help="multi-class Ultralytics checkpoint (default: repository best.pt)")
     parser.add_argument(
-        "--confidence", type=float, default=0.45,
-        help="minimum YOLO confidence (default: 0.45)")
+        "--confidence", type=float, default=0.90,
+        help="minimum YOLO confidence (default: 0.90)")
     parser.add_argument(
-        "--device", choices=["auto", "cpu", "cuda"], default="auto")
+        "--device", choices=["auto", "cpu", "cuda"], default="cuda")
+    parser.add_argument(
+        "--max-inference-hz", type=float, default=8.0,
+        help="maximum YOLO source-frame rate (default: 8 Hz)")
     parser.add_argument(
         "--show", action="store_true", help="show the YOLO result window")
     parser.add_argument(
@@ -7802,6 +7955,8 @@ def parse_args():
     args = parser.parse_args()
     if not 0.0 <= args.confidence <= 1.0:
         parser.error("--confidence must be in [0, 1]")
+    if not 0.0 < args.max_inference_hz < float("inf"):
+        parser.error("--max-inference-hz must be finite and positive")
     if args.max_scan_cycles < 1:
         parser.error("--max-scan-cycles must be >= 1")
     return args
@@ -7827,7 +7982,8 @@ def main() -> None:
             backend="yolo", pub_res_img=True, device=args.device,
             weights=weights, target_kind=args.target_kind,
             confidence=args.confidence, show=False,
-            camera_names=("head",))
+            camera_names=("head",),
+            max_inference_hz=args.max_inference_hz)
         aruco_node = ArucoDetectNode(
             "head", marker_size=MARKER_SIZE_M, publish_tf=False,
             publish_result_image=True)

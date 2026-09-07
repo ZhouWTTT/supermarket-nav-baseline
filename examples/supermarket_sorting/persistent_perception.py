@@ -27,12 +27,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="persistent all-class supermarket perception")
     parser.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
-    parser.add_argument("--confidence", type=float, default=0.45)
+    parser.add_argument("--confidence", type=float, default=0.90)
     parser.add_argument(
-        "--max-inference-hz", type=float, default=12.0,
+        "--max-inference-hz", type=float, default=8.0,
         help="maximum YOLO source-frame rate while perception is enabled")
     parser.add_argument(
-        "--device", choices=["auto", "cpu", "cuda"], default="auto")
+        "--device", choices=["auto", "cpu", "cuda"], default="cuda")
     parser.add_argument(
         "--ready-file", required=True,
         help="runner-owned readiness sentinel written after both nodes load")

@@ -1357,8 +1357,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--weights", default=str(integrated.REPO_ROOT / "best.pt"),
         help="multi-class Ultralytics checkpoint (default: repository best.pt)")
-    parser.add_argument("--confidence", type=float, default=0.45)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--confidence", type=float, default=0.90)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="cuda")
+    parser.add_argument(
+        "--max-inference-hz", type=float, default=8.0,
+        help="maximum YOLO source-frame rate (default: 8 Hz)")
     parser.add_argument("--show", action="store_true",
                         help="show the YOLO result window")
     parser.add_argument("--max-scan-cycles", type=int, default=3)
@@ -1395,6 +1398,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--orders-count must be >= 1")
     if not 0.0 <= args.confidence <= 1.0:
         parser.error("--confidence must be in [0, 1]")
+    if not 0.0 < args.max_inference_hz < float("inf"):
+        parser.error("--max-inference-hz must be finite and positive")
     if args.max_scan_cycles < 1:
         parser.error("--max-scan-cycles must be >= 1")
     if args.backup_after_grab < 0.0:
@@ -1453,7 +1458,8 @@ def main() -> None:
             backend="yolo", pub_res_img=True, device=args.device,
             weights=weights, target_kind=None,
             confidence=args.confidence, show=False,
-            camera_names=("head",))
+            camera_names=("head",),
+            max_inference_hz=args.max_inference_hz)
         aruco_node = pick.ArucoDetectNode(
             "head", marker_size=pick.MARKER_SIZE_M, publish_tf=False,
             publish_result_image=True)

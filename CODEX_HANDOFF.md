@@ -386,7 +386,9 @@ sudo docker run --rm -d \
 
 当前启动入口没有改变，仍是 `./scripts/run_baseline.sh`。新增参数都已有默认值：
 
-- `SUPERMARKET_INFERENCE_HZ`，默认 `12`
+- `SUPERMARKET_DEVICE`，默认 `cuda`
+- `SUPERMARKET_YOLO_CONFIDENCE`，默认 `0.90`
+- `SUPERMARKET_INFERENCE_HZ`，默认 `8`
 - `SUPERMARKET_TARGET_TIME`，默认 `400`
 - `SUPERMARKET_MAX_SCAN_CYCLES`，默认 `2`
 - `SUPERMARKET_MAX_ATTEMPTS`，默认 `2`

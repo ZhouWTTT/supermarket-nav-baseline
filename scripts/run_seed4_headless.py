@@ -59,8 +59,9 @@ def main() -> int:
     parser.add_argument("--target-time", type=int, default=600)
     parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--max-scan-cycles", type=int, default=2)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--inference-hz", type=float, default=12.0)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--confidence", type=float, default=0.90)
+    parser.add_argument("--inference-hz", type=float, default=8.0)
     parser.add_argument("--deadline-s", type=float, default=1800.0)
     args = parser.parse_args()
 
@@ -119,6 +120,7 @@ def main() -> int:
         "--memory-confirmations", "3",
         "--memory-confidence-threshold", "0.95",
         "--grab-policy", "nearest",
+        "--confidence", f"{args.confidence:g}",
         "--inference-hz", f"{args.inference_hz:g}",
         "--device", args.device,
         "--order-timeout", str(args.order_timeout),

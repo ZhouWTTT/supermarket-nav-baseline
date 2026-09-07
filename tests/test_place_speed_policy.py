@@ -130,12 +130,15 @@ def test_loaded_motion_speedups_remain_below_generic_limits():
 
     assert per_kind["chengzi"] == 0.0045
     assert per_kind["pingguo"] == 0.0045
+    assert per_kind["maidong"] == 0.0045
     assert per_kind["heweidao"] == 0.0105
     assert per_kind["chengzi"] < _literal("PLACE_LOADED_ARM_MAX_STEP_RAD")
     assert _literal("HEWEIDAO_PLACE_DESCENT_SLIDE_STEP_M") == 0.0006
     assert (_literal("HEWEIDAO_PLACE_DESCENT_SLIDE_STEP_M")
             < _literal("PLACE_DESCENT_SLIDE_STEP_M"))
     assert _literal("PLACE_EMPTY_DUAL_RECOVERY_MAX_STEP_RAD") == 0.015
+    ramps = _literal("PLACE_LOADED_ARM_STEP_RAMP_BY_KIND_RAD")
+    assert ramps["maidong"] == 0.00015
 
 
 def test_fast_empty_dual_recovery_starts_only_after_table_clearance():
