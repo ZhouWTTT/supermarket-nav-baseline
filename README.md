@@ -26,6 +26,10 @@ docker exec -it supermarket_sorting_client \
 The entry script supports these optional environment variables:
 
 - `SUPERMARKET_BASELINE_WEIGHTS`: YOLO checkpoint path.
+- `SUPERMARKET_DEVICE`: YOLO inference device, default `cuda`; use `cpu` to
+  force CPU inference. CUDA automatically falls back to CPU when unavailable.
+- `SUPERMARKET_YOLO_CONFIDENCE`: minimum YOLO confidence, default `0.90`.
+- `SUPERMARKET_INFERENCE_HZ`: maximum active YOLO inference rate, default `8`.
 - `SUPERMARKET_MAX_SCAN_CYCLES`: shelf scan cycles per attempt, default `2`.
 - `SUPERMARKET_MAX_ATTEMPTS`: attempts per anonymous order, default `2`.
 - `SUPERMARKET_INVENTORY_CONFIRMATIONS`: synchronized observations required

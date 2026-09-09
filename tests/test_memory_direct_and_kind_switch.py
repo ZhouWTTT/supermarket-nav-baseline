@@ -136,6 +136,8 @@ def _retarget_policy_class():
     constants = {
         "DYNAMIC_DIRECT_RETARGET_MARGIN_M",
         "DYNAMIC_DIRECT_RETARGET_MIN_HOLD_S",
+        "DYNAMIC_DIRECT_SAME_LEVEL_RETARGET_MARGIN_M",
+        "DYNAMIC_DIRECT_FINAL_TARGET_LOCK_M",
     }
     assignments = [
         node for node in tree.body
@@ -187,7 +189,7 @@ def test_new_reliable_e_shelf_order_replaces_farther_c_shelf_leg():
             < e_shelf_chips["retarget_current_distance"])
 
 
-def test_direct_retarget_hysteresis_rejects_same_or_barely_closer_slot():
+def test_same_level_cross_kind_retarget_keeps_global_margin():
     policy = _retarget_policy_class()()
     policy.state = "direct_transit"
     policy.target_kind = "chengzi"
@@ -201,13 +203,40 @@ def test_direct_retarget_hysteresis_rejects_same_or_barely_closer_slot():
         "kind": "chengzi", "shelf": "C", "level": "L1",
         "column": "2", "target_xy": (0.0, 2.0),
     }
-    barely_closer = {
-        "kind": "shupian", "shelf": "C", "level": "L2",
+    eight_cm_cross_kind_gain = {
+        "kind": "shupian", "shelf": "C", "level": "L1",
+        "column": "1", "target_xy": (0.0, 1.92),
+    }
+    useful_cross_kind_gain = {
+        "kind": "shupian", "shelf": "C", "level": "L1",
+        "column": "1", "target_xy": (0.0, 1.85),
+    }
+    same_kind_slot_correction = {
+        "kind": "chengzi", "shelf": "C", "level": "L1",
         "column": "1", "target_xy": (0.0, 1.95),
     }
 
     assert not policy._direct_retarget_is_better(same)
-    assert not policy._direct_retarget_is_better(barely_closer)
+    assert not policy._direct_retarget_is_better(eight_cm_cross_kind_gain)
+    assert policy._direct_retarget_is_better(useful_cross_kind_gain)
+    assert policy._direct_retarget_is_better(same_kind_slot_correction)
+
+
+def test_direct_target_is_locked_inside_final_braking_zone():
+    policy = _retarget_policy_class()()
+    policy.state = "direct_transit"
+    policy.target_kind = "pingguo"
+    policy.direct_transit_slot = ("E", "L1", "3")
+    policy.direct_transit_started_at = 8.0
+    policy.base_xy = np.array([1.70, 2.30])
+    policy.align_base_x = 1.92
+    policy.align_base_y = 2.475
+    adjacent = {
+        "kind": "maidong", "shelf": "E", "level": "L1",
+        "column": "2", "target_xy": (1.70, 2.475),
+    }
+
+    assert not policy._direct_retarget_is_better(adjacent)
 
 
 def test_kind_switch_rebuilds_grasp_geometry_and_delivery_hook():

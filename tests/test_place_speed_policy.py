@@ -122,20 +122,24 @@ def test_open_confirmation_must_be_continuous():
     assert not policy._single_place_release_ready(0.30)
     policy.grip = 1.0
     assert not policy._single_place_release_ready(0.40)
-    assert policy._single_place_release_ready(0.51)
+    assert not policy._single_place_release_ready(0.60)
+    assert policy._single_place_release_ready(0.65)
 
 
 def test_loaded_motion_speedups_remain_below_generic_limits():
     per_kind = _literal("PLACE_LOADED_ARM_MAX_STEP_BY_KIND_RAD")
 
-    assert per_kind["chengzi"] == 0.0045
-    assert per_kind["pingguo"] == 0.0045
+    assert per_kind["chengzi"] == 0.0070
+    assert per_kind["pingguo"] == 0.0070
+    assert per_kind["maidong"] == 0.0045
     assert per_kind["heweidao"] == 0.0105
     assert per_kind["chengzi"] < _literal("PLACE_LOADED_ARM_MAX_STEP_RAD")
     assert _literal("HEWEIDAO_PLACE_DESCENT_SLIDE_STEP_M") == 0.0006
     assert (_literal("HEWEIDAO_PLACE_DESCENT_SLIDE_STEP_M")
             < _literal("PLACE_DESCENT_SLIDE_STEP_M"))
-    assert _literal("PLACE_EMPTY_DUAL_RECOVERY_MAX_STEP_RAD") == 0.015
+    assert _literal("PLACE_EMPTY_DUAL_RECOVERY_MAX_STEP_RAD") == 0.024
+    ramps = _literal("PLACE_LOADED_ARM_STEP_RAMP_BY_KIND_RAD")
+    assert ramps["maidong"] == 0.00015
 
 
 def test_fast_empty_dual_recovery_starts_only_after_table_clearance():
