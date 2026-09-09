@@ -269,7 +269,7 @@ TOP_LEFT_GRASP_X_BIAS_M = 0.000
 # while correcting heading once the error is moderate, keep a minimum approach
 # speed, and accept the final heading with a deadband so odom yaw noise cannot
 # stall the phase.
-NAV_LINEAR_MAX_MPS = 0.90
+NAV_LINEAR_MAX_MPS = 1.15
 NAV_LINEAR_MIN_MPS = 0.10
 # 货架对齐的最后一段使用更低的进给下限：对齐容差只有 2.5cm，高速停车
 # 过冲会偏移抓取位姿。仅提高距离比例增益，最后 50mm 仍保持原 0.10m/s
@@ -324,14 +324,28 @@ MARKER_SAMPLE_SPREAD_MAX_M = 0.04
 # Close-range verification before committing the arm.  Far-view YOLO and
 # ArUco association remains the localisation source; this second view only
 # verifies that the requested class is still present at the selected slot.
-CLOSE_RECHECK_CONFIRMATIONS = 2
+# Close verification is only a final presence guard after the matrix/direct
+# route has already localised the slot.  Requiring two close-range frames made
+# brief occlusion look like an empty slot and kept the robot scanning in front
+# of the shelf.  One fresh class-and-depth-consistent frame is sufficient; the
+# class equality check in _recheck_detection_matches remains mandatory.
+CLOSE_RECHECK_CONFIRMATIONS = 1
+# Passing the already-selected class and abandoning it are deliberately
+# asymmetric decisions.  A single class-and-depth-consistent frame is enough
+# to avoid the old close-recheck stall, but a different pending class must be
+# stable across several fresh frames before it can redirect the robot.
+CLOSE_RECHECK_SWITCH_CONFIRMATIONS = 3
 CLOSE_RECHECK_WINDOW_S = 2.0
-CLOSE_RECHECK_POSE_TIMEOUT_S = 3.0
+# Observation time starts only after the slide/head have reached the requested
+# pose.  Keep a separate actuator-motion ceiling so a slow 0.60 m lower-shelf
+# slide move cannot consume the entire camera observation window.
+CLOSE_RECHECK_POSE_TIMEOUT_S = 1.0
+CLOSE_RECHECK_CAMERA_MOTION_TIMEOUT_S = 4.0
 # Give the level-aligned camera a short opportunity to decode/associate a
 # marker before accepting the existing YOLO + depth fallback.  This is a
 # preference window, not a hard requirement: an occluded or unreadable marker
 # must never prevent a geometrically consistent target from being grasped.
-CLOSE_RECHECK_ARUCO_PREFERENCE_S = 0.75
+CLOSE_RECHECK_ARUCO_PREFERENCE_S = 0.25
 REVISIT_POSE_COMMAND_TIMEOUT_S = 5.0
 CLOSE_RECHECK_XY_MAX_M = 0.12
 CLOSE_RECHECK_Z_MAX_M = 0.16
@@ -358,24 +372,42 @@ TOP_PREGRASP_BACKOFF_M = 0.12
 # are therefore unchanged.
 TOP_SHELF_SURFACE_Z_M = 1.189
 TOP_MIN_TCP_TARGET_CLEARANCE_M = 0.070
+# Spheres need the jaws near their equator rather than across the upper cap.
+# Keep a separate top-shelf floor 10 mm below the generic wrist clearance;
+# this preserves rail clearance without forcing a ball into a high grasp.
+TOP_SPHERE_MIN_TCP_TARGET_CLEARANCE_M = 0.060
 LOWER_PREGRASP_BACKOFF_M = 0.16
 LOWER_GRASP_TCP_FORWARD_M = 0.035
+# Lower-shelf spheres use the generic single-segment front approach rather
+# than the contact-search sphere profile.  The generic 35 mm wrist transform
+# left recent apples/oranges at the finger tips, so deepen only their final
+# open-gripper endpoint by 15 mm.  This is still one continuous trajectory at
+# GENERIC_DIRECT_FORWARD_SPEED_MPS: no slower phase or extra pause is added.
+LOWER_SPHERE_GRASP_TCP_FORWARD_M = 0.050
 # Every supported profile first reaches its established close point with the
 # gripper open, then keeps the same endpoint orientation and executes one
-# additional monotonic 50 mm arm segment before closing.  Generic profiles
-# solve both endpoints during configuration; sphere profiles build the second
-# endpoint once from the measured physical-contact pose.
+# additional monotonic arm segment before closing.  Generic profiles use the
+# 50 mm default below; sphere profiles use their own deeper, slower seating
+# move built once from the measured physical-contact pose.
 GENERIC_POST_CONTACT_EXTENSION_M = 0.050
 # 按货物类型覆盖接触后前伸量（米）：薯片罐用 25mm——既让罐子坐进夹爪
 # 更深、夹得更稳，又避免 50mm 长前伸把罐子推倒。
 GENERIC_POST_EXTEND_M_BY_KIND = {"shupian": 0.025}
 # 核桃味刀越靠下夹持越稳定。利用已有的闭合前延伸段同步下降 10mm，
-# 不增加独立状态或停顿；其余商品保持水平前伸。
-GENERIC_POST_EXTEND_Z_DROP_M_BY_KIND = {"heweidao": 0.010}
+# 不增加独立状态或停顿；三明治在顶沿/封口处夹持偏松（实测合爪后爪位仍
+# ≈0.97，即爪子没吃到 66mm 主体宽度），下降 6mm 让爪子贴住盒身。
+GENERIC_POST_EXTEND_Z_DROP_M_BY_KIND = {
+    "heweidao": 0.010,
+    "sanmingzhi": 0.006,
+}
 # The extended middle/lower endpoint is outside the analytic arm envelope from
 # SCAN_Y once navigation tolerance is included.  Move only those non-spherical
-# profiles closer; sphere alignment and the top profile remain unchanged.
+# profiles closer; the top profile remains unchanged.  Middle spheres use the
+# smaller dedicated compensation below.
 GENERIC_EXTENSION_ALIGN_FORWARD_M = 0.040
+# Keep the deeper middle-sphere endpoint inside the same arm envelope by
+# moving the base forward by exactly the added 15 mm seating distance.
+SPHERE_EXTENSION_ALIGN_FORWARD_M = 0.015
 # The generic middle/lower front endpoints sit near the selected arm's
 # workspace edge: a ~1.5 cm base arrival deviation can push the IK chain past
 # the boundary.  On failure, nudge the base forward and re-drive instead of
@@ -385,6 +417,11 @@ GENERIC_IK_RETRY_MAX_M = 0.06
 GENERIC_ALIGN_Y_MAX_M = 2.60
 LOWER_LIFT_M = 0.04
 LOWER_LIFT_DWELL_S = 1.2
+# 下部货架抬升的实测到位门限：滑轨只需抬 40 mm，命令/实测一致到 5 mm
+# 且已运动 0.25 s 即可认为完成，不必干等固定 1.2 s。固定 dwell 仍作为
+# 兜底上限，防止抬升反馈异常时提前横向收回刮到前轨。
+LOWER_LIFT_SETTLE_ERROR_M = 0.005
+LOWER_LIFT_MIN_ELAPSED_S = 0.25
 LOWER_RETREAT_DWELL_S = 2.5
 # The generic middle/top retreat streams to the pregrasp joints solved at the
 # align pose.  The mobile base is not held during middle manipulation, so a
@@ -426,6 +463,13 @@ SPHERE_TERMINAL_SPEED_MPS = 0.060
 SPHERE_TERMINAL_ZONE_M = 0.045
 SPHERE_OPEN_GRIP_DROP_CONTACT = 0.08
 SPHERE_CONTACT_CREEP_SPEED_MPS = 0.020
+# Seat the sphere 30 mm deeper than the generic 50 mm continuation so it is
+# held by the useful inner finger region instead of the tips.  This happens
+# after the sphere is already close enough to roll away from a sharp command,
+# so keep it at the same gentle speed as contact creep.  Generic/cylindrical
+# goods retain their original distance and faster fixed-trajectory setting.
+SPHERE_POST_CONTACT_EXTENSION_M = 0.080
+SPHERE_POST_EXTEND_SPEED_MPS = 0.020
 SPHERE_CONTACT_CREEP_TIMEOUT_S = 1.5
 SPHERE_CREEP_CAPTURE_GRIP_DROP = 0.15
 SPHERE_CREEP_MIN_ADVANCE_M = 0.002
@@ -469,10 +513,21 @@ FRONT_GRASP_OVERSHOOT_M = 0.03
 # 空载手臂关节指令步进上限（rad/tick，约 50Hz）。提高后取货阶段的手臂
 # 摆位/前伸更快；接近接触的终段仍有 FORWARD_TERMINAL_ARM_STEP_RAD 慢速区，
 # 载货放置手臂另由 PLACE_LOADED_ARM_MAX_STEP_RAD 独立限速，不受影响。
-ARM_COMMAND_MAX_STEP_RAD = 0.026
+ARM_COMMAND_MAX_STEP_RAD = 0.030
 # 收回阶段（STATE_RETREAT）使用更小的关节步长：抓取后带着货物往回撤时
-# 速度放慢约一半，避免快速收臂让货物晃动/刮擦货架。
-RETREAT_ARM_MAX_STEP_RAD = 0.010
+# 速度放慢避免快速收臂让货物晃动/刮擦货架。0.018 仍明显低于前伸档位，
+# 收回时间再省约 0.2 s/单。
+RETREAT_ARM_MAX_STEP_RAD = 0.018
+# heweidao 夹持最脆弱（爪位≈开限位）、三明治软质易滑，都保持 0.010 慢速
+# 收回，避免通用收回提速后滑脱。
+RETREAT_ARM_MAX_STEP_BY_KIND_RAD = {
+    "heweidao": 0.010,
+    "sanmingzhi": 0.010,
+}
+# 单臂抓取各阶段（deploy 降到抓取高度、抬升、运输高度恢复）的滑轨命令
+# 步进（m/tick）。0.014 m/tick 更快完成滑轨段；纸巾双臂抬升仍走
+# 各自的 DUAL_TISSUE_LIFT_SLIDE_STEP_M 慢速。
+ARM_SLIDE_MAX_STEP_M = 0.014
 # Every product profile uses the same measured Cartesian terminal slowdown.
 # This is a command-rate limit, not a per-class position correction: outside
 # the final 50 mm the arm keeps its current speed, then smoothly ramps down to
@@ -490,8 +545,28 @@ LIFT_AMOUNT_M = 0.06
 # joint interpolation without measured-TCP correction, convergence gates, or
 # replanning.  Keeping the peak Cartesian-equivalent speed low prevents light
 # goods from being struck while eliminating feedback-induced shaking.
-GENERIC_DIRECT_FORWARD_SPEED_MPS = 0.042
-GENERIC_DIRECT_FORWARD_MIN_DURATION_S = 2.5
+# Established generic/sphere paths tolerate 0.090 m/s: runs at 0.050~0.080
+# completed with no grasp error, and the fixed trajectory stays well below
+# speeds that pushed goods. Thin sandwiches use their dedicated 0.036 m/s
+# approach below so their open fingers still have time to settle laterally.
+GENERIC_DIRECT_FORWARD_SPEED_MPS = 0.090
+GENERIC_DIRECT_FORWARD_SPEED_BY_KIND_MPS = {
+    "sanmingzhi": 0.036,
+    # heweidao 的夹持余量很小（实测合爪后爪位仍≈1.0，靠开张限位卡住杯体），
+    # 快前伸/快张爪会把杯子推离原位导致运输中滑脱；恢复旧版已验证的
+    # 0.050 前伸速度。
+    "heweidao": 0.050,
+}
+# 接触后 50 mm 的“张爪继续前伸”段在 0.090 m/s 下插值时长约 0.83 s；最短
+# 时长压到 1.2 s 仍保留平滑缓动与稳定窗口。
+GENERIC_DIRECT_FORWARD_MIN_DURATION_S = 1.2
+GENERIC_DIRECT_FORWARD_MIN_DURATION_BY_KIND_S = {
+    # 三明治沿用旧 2.5 s：开爪横向稳定需要时间。
+    "sanmingzhi": 2.5,
+    # heweidao 张爪带 10 mm 下沉前伸，过快会破坏与杯体的贴合并引起滑脱；
+    # 保持旧版 2.5 s。
+    "heweidao": 2.5,
+}
 GENERIC_DIRECT_FORWARD_SETTLE_S = 0.5
 GENERIC_DIRECT_FORWARD_MIN_SETTLE_S = 0.20
 # A single feedback sample can cross the endpoint tolerance while the arm is
@@ -686,8 +761,12 @@ DUAL_TISSUE_ENDPOINT_TCP_TOLERANCE_M = 0.018
 DUAL_TISSUE_SIDE_ROLLED_ENABLED = True
 # 侧列（左右两列）预抓/接触 TCP 相对板面的抬升：比中列更高，给闭合前
 # 的额外下降留出空间（闭合目标仍受板面净空约束）。
-DUAL_TISSUE_SIDE_ROLLED_TCP_CLEARANCE_M = 0.110
-# 侧列（C1/C3）侧滚腕预压与中列同步加到 30mm/侧，加大夹紧力。
+# 侧滚腕顶层若抬得过高会把肘部推到可达边界：最近日志中双侧 TCP
+# 在 y 方向短约 0.35m、关节误差超过 2rad，尚未进入货架就被中止。
+# 0.100m 保留手指净空，同时回到此前可达的顶层高度。
+DUAL_TISSUE_SIDE_ROLLED_TCP_CLEARANCE_M = 0.100
+# 侧列（C1/C3）沿用速度调整前验证过的 30mm/侧预压；恢复低速撤退后
+# 保持原有夹持力，不再通过减小夹紧量牺牲持物稳定性。
 DUAL_TISSUE_SIDE_ROLLED_SQUEEZE_M = 0.030
 DUAL_TISSUE_SIDE_ROLLED_MAX_SEGMENT_JOINT_DELTA_RAD = 0.90
 # 手背（outward）探入到位后，旋转 90° 到“手侧面”夹持姿态的路径长度
@@ -714,7 +793,7 @@ DUAL_TISSUE_LOWER_TCP_CLEARANCE_M = 0.085
 DUAL_TISSUE_ALIGN_FORWARD_M = -0.020
 # 夹爪完全闭合（0 为最紧），配合侧夹预压增大，避免纸盒从指间滑脱。
 DUAL_TISSUE_GRIP_COMMAND = 0.0
-DUAL_TISSUE_FORWARD_SPEED_MPS = 0.042
+DUAL_TISSUE_FORWARD_SPEED_MPS = 0.050
 DUAL_TISSUE_CLOSE_SPEED_MPS = 0.05
 DUAL_TISSUE_CONTACT_SEARCH_HALF_SPAN_M = 0.045
 DUAL_TISSUE_CONTACT_SEARCH_SPEED_MPS = 0.015
@@ -739,19 +818,22 @@ DUAL_TISSUE_CONTACT_ENDPOINT_TOLERANCE_M = 0.003
 # A closed unloaded gripper tracks 0.08 in prior runs; side contact in the
 # successful-but-unstable run forced both measured joints down near 0.012.
 DUAL_TISSUE_GRIP_CONTACT_MAX = 0.045
-# 侧夹预压拉大：双臂合拢后继续内压，纸盒挡住即由位置控制器持续加压。
-# 用户反馈最新一次抓纸巾没抓稳，从 25mm 加到 30mm/侧（仍在执行器力矩
-# 上限内封顶，不会物理发散）。
-# 双臂闭合时的单侧预压量（米）：从实测接触位置再向内压入的量。加大后
-# 两侧钳爪对纸盒的夹紧力更强，纸盒不易在抬/撤过程中滑动。
-# The old 30 mm/side preload once toppled a tissue box under the legacy flow;
-# the current side-rolled three-point flow keeps the box square, so 30 mm is
-# retried here per user request for a firmer hold.
+# This contact-level constant must not be reused as a transport "empty"
+# threshold.  Loaded rolled tissue grasps legitimately read 0.05--0.10 while
+# the box is still held (and have been delivered at those values); only a
+# clearly open pair of jaws should trigger a transport-drop recovery.
+DUAL_TISSUE_TRANSPORT_EMPTY_MIN = 0.25
+# 双臂闭合时的单侧预压量（米）：沿用速度调整前验证过的 30mm/侧夹紧量；
+# 运输阶段已恢复低速，避免用减小夹紧量来掩盖撤退时序问题。
 DUAL_TISSUE_SQUEEZE_M = 0.030
-DUAL_TISSUE_SQUEEZE_SPEED_MPS = 0.012
-DUAL_TISSUE_RETREAT_SPEED_MPS = 0.036
-DUAL_TISSUE_MIN_MOTION_DURATION_S = 1.5
-DUAL_TISSUE_MOTION_SETTLE_S = 0.60
+DUAL_TISSUE_SQUEEZE_SPEED_MPS = 0.018
+# 放置时反向松开纸巾预压的独立速度：货物已接触桌面，松开比货架夹紧更
+# 安全，因此不再复用货架上的极慢合拢速度。0.050 m/s 配合 1.0 s 最短时长，
+# 30 mm/侧反挤松开段约 1.2 s 完成。
+DUAL_TISSUE_RELEASE_SPEED_MPS = 0.050
+DUAL_TISSUE_RETREAT_SPEED_MPS = 0.024
+DUAL_TISSUE_MIN_MOTION_DURATION_S = 1.0
+DUAL_TISSUE_MOTION_SETTLE_S = 0.75
 DUAL_TISSUE_MOTION_MIN_SETTLE_S = 0.20
 # The old deploy transition advanced after a fixed two-second dwell even when
 # one measured arm was still short of the symmetric pregrasp.  Keep the same
@@ -761,9 +843,27 @@ DUAL_TISSUE_MOTION_MIN_SETTLE_S = 0.20
 # 后还要空等。
 DUAL_TISSUE_DEPLOY_DWELL_S = 1.5
 DUAL_TISSUE_DEPLOY_TIMEOUT_S = 5.0
-# 侧夹预压保持时长：预压动作本身已有收敛/稳定门控，保持时间从 4s 降到
-# 3s，缩短提拉前等待。
-# 预压保持时长略增，让接触力在提拉前稳定建立（力度加大后多给 1s 收敛）。
+# Five seconds remains the normal/soft deadline.  A top side-column rolled
+# pregrasp can, however, start several radians away from the neutral posture;
+# under a slow simulator it is still visibly converging when that deadline is
+# reached.  Continue only while measured arm/slide feedback makes progress,
+# and retain both a stall deadline and a finite hard ceiling.
+DUAL_TISSUE_DEPLOY_HARD_TIMEOUT_S = 35.0
+DUAL_TISSUE_DEPLOY_STALL_TIMEOUT_S = 4.0
+DUAL_TISSUE_DEPLOY_ARM_PROGRESS_RAD = 0.030
+DUAL_TISSUE_DEPLOY_SLIDE_PROGRESS_M = 0.002
+DUAL_TISSUE_DEPLOY_PROGRESS_LOG_PERIOD_S = 5.0
+# 预抓取的 Cartesian 备用门：允许腕部冗余关节留下小残差，但两侧 TCP
+# 必须都在目标附近、保持水平且关节误差仍有限，绝不对明显未到位的手臂
+# 放行到前伸。
+DUAL_TISSUE_DEPLOY_TCP_TOLERANCE_M = 0.030
+DUAL_TISSUE_DEPLOY_CARTESIAN_MAX_JOINT_ERROR_RAD = 0.20
+DUAL_TISSUE_DEPLOY_TCP_LINE_Y_TOLERANCE_M = 0.040
+# The squeeze trajectory already ends behind both joint/TCP stability gates.
+# Start lifting after one additional second when both closed-gripper readings
+# and the commanded clamp pose remain healthy.  Keep the former four-second
+# dwell only as a bounded fallback for missing or unsettled feedback.
+DUAL_TISSUE_CLAMP_MIN_DWELL_S = 1.0
 DUAL_TISSUE_CLAMP_DWELL_S = 4.0
 DUAL_TISSUE_LIFT_M = 0.060
 # The slide cannot raise a top-shelf grasp, so the arms perform a shorter
@@ -784,9 +884,9 @@ DUAL_TISSUE_ARM_RETREAT_STEP_M = 0.055
 DUAL_TISSUE_ARM_SEGMENT_MAX_JOINT_DELTA_RAD = 0.45
 DUAL_TISSUE_TOP_MIDDLE_LIFT_INWARD_PRELOAD_M = 0.002
 # 顶层侧滚腕抬升撤退限速（与中层/下层手侧面撤退同速）。实测 0.030 下带载
-# 撤退时双侧手臂差约 0.07 rad 不收敛（左臂 TCP 差 50mm），10s 超时中止丢
-# 盒；0.018 过于保守，提到 0.024 缩短取出时间，仍低于 0.030 的失败点。
-DUAL_TISSUE_TOP_ARM_RETREAT_SPEED_MPS = 0.036
+# 撤退时双侧手臂差约 0.07 rad 不收敛（左臂 TCP 差 50mm）；0.024 在低速
+# 验证包络内，同时把 0.185m 的撤退从 ~15s 缩短到 ~12s，仍低于失败点。
+DUAL_TISSUE_TOP_ARM_RETREAT_SPEED_MPS = 0.024
 DUAL_TISSUE_ARM_LIFT_Z_TOLERANCE_M = 0.006
 DUAL_TISSUE_LIFT_DWELL_S = 2.5
 DUAL_TISSUE_SLIDE_LIFT_TOLERANCE_M = 0.015
@@ -819,8 +919,17 @@ GRIP_OPEN = 1.0
 GRIP_CLOSE = 0.08
 GENERIC_GRIP_CLOSE = 0.0
 GRIP_CLOSE_BY_CLASS = {"sanmingzhi": 0.16}
-GRIP_OPEN_MAX_STEP = 0.025
-GRIP_CLOSE_MAX_STEP = 0.006
+# Keep the generic capture policy for sandwiches; lateral centering is handled
+# by the validated arm bias rather than a product-specific rejection.
+GENERIC_CAPTURE_MAX_GRIP_BY_KIND = {}
+# 张爪命令步进 0.025→0.040：张开是离开货物的动作，无接触风险，放货后的
+# 1.0 s 释放停顿主要就是受此限速限制，提速后约省 0.3~0.4 s/单。
+GRIP_OPEN_MAX_STEP = 0.050
+# 合爪命令步进提到 0.012 rad/tick：接触前的手指合拢更快；接触后由
+# 货物/实测反馈停住，不受影响。
+GRIP_CLOSE_MAX_STEP = 0.012
+# heweidao 合爪过快会把杯子顶离卡位，保持旧版 0.006 慢速合爪。
+GRIP_CLOSE_MAX_STEP_BY_KIND = {"heweidao": 0.006}
 GENERIC_CLOSE_DWELL_S = 6.0
 GENERIC_EMPTY_GRIP_MARGIN = 0.02
 # Generic close is gated on the measured gripper instead of a fixed 6 s dwell:
@@ -860,23 +969,27 @@ GENERIC_TCP_FINGER_CLEARANCE_M = 0.06
 GENERIC_TCP_FINGER_CLEARANCE_BY_KIND_M = {
     "kouxiangtang": 0.050,
 }
-# 所有货物抓取姿态的目标 Z 统一抬升 1cm：让指尖略高于测得的货物中心，
-# 避免指尖落在货架导轨/前缘高度（D 架苹果指尖撞导轨问题），对深度测量
-# 的偏低误差更宽容。对球体（苹果/橙子）与普通货物、各层货架一致生效。
+# 普通货物抓取姿态的目标 Z 统一抬升 1cm：让指尖略高于测得的货物中心，
+# 避免指尖落在货架导轨/前缘高度，并对深度测量的偏低误差更宽容。球体
+# 使用下方独立高度策略，不走这个通用抬升。
 GRASP_TCP_Z_RAISE_M = 0.010
-# 球体（苹果/橙子）抓取 TCP 相对货物中心的目标抬升。通用 10mm 抬升对球体
-# 偏保守，指尖会落在球体上半部、夹持不稳；球体改为 5mm，让指尖更贴近赤道
-# （最大截面）夹得更稳，同时仍保留少量净抬升以避开货架导轨/前缘。
-# 顶层球体仍走 top_grasp_tcp_z 的最低净空规则，不受此值影响。
-SPHERE_GRASP_TCP_Z_RAISE_M = 0.005
+# 球体（苹果/橙子）的目标 TCP 下移到球心下方 5mm，使夹爪落在赤道附近的
+# 最大截面，而不是夹住上半球。顶层另由较低但仍安全的独立净空下限保护。
+SPHERE_GRASP_TCP_Z_RAISE_M = -0.005
 # 按货物类型的抓取高度额外偏移（米）：负值降低。可乐、核桃味刀调低 1cm。
 GRASP_TCP_Z_OFFSET_BY_KIND = {"kele": -0.010, "heweidao": -0.010}
 # KDL/仿真运动学的 X 方向执行偏差：普通货物右臂 TCP 实测比指令偏东约
 # 1-2cm（用户视角为偏左），把指令目标再往西（-x）10mm，右臂合计 -20mm；
 # 左臂不再往东补偿，保持目标点居中。球体与纸巾不走该补偿，不受影响。
 GRASP_TCP_X_OFFSET_BY_ARM = {"r": 0.003, "l": 0.000}
+# Do not add a sandwich-only lateral correction: the earlier trial introduced
+# a repeatable 6 mm bias and made the TCP land off-centre.
+SANMINGZHI_INWARD_X_OFFSET_BY_ARM_M = {}
 GRIPPER_MAX_OPENING_M = 0.080
 GRIP_PRESHAPE_CLEARANCE_M = 0.012
+# 三明治预张爪稍收一点（两侧余量 12→10 mm，preshape 0.975→0.950），
+# 让爪子更快贴住盒身而不是停在顶沿外围。
+GRIP_PRESHAPE_CLEARANCE_BY_KIND_M = {"sanmingzhi": 0.010}
 GRIP_PRESHAPE_REACHED_TOLERANCE = 0.04
 
 STATE_GO_SCAN = "go_scan"
@@ -908,6 +1021,75 @@ def generic_post_extend_world(
         target_kind, GENERIC_POST_CONTACT_EXTENSION_M)
     extended[2] -= GENERIC_POST_EXTEND_Z_DROP_M_BY_KIND.get(target_kind, 0.0)
     return extended
+
+
+def lower_grasp_tcp_forward_m(target_kind: str) -> float:
+    """Return the lower-profile wrist depth without changing its speed."""
+    if target_kind in SPHERE_RADIUS_M:
+        return LOWER_SPHERE_GRASP_TCP_FORWARD_M
+    return LOWER_GRASP_TCP_FORWARD_M
+
+
+def generic_direct_forward_speed_mps(target_kind: str) -> float:
+    """Select a profile speed without altering sphere motion timing."""
+    return float(GENERIC_DIRECT_FORWARD_SPEED_BY_KIND_MPS.get(
+        target_kind, GENERIC_DIRECT_FORWARD_SPEED_MPS))
+
+
+def dual_tissue_wrist_roll_pair(
+        operator_outward: bool) -> tuple[float, float]:
+    """Return left/right roll signs in the operator-facing convention."""
+    magnitude = DUAL_TISSUE_TOP_WRIST_ROLL_RAD
+    return ((-magnitude, magnitude) if operator_outward
+            else (magnitude, -magnitude))
+
+
+def grip_preshape_for_kind(target_kind: str) -> float:
+    """Return a geometry-aware open command before approaching a product."""
+    clearance = GRIP_PRESHAPE_CLEARANCE_BY_KIND_M.get(
+        target_kind, GRIP_PRESHAPE_CLEARANCE_M)
+    return float(np.clip(
+        (PRODUCT_GRASP_WIDTH_M[target_kind] + clearance)
+        / GRIPPER_MAX_OPENING_M,
+        GRIP_CLOSE + GENERIC_EMPTY_GRIP_MARGIN,
+        GRIP_OPEN))
+
+
+def grasp_tcp_x_offset(target_kind: str, grasp_arm: str) -> float:
+    """Return the arm bias plus a shape-specific centring correction."""
+    offset = GRASP_TCP_X_OFFSET_BY_ARM.get(grasp_arm, 0.0)
+    if target_kind == "sanmingzhi":
+        offset += SANMINGZHI_INWARD_X_OFFSET_BY_ARM_M.get(grasp_arm, 0.0)
+    return offset
+
+
+def dual_tissue_clamp_release_gate(
+        elapsed: float, arm_error: float,
+        left_grip: float | None, right_grip: float | None) -> str | None:
+    """Return the safe tissue-clamp release gate, if one is satisfied."""
+    feedback_ready = bool(
+        left_grip is not None
+        and right_grip is not None
+        and left_grip <= DUAL_TISSUE_GRIP_CONTACT_MAX
+        and right_grip <= DUAL_TISSUE_GRIP_CONTACT_MAX
+        and arm_error <= ARM_REACHED_TOLERANCE_RAD + 0.015)
+    if elapsed >= DUAL_TISSUE_CLAMP_DWELL_S:
+        return "fallback-timeout"
+    if elapsed >= DUAL_TISSUE_CLAMP_MIN_DWELL_S and feedback_ready:
+        return "stable-feedback"
+    return None
+
+
+def sphere_grasp_tcp_z(
+        product_center_z: float, shelf_level: str) -> float:
+    """Return the lower, shelf-safe TCP height for a spherical product."""
+    target_z = float(product_center_z) + SPHERE_GRASP_TCP_Z_RAISE_M
+    if shelf_level == "top":
+        target_z = max(
+            target_z,
+            TOP_SHELF_SURFACE_Z_M
+            + TOP_SPHERE_MIN_TCP_TARGET_CLEARANCE_M)
+    return target_z
 
 
 def wrap_to_pi(angle: float) -> float:
@@ -1030,11 +1212,7 @@ class ShelfPickController(Node):
         self.target_kind = target_kind
         self.product_height = PRODUCT_CENTER_ABOVE_MARKER_M[target_kind]
         self.product_grasp_width = PRODUCT_GRASP_WIDTH_M[target_kind]
-        self.grip_preshape_command = float(np.clip(
-            (self.product_grasp_width + GRIP_PRESHAPE_CLEARANCE_M)
-            / GRIPPER_MAX_OPENING_M,
-            GRIP_CLOSE + GENERIC_EMPTY_GRIP_MARGIN,
-            GRIP_OPEN))
+        self.grip_preshape_command = grip_preshape_for_kind(target_kind)
         self.max_scan_cycles = max_scan_cycles
         self.tcp_diagnostic_ground_truth = tcp_diagnostic_ground_truth
         self.scan_skip_lower = bool(scan_skip_lower)
@@ -1150,11 +1328,16 @@ class ShelfPickController(Node):
         self.target_physical_marker_id = None
         self.target_world = None
         self.committed_slot = None
-        # 记忆直达槽位复核失败后的同货架相邻列重试（方案 B）：
-        # 列证据通常只差一格，相邻列命中可省掉整轮“回货架中心全量扫描”。
+        # Legacy bounded adjacent-column retry state.  Keep the mechanism for
+        # explicit experiments, but disable it in the production default below.
         self.direct_slot_target_active = False
         self.direct_slot_adjacent_retries = 0
-        self.direct_slot_adjacent_max_retries = 2
+        # A failed close verification means the direct-memory proposal is no
+        # longer trustworthy.  Do not spend another 12--30 seconds blindly
+        # walking across adjacent columns; the integrated worker can return a
+        # reroute result so the runner immediately selects another pending
+        # order.  Standalone/last-order mode still falls back to a full scan.
+        self.direct_slot_adjacent_max_retries = 0
         self.grasp_arm = "r"
         self.align_base_x = None
         self.align_base_y = SCAN_Y
@@ -1189,6 +1372,9 @@ class ShelfPickController(Node):
         self.post_extend_arm_joints = None
         self.post_extend_start_joints = None
         self.post_extend_duration_s = 0.0
+        self.generic_direct_speed_mps = generic_direct_forward_speed_mps(
+            target_kind)
+        self.post_extend_speed_mps = self.generic_direct_speed_mps
         self.post_extend_endpoint_ready_since = None
         self.generic_top_lift_arm_joints = None
         self.generic_top_retreat_arm_joints = None
@@ -1234,7 +1420,10 @@ class ShelfPickController(Node):
         # 中间列纸巾"直接探入"：不走宽环绕，双臂以夹持跨度直接前探后压紧
         self.dual_direct_probe = False
         self.dual_top_wrist_rolled = False
-        self.dual_top_wrist_inward = False
+        # Legacy flag naming is opposite to the operator-facing visual
+        # convention: True commands left=-90/right=+90, which is the requested
+        # bilateral outward roll.
+        self.dual_top_wrist_inward = True
         self.dual_side_rolled = False
         self.dual_contact_push_side = "left"
         self.dual_pregrasp_half_span = DUAL_TISSUE_PREGRASP_HALF_SPAN_M
@@ -1256,6 +1445,10 @@ class ShelfPickController(Node):
         self.dual_motion_path_distances = None
         self.dual_motion_path_left = None
         self.dual_motion_path_right = None
+        self.dual_deploy_best_arm_error = None
+        self.dual_deploy_best_slide_error = None
+        self.dual_deploy_last_progress_at = None
+        self.dual_deploy_extension_last_log = None
         self.dual_contact_start_left_joints = None
         self.dual_contact_start_right_joints = None
         self.dual_contact_target_left_joints = None
@@ -1395,9 +1588,15 @@ class ShelfPickController(Node):
             self.opportunistic_yolo_frames.append(
                 (stamp_ns, head_records))
             self._maybe_lock_opportunistic_target_locked()
-            records = [
+            target_records = [
                 record for record in head_records
                 if record.get("class") == self.target_kind]
+            # Close recheck can opportunistically switch to another pending
+            # order, so it must see the all-class frame.  Normal scan and
+            # association paths intentionally retain target-only records.
+            records = (
+                head_records if self.state == STATE_RECHECK
+                else target_records)
             if not records:
                 return
             self.yolo_frames.append((stamp_ns, records))
@@ -1408,7 +1607,7 @@ class ShelfPickController(Node):
             if collect_yolo_only:
                 # 有框无码候选：记录 YOLO 目标类框（按世界 x/z 或像素归并），
                 # 让"检测到但没解到码"的货物也能触发定点补拍。
-                for record in records:
+                for record in target_records:
                     world = self._detection_world(record)
                     slot = None
                     if world is not None:
@@ -1605,11 +1804,8 @@ class ShelfPickController(Node):
                 kind, ())))
         self.product_height = PRODUCT_CENTER_ABOVE_MARKER_M[kind]
         self.product_grasp_width = PRODUCT_GRASP_WIDTH_M[kind]
-        self.grip_preshape_command = float(np.clip(
-            (self.product_grasp_width + GRIP_PRESHAPE_CLEARANCE_M)
-            / GRIPPER_MAX_OPENING_M,
-            GRIP_CLOSE + GENERIC_EMPTY_GRIP_MARGIN,
-            GRIP_OPEN))
+        self.grip_preshape_command = grip_preshape_for_kind(kind)
+        self.generic_direct_speed_mps = generic_direct_forward_speed_mps(kind)
         self.use_dual_tissue_grasp = kind == "zhijin"
         self.no_middle_tissue = False
         self.skipped_tissue_markers.clear()
@@ -1797,7 +1993,8 @@ class ShelfPickController(Node):
         # 目标，基座同步跟随，保持横向偏置不变。
         if (not self.use_dual_tissue_grasp
                 and self.target_kind not in SPHERE_RADIUS_M):
-            x_offset = GRASP_TCP_X_OFFSET_BY_ARM.get(self.grasp_arm, 0.0)
+            x_offset = grasp_tcp_x_offset(
+                self.target_kind, self.grasp_arm)
             if slot_z >= TOP_SHELF_Z_M and self.grasp_arm == "l":
                 # 顶层左臂实机末端偏西约 1cm，目标点向东再移 8mm 抵消。
                 x_offset += TOP_LEFT_GRASP_X_BIAS_M
@@ -1828,6 +2025,8 @@ class ShelfPickController(Node):
             self.align_base_y = (
                 SCAN_Y + GENERIC_EXTENSION_ALIGN_FORWARD_M
                 + DUAL_TISSUE_ALIGN_FORWARD_M)
+        elif self.use_sphere_grasp and self.shelf_level == "middle":
+            self.align_base_y = SCAN_Y + SPHERE_EXTENSION_ALIGN_FORWARD_M
         elif (self.shelf_level in ("middle", "lower")
               and self.object_geometry != "sphere"):
             self.align_base_y = (
@@ -2250,7 +2449,8 @@ class ShelfPickController(Node):
         # 目标，基座同步跟随，保持横向偏置不变。
         if (not self.use_dual_tissue_grasp
                 and self.target_kind not in SPHERE_RADIUS_M):
-            x_offset = GRASP_TCP_X_OFFSET_BY_ARM.get(self.grasp_arm, 0.0)
+            x_offset = grasp_tcp_x_offset(
+                self.target_kind, self.grasp_arm)
             if x_offset:
                 self.target_world[0] += x_offset
                 self.align_base_x = float(np.clip(
@@ -2274,6 +2474,8 @@ class ShelfPickController(Node):
             self.align_base_y = (
                 SCAN_Y + GENERIC_EXTENSION_ALIGN_FORWARD_M
                 + DUAL_TISSUE_ALIGN_FORWARD_M)
+        elif self.use_sphere_grasp and self.shelf_level == "middle":
+            self.align_base_y = SCAN_Y + SPHERE_EXTENSION_ALIGN_FORWARD_M
         elif (self.shelf_level in ("middle", "lower")
               and self.object_geometry != "sphere"):
             self.align_base_y = (
@@ -2483,7 +2685,7 @@ class ShelfPickController(Node):
             self.recheck_switch_world = world.copy()
             self.recheck_switch_slot = slot
             self.recheck_switch_count = 1
-        if self.recheck_switch_count < CLOSE_RECHECK_CONFIRMATIONS:
+        if self.recheck_switch_count < CLOSE_RECHECK_SWITCH_CONFIRMATIONS:
             return
         self._switch_recheck_target(kind, world, slot)
 
@@ -2572,6 +2774,13 @@ class ShelfPickController(Node):
         marker appears during the short preference window, retain the proven
         YOLO + depth fallback.
         """
+        # The geometry check below historically accepted any class near the
+        # expected XYZ.  That becomes unsafe with a one-frame gate: a nearby
+        # product could release the arm.  Other pending classes are handled by
+        # _maybe_switch_recheck_target instead.
+        if detection.get("class") != self.target_kind:
+            return False, "class"
+
         marker = marker_below_yolo(detection, markers)
         marker_id = None
         if marker is not None:
@@ -2599,8 +2808,8 @@ class ShelfPickController(Node):
             # 深度单点常有系统性偏移：商品明明在预期槽位，但世界点离记忆
             # 中心差 0.12–0.16m 就被误判为“槽位无货”，随后整单改道/重试。
             # 零耗时兜底：只要类别一致且世界点映射到同一 (shelf, level,
-            # column) 固定槽位格，同样视为近距复核命中（仍要求 2 个独立
-            # 帧，不增加驻停时间）。
+            # column) 固定槽位格，同样视为近距复核命中；它仍须通过当前
+            # 一帧类别硬校验，不增加驻停时间。
             slot = fixed_slot_from_world(
                 float(world[0]), float(world[2]))
             expected = self.target_slot()
@@ -2610,6 +2819,10 @@ class ShelfPickController(Node):
                 return True, "depth(slot-grid)"
             return False, "depth"
 
+        aruco_preference_active = (
+            self.scan_camera_ready_since is not None
+            and self.now() - self.scan_camera_ready_since
+            < CLOSE_RECHECK_ARUCO_PREFERENCE_S)
         marker_adoptable = (
             marker_id is not None
             and self.target_marker_id is None
@@ -2622,10 +2835,9 @@ class ShelfPickController(Node):
             else:
                 self.recheck_marker_candidate_id = marker_id
                 self.recheck_marker_candidate_count = 1
-            # Require two consecutive associations before adopting an ID.
-            # The normal close-recheck still needs its own two confirmed
-            # frames after adoption, so a one-frame decode cannot identify a
-            # delivered item or accidentally blacklist a marker.
+            # Require two consecutive associations before adopting an ID.  The
+            # second association also satisfies the one-frame presence gate,
+            # so one stray marker decode cannot identify or blacklist an item.
             if self.recheck_marker_candidate_count >= 2:
                 self.target_marker_id = marker_id
                 self.get_logger().info(
@@ -2633,8 +2845,12 @@ class ShelfPickController(Node):
                     f"{marker_id} for depth-consistent kind="
                     f"{self.target_kind}")
                 return True, f"aruco(adopt={marker_id})"
-            return False, f"aruco(candidate={marker_id})"
-        if self.target_marker_id is None:
+            # ArUco is a short preference, not a hard dependency.  Once its
+            # small window expires, keep the candidate for a later ID adoption
+            # but let the already-matched YOLO + depth evidence pass now.
+            if aruco_preference_active:
+                return False, f"aruco(candidate={marker_id})"
+        if self.target_marker_id is None and marker_id is None:
             self.recheck_marker_candidate_id = None
             self.recheck_marker_candidate_count = 0
 
@@ -2642,9 +2858,7 @@ class ShelfPickController(Node):
         # detector has had a fair chance to publish a synchronized result.
         # Once the preference interval expires, this remains the original
         # non-blocking depth fallback.
-        if (self.scan_camera_ready_since is not None
-                and self.now() - self.scan_camera_ready_since
-                < CLOSE_RECHECK_ARUCO_PREFERENCE_S):
+        if aruco_preference_active:
             return False, "waiting-aruco"
         if marker_id is None:
             source = "depth(no-aruco)"
@@ -2688,8 +2902,7 @@ class ShelfPickController(Node):
         return True
 
     def _recheck_fail(self) -> None:
-        """Skip this slot and resume scanning (after bounded adjacent-column
-        retries for memory direct-slot targets)."""
+        """Skip this slot and reroute, or resume the standalone fallback scan."""
         marker_id = self.target_marker_id
         if marker_id is not None:
             self.recheck_marker_skips.add(marker_id)
@@ -2704,9 +2917,9 @@ class ShelfPickController(Node):
         self.recheck_marker_candidate_id = None
         self.recheck_marker_candidate_count = 0
         self.scan_camera_ready_since = None
-        # 方案 B：记忆直达槽位复核失败时，先试同货架相邻列（横向 0.22m 级），
-        # 而不是立刻回货架中心全量扫描。列证据通常只差一格，相邻列命中即可
-        # 省掉整轮扫描/补拍/重新定位/二次对齐（实测约 26s → 约 5s）。
+        # Optional legacy hook for experiments that explicitly enable adjacent
+        # retries.  The production default is zero, so integrated multi-order
+        # runs proceed directly to _reroute_on_missing_direct_slot().
         if (marker_id is None
                 and self.direct_slot_target_active
                 and self._try_adjacent_direct_slot()):
@@ -2907,7 +3120,8 @@ class ShelfPickController(Node):
             f"grip={gripper} preshape={self.grip_preshape_command:.3f}")
 
     def set_twist(self, linear: float, angular: float) -> None:
-        self.des_linear = float(np.clip(linear, -0.90, 0.90))
+        self.des_linear = float(np.clip(
+            linear, -NAV_LINEAR_MAX_MPS, NAV_LINEAR_MAX_MPS))
         self.des_angular = float(np.clip(angular, -2.50, 2.50))
 
     def begin_manip_base_hold(self) -> None:
@@ -2958,14 +3172,15 @@ class ShelfPickController(Node):
         """
         if self._grasp_arm_switch_count >= 1:
             return False
-        current_offset = GRASP_TCP_X_OFFSET_BY_ARM.get(self.grasp_arm, 0.0)
+        current_offset = grasp_tcp_x_offset(
+            self.target_kind, self.grasp_arm)
         base_slot_x = float(self.target_world[0]) - current_offset
         new_arm = "l" if self.grasp_arm == "r" else "r"
         if new_arm == "l":
             desired_base_x = base_slot_x + ARM_LATERAL_BIAS_M
         else:
             desired_base_x = base_slot_x - ARM_LATERAL_BIAS_M
-        new_offset = GRASP_TCP_X_OFFSET_BY_ARM.get(new_arm, 0.0)
+        new_offset = grasp_tcp_x_offset(self.target_kind, new_arm)
         if self.is_top_shelf and new_arm == "l":
             new_offset += TOP_LEFT_GRASP_X_BIAS_M
         self.grasp_arm = new_arm
@@ -3807,13 +4022,12 @@ class ShelfPickController(Node):
             # 长边在未滚转时横向布置，侧列探入会被货架前立柱挡住（实测撞柱），
             # 滚转 ±90° 后 50 mm 窄边朝横向，探入姿态才能通过立柱与纸盒之间
             # 的窄通道。
-            left_roll = (-DUAL_TISSUE_TOP_WRIST_ROLL_RAD
-                         if top_wrist_inward
-                         else DUAL_TISSUE_TOP_WRIST_ROLL_RAD)
+            left_roll, right_roll = dual_tissue_wrist_roll_pair(
+                operator_outward=bool(top_wrist_inward))
             left_target[:3, :3] = Rotation.from_euler(
                 "x", left_roll).as_matrix()
             right_target[:3, :3] = Rotation.from_euler(
-                "x", -left_roll).as_matrix()
+                "x", right_roll).as_matrix()
         # The top-shelf fork keeps the left wrist in its side-bracket pose but
         # deliberately returns the right endpoint to the normal orientation,
         # turning link6's 160 mm collision box from a vertical side pad into a
@@ -4008,8 +4222,10 @@ class ShelfPickController(Node):
             if self.dual_side_rolled
             else DUAL_TISSUE_INSERT_FORWARD_M)
         self.dual_top_wrist_rolled = self.dual_side_rolled
-        # A/B 试验 v2（用户要求）：侧列再次改试另一种旋转朝向，并同步加大
-        # 闭合预压（30mm/侧）以补偿抓持力。若仍夹不稳/推离纸盒，改回 False。
+        # Legacy ``inward`` names the footprint-frame sign, not the visible
+        # direction of the two claws.  True is left=-90/right=+90 and appears
+        # as both claws rolling outward.  Wall clearance is handled by base-X
+        # shifts, so it must not silently reverse this grasp orientation.
         self.dual_top_wrist_inward = True
         self.dual_contact_push_side = (
             "right" if column == "3" else "left")
@@ -4209,6 +4425,12 @@ class ShelfPickController(Node):
         self.des_left_grip = DUAL_TISSUE_GRIP_COMMAND
         self.des_right_grip = DUAL_TISSUE_GRIP_COMMAND
         self.des_slide = self.slide_grasp
+        # The deploy deadline is feedback-driven.  Reset its progress watcher
+        # for every freshly solved pregrasp (including an IK/base retry).
+        self.dual_deploy_best_arm_error = None
+        self.dual_deploy_best_slide_error = None
+        self.dual_deploy_last_progress_at = None
+        self.dual_deploy_extension_last_log = None
         self.get_logger().info(
             f"[dual-tissue-IK] tcp_z={tcp_z:.3f} "
             f"raise={tcp_z - self.target_world[2]:.3f}m "
@@ -4222,6 +4444,8 @@ class ShelfPickController(Node):
             f"retreat_right={np.round(retreat_right, 3)} "
             f"grippers=closed({DUAL_TISSUE_GRIP_COMMAND:.2f}) "
             f"side_rolled={int(self.dual_side_rolled)} "
+            f"roll_direction={'outward' if self.dual_top_wrist_inward else 'inward'} "
+            f"roll_deg=({'-90,+90' if self.dual_top_wrist_inward else '+90,-90'}) "
             f"contact_push={self.dual_contact_push_side}")
         if self.dual_direct_probe:
             self.get_logger().info(
@@ -4857,7 +5081,8 @@ class ShelfPickController(Node):
                 self.target_kind, GENERIC_TCP_FINGER_CLEARANCE_M)))
         # This is a wrist-to-inner-finger geometry transform, not a perception
         # correction, so it remains active in fixed-layout diagnostic mode.
-        nominal_contact_world[1] += LOWER_GRASP_TCP_FORWARD_M
+        lower_tcp_forward = lower_grasp_tcp_forward_m(self.target_kind)
+        nominal_contact_world[1] += lower_tcp_forward
         post_extension_enabled = self.object_geometry != "sphere"
         extended_contact_world = nominal_contact_world.copy()
         if post_extension_enabled:
@@ -4930,7 +5155,9 @@ class ShelfPickController(Node):
                 f"post_extension="
                 f"{np.linalg.norm(extended_contact_world - nominal_contact_world) if post_extension_enabled else 0.0:.3f}m "
                 f"z_drop={GENERIC_POST_EXTEND_Z_DROP_M_BY_KIND.get(self.target_kind, 0.0) if post_extension_enabled else 0.0:.3f}m "
-                f"tcp_forward={LOWER_GRASP_TCP_FORWARD_M:.3f}m "
+                f"tcp_forward={lower_tcp_forward:.3f}m "
+                f"sphere_margin_boost="
+                f"{lower_tcp_forward - LOWER_GRASP_TCP_FORWARD_M:.3f}m "
                 f"slide={self.slide_grasp:.3f} "
                 f"direct_speed={GENERIC_DIRECT_FORWARD_SPEED_MPS:.3f}m/s "
                 "fixed_trajectory=1 feedback_gates=0")
@@ -4958,10 +5185,8 @@ class ShelfPickController(Node):
     def configure_sphere_grasp(self) -> bool:
         """Configure sphere geometry for the selected supported shelf layer."""
         pregrasp_world = self.target_world.copy()
-        grasp_tcp_z = float(
-            self.target_world[2] + SPHERE_GRASP_TCP_Z_RAISE_M)
-        if self.shelf_level == "top":
-            grasp_tcp_z = self.top_grasp_tcp_z()
+        grasp_tcp_z = sphere_grasp_tcp_z(
+            self.target_world[2], self.shelf_level)
         pregrasp_world[2] = grasp_tcp_z
         pregrasp_world[1] -= SPHERE_PREGRASP_BACKOFF_M
         contact_world = self.target_world.copy()
@@ -5213,15 +5438,17 @@ class ShelfPickController(Node):
             # duration by 1.5 keeps the approximate peak Cartesian speed at or
             # below the requested low speed.
             self.generic_direct_duration_s = max(
-                GENERIC_DIRECT_FORWARD_MIN_DURATION_S,
-                1.5 * path_length / GENERIC_DIRECT_FORWARD_SPEED_MPS)
+                GENERIC_DIRECT_FORWARD_MIN_DURATION_BY_KIND_S.get(
+                    getattr(self, "target_kind", None),
+                    GENERIC_DIRECT_FORWARD_MIN_DURATION_S),
+                1.5 * path_length / self.generic_direct_speed_mps)
             self.generic_direct_endpoint_ready_since = None
             self.set_selected_arm_target(self.generic_direct_start_joints)
             self.get_logger().info(
                 f"[generic-direct] fixed endpoint armed; "
                 f"duration={self.generic_direct_duration_s:.2f}s "
                 f"settle={GENERIC_DIRECT_FORWARD_SETTLE_S:.2f}s "
-                f"speed={GENERIC_DIRECT_FORWARD_SPEED_MPS:.3f}m/s "
+                f"speed={self.generic_direct_speed_mps:.3f}m/s "
                 "feedback_gates=0 replanning=0")
         self.set_state(STATE_ARM_FORWARD)
 
@@ -5402,14 +5629,86 @@ class ShelfPickController(Node):
             self.set_state(STATE_ABORT)
             return
 
+        now = self.now()
+        arm_error = self.dual_arm_error()
+        measured_slide = self.joints.get("slide_joint")
+        slide_error = (
+            float("inf") if measured_slide is None
+            else abs(float(measured_slide) - self.des_slide))
+
+        # Record real actuator progress rather than treating elapsed wall time
+        # as proof of a jam.  Updating only after a meaningful cumulative
+        # reduction rejects encoder jitter while still following a slow arm.
+        best_arm_error = self.dual_deploy_best_arm_error
+        best_slide_error = self.dual_deploy_best_slide_error
+        made_progress = False
+        if math.isfinite(arm_error):
+            if best_arm_error is None:
+                self.dual_deploy_best_arm_error = arm_error
+                made_progress = True
+            elif (arm_error <= best_arm_error
+                  - DUAL_TISSUE_DEPLOY_ARM_PROGRESS_RAD):
+                self.dual_deploy_best_arm_error = arm_error
+                made_progress = True
+        if math.isfinite(slide_error):
+            if best_slide_error is None:
+                self.dual_deploy_best_slide_error = slide_error
+                made_progress = True
+            elif (slide_error <= best_slide_error
+                  - DUAL_TISSUE_DEPLOY_SLIDE_PROGRESS_M):
+                self.dual_deploy_best_slide_error = slide_error
+                made_progress = True
+        if made_progress:
+            self.dual_deploy_last_progress_at = now
+
         deploy_ready = self.dual_commands_ready(
             ARM_REACHED_TOLERANCE_RAD + 0.015, 0.025)
+        # A redundant wrist can retain a modest joint residual while its TCP
+        # is already at the symmetric pregrasp. Use measured Cartesian poses
+        # as a bounded fallback; this is deliberately stricter than a timeout
+        # bypass so an arm that is still centimetres away (or badly skewed)
+        # remains blocked.
+        cartesian_ready = False
+        try:
+            left_pre = getattr(self, "dual_pregrasp_left_joints", None)
+            right_pre = getattr(self, "dual_pregrasp_right_joints", None)
+            if left_pre is not None and right_pre is not None:
+                left_tcp = self.arm_tcp_world("left")
+                right_tcp = self.arm_tcp_world("right")
+                left_target_tcp = self.arm_target_tcp_world("left", left_pre)
+                right_target_tcp = self.arm_target_tcp_world("right", right_pre)
+                if (left_tcp is not None and right_tcp is not None
+                        and left_target_tcp is not None
+                        and right_target_tcp is not None):
+                    left_error = float(np.max(np.abs(left_tcp - left_target_tcp)))
+                    right_error = float(np.max(np.abs(right_tcp - right_target_tcp)))
+                    line_y_error = abs(float(right_tcp[1] - left_tcp[1]))
+                    tcp_spacing = float(right_tcp[0] - left_tcp[0])
+                    cartesian_ready = bool(
+                        left_error <= DUAL_TISSUE_DEPLOY_TCP_TOLERANCE_M
+                        and right_error <= DUAL_TISSUE_DEPLOY_TCP_TOLERANCE_M
+                        and line_y_error <= DUAL_TISSUE_DEPLOY_TCP_LINE_Y_TOLERANCE_M
+                        and tcp_spacing >= 0.10
+                        and arm_error <= DUAL_TISSUE_DEPLOY_CARTESIAN_MAX_JOINT_ERROR_RAD)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            # Host-side tests and transient feedback gaps retain the original
+            # joint/slide gate; production simply waits for the next sample.
+            cartesian_ready = False
+        if (deploy_elapsed >= DUAL_TISSUE_DEPLOY_DWELL_S
+                and cartesian_ready):
+            self.get_logger().info(
+                f"[dual-tissue-deploy] measured Cartesian pregrasp stable "
+                f"after {deploy_elapsed:.2f}s despite bounded joint residual; "
+                f"dual_arm_error={arm_error:.4f}rad; starting fixed surround "
+                "motion")
+            self.start_dual_tissue_surround()
+            return
         if (deploy_elapsed >= DUAL_TISSUE_DEPLOY_DWELL_S
                 and deploy_ready):
             self.get_logger().info(
                 f"[dual-tissue-deploy] measured pregrasp stable after "
                 f"{deploy_elapsed:.2f}s; dual_arm_error="
-                f"{self.dual_arm_error():.4f}rad; starting fixed surround "
+                f"{arm_error:.4f}rad; starting fixed surround "
                 "motion")
             self.start_dual_tissue_surround()
             return
@@ -5417,15 +5716,37 @@ class ShelfPickController(Node):
         if deploy_elapsed < DUAL_TISSUE_DEPLOY_TIMEOUT_S:
             return
 
-        measured_slide = self.joints.get("slide_joint")
-        slide_error = (
-            float("inf") if measured_slide is None
-            else abs(float(measured_slide) - self.des_slide))
+        last_progress_at = self.dual_deploy_last_progress_at
+        progress_age = (
+            float("inf") if last_progress_at is None
+            else max(0.0, now - last_progress_at))
+        hard_timeout = (
+            deploy_elapsed >= DUAL_TISSUE_DEPLOY_HARD_TIMEOUT_S)
+        stalled = (
+            progress_age >= DUAL_TISSUE_DEPLOY_STALL_TIMEOUT_S)
+        if not hard_timeout and not stalled:
+            last_log = self.dual_deploy_extension_last_log
+            if (last_log is None
+                    or deploy_elapsed - last_log
+                    >= DUAL_TISSUE_DEPLOY_PROGRESS_LOG_PERIOD_S):
+                self.dual_deploy_extension_last_log = deploy_elapsed
+                self.get_logger().warn(
+                    "[dual-tissue-deploy] soft deadline reached but "
+                    "measured pregrasp is still converging; "
+                    f"elapsed={deploy_elapsed:.2f}s "
+                    f"dual_arm_error={arm_error:.4f}rad "
+                    f"slide_error={slide_error:.4f}m "
+                    f"progress_age={progress_age:.2f}s; continuing")
+            return
+
+        reason = "hard timeout" if hard_timeout else "actuator stalled"
         self.get_logger().error(
             "[dual-tissue-deploy] measured pregrasp did not converge; "
             f"elapsed={deploy_elapsed:.2f}s "
-            f"dual_arm_error={self.dual_arm_error():.4f}rad "
-            f"slide_error={slide_error:.4f}m; aborting before insertion")
+            f"dual_arm_error={arm_error:.4f}rad "
+            f"slide_error={slide_error:.4f}m "
+            f"progress_age={progress_age:.2f}s reason={reason}; "
+            "aborting before insertion")
         self.set_state(STATE_ABORT)
 
     def advance_dual_tissue_surround_sequence(self) -> None:
@@ -5968,7 +6289,15 @@ class ShelfPickController(Node):
                 <= DUAL_TISSUE_ARM_LIFT_Z_TOLERANCE_M
                 and abs(float(right_tcp[2] - right_target_tcp[2]))
                 <= DUAL_TISSUE_ARM_LIFT_Z_TOLERANCE_M)
-            endpoint_ready = endpoint_ready and lift_height_ready
+            if lift_height_ready:
+                # The loaded lift is a vertical motion.  Lateral/roll residual
+                # at the target height is clamp preload plus load deflection,
+                # not a reason to abort a tissue that is already raised off
+                # the board (observed ~0.04 m TCP error at only 0.04 rad joint
+                # error right after the 35 mm lift completed).
+                endpoint_ready = True
+            else:
+                endpoint_ready = False
         elif self.dual_motion_label.startswith("raised_retreat_"):
             # Lateral position error is useful clamp preload.  Gate the loaded
             # retreat on depth and height instead of rejecting that preload.
@@ -6124,9 +6453,15 @@ class ShelfPickController(Node):
         extension_length = float(np.linalg.norm(
             self.post_extend_target_world
             - self.post_extend_nominal_world))
+        self.post_extend_speed_mps = (
+            SPHERE_POST_EXTEND_SPEED_MPS
+            if self.use_sphere_grasp
+            else self.generic_direct_speed_mps)
         self.post_extend_duration_s = max(
-            GENERIC_DIRECT_FORWARD_MIN_DURATION_S,
-            1.5 * extension_length / GENERIC_DIRECT_FORWARD_SPEED_MPS)
+            GENERIC_DIRECT_FORWARD_MIN_DURATION_BY_KIND_S.get(
+                getattr(self, "target_kind", None),
+                GENERIC_DIRECT_FORWARD_MIN_DURATION_S),
+            1.5 * extension_length / self.post_extend_speed_mps)
         self.post_extend_endpoint_ready_since = None
         # Snap the diagnostic target to the second endpoint before entering
         # the state.  The arm command itself starts from its measured joints,
@@ -6142,16 +6477,16 @@ class ShelfPickController(Node):
             f"{np.round(self.post_extend_target_world, 4)} "
             f"distance={extension_length:.3f}m "
             f"duration={self.post_extend_duration_s:.2f}s "
-            f"speed={GENERIC_DIRECT_FORWARD_SPEED_MPS:.3f}m/s "
+            f"speed={self.post_extend_speed_mps:.3f}m/s "
             "orientation=unchanged feedback_gates=0 replanning=0")
         self.set_state(STATE_POST_EXTEND)
 
     def prepare_sphere_post_extension(self) -> bool:
-        """Build the sphere's 50 mm endpoint from its measured close pose.
+        """Build the sphere's deeper endpoint from its measured close pose.
 
         Physical sphere contact may end the existing creep before its nominal
         Cartesian goal.  Starting from the measured TCP guarantees that the
-        requested continuation is 50 mm from the point where this run would
+        requested continuation is measured from the point where this run would
         previously have closed, while preserving measured X/Z and orientation.
         A one-shot IK failure falls back to closing at the established point;
         it never enters a retry/correction loop.
@@ -6164,7 +6499,7 @@ class ShelfPickController(Node):
             return False
         measured_joints = self.selected_arm_positions().copy()
         extended_world = actual_tcp.copy()
-        extended_world[1] += GENERIC_POST_CONTACT_EXTENSION_M
+        extended_world[1] += SPHERE_POST_CONTACT_EXTENSION_M
         try:
             extended_joints = self.solve_kdl_world(
                 extended_world, measured_joints)
@@ -6181,12 +6516,12 @@ class ShelfPickController(Node):
             f"[{self.shelf_level}-sphere-post-extend] prepared from measured "
             f"close point={np.round(actual_tcp, 4)} to "
             f"extended_close={np.round(extended_world, 4)} "
-            f"distance={GENERIC_POST_CONTACT_EXTENSION_M:.3f}m; "
+            f"distance={SPHERE_POST_CONTACT_EXTENSION_M:.3f}m; "
             "gripper remains open")
         return True
 
     def advance_post_extension(self) -> tuple[str, np.ndarray | None]:
-        """Play a profile's 50 mm extension, then permit closure."""
+        """Play a profile's configured extension, then permit closure."""
         elapsed = self.now() - self.state_t0
         duration = max(self.post_extend_duration_s, 1e-6)
         progress = float(np.clip(elapsed / duration, 0.0, 1.0))
@@ -6703,7 +7038,7 @@ class ShelfPickController(Node):
             DUAL_TISSUE_LIFT_SLIDE_STEP_M
             if (self.use_dual_tissue_grasp
                 and self.state == STATE_LIFT)
-            else 0.006)
+            else ARM_SLIDE_MAX_STEP_M)
         self.cmd_slide = float(self.slew(
             self.cmd_slide, self.des_slide, slide_step))
         self.cmd_head = self.slew(self.cmd_head, self.des_head, 0.025)
@@ -6727,7 +7062,9 @@ class ShelfPickController(Node):
         else:
             forward_step = self.forward_arm_step_limit()
             selected_step = (
-                RETREAT_ARM_MAX_STEP_RAD
+                RETREAT_ARM_MAX_STEP_BY_KIND_RAD.get(
+                    getattr(self, "target_kind", None),
+                    RETREAT_ARM_MAX_STEP_RAD)
                 if self.state == STATE_RETREAT
                 else forward_step)
             left_step = (
@@ -6740,12 +7077,14 @@ class ShelfPickController(Node):
                 self.cmd_left_arm, self.des_left_arm, left_step)
             self.cmd_right_arm = self.synchronized_slew(
                 self.cmd_right_arm, self.des_right_arm, right_step)
+        close_step = GRIP_CLOSE_MAX_STEP_BY_KIND.get(
+            getattr(self, "target_kind", None), GRIP_CLOSE_MAX_STEP)
         left_grip_step = (
-            GRIP_CLOSE_MAX_STEP
+            close_step
             if self.des_left_grip < self.cmd_left_grip
             else GRIP_OPEN_MAX_STEP)
         right_grip_step = (
-            GRIP_CLOSE_MAX_STEP
+            close_step
             if self.des_right_grip < self.cmd_right_grip
             else GRIP_OPEN_MAX_STEP)
         self.cmd_left_grip = float(self.slew(
@@ -6919,10 +7258,12 @@ class ShelfPickController(Node):
             _, slide_target, yaw_target, pitch_target = pose
             self.des_slide = slide_target
             self.des_head[:] = [yaw_target, pitch_target]
+            now = self.now()
             if self.scan_camera_ready(pose):
                 if self.scan_camera_ready_since is None:
-                    self.scan_camera_ready_since = self.now()
-                if (self.now() - self.scan_camera_ready_since
+                    self.scan_camera_ready_since = now
+                ready_elapsed = now - self.scan_camera_ready_since
+                if (ready_elapsed
                         >= SCAN_CAMERA_STABLE_S
                         and self._recheck_confirmed()):
                     self._recheck_passed = True
@@ -6933,14 +7274,27 @@ class ShelfPickController(Node):
                         f"{self.target_marker_id} kind={self.target_kind}; "
                         "proceeding to grasp")
                     self._start_grasp_settle()
+                elif (self.state == STATE_RECHECK
+                      and ready_elapsed
+                      >= (SCAN_CAMERA_STABLE_S
+                          + CLOSE_RECHECK_POSE_TIMEOUT_S)):
+                    self.get_logger().info(
+                        f"[close-recheck] pose={pose[0]} observation window "
+                        f"exhausted after camera-ready; trying next view")
+                    if not self._advance_recheck_pose():
+                        self._recheck_fail()
             else:
                 self.scan_camera_ready_since = None
-
-            if (self.state == STATE_RECHECK
-                    and self.now() - self.recheck_pose_started_at
-                    >= CLOSE_RECHECK_POSE_TIMEOUT_S):
-                if not self._advance_recheck_pose():
-                    self._recheck_fail()
+                if (self.state == STATE_RECHECK
+                        and now - self.recheck_pose_started_at
+                        >= CLOSE_RECHECK_CAMERA_MOTION_TIMEOUT_S):
+                    self.get_logger().warn(
+                        f"[close-recheck] pose={pose[0]} camera did not reach "
+                        f"its command within "
+                        f"{CLOSE_RECHECK_CAMERA_MOTION_TIMEOUT_S:.1f}s; "
+                        "trying next view")
+                    if not self._advance_recheck_pose():
+                        self._recheck_fail()
 
         elif self.state == STATE_TISSUE_ROTATE:
             self.des_slide = self.slide_grasp
@@ -7155,7 +7509,22 @@ class ShelfPickController(Node):
             self.des_left_grip = DUAL_TISSUE_GRIP_COMMAND
             self.des_right_grip = DUAL_TISSUE_GRIP_COMMAND
             close_elapsed = self.now() - self.state_t0
-            if close_elapsed >= DUAL_TISSUE_CLAMP_DWELL_S:
+            clamp_arm_error = self.dual_arm_error()
+            clamp_left_grip = self.joints.get(
+                "left_arm_eef_gripper_joint")
+            clamp_right_grip = self.joints.get(
+                "right_arm_eef_gripper_joint")
+            clamp_gate = dual_tissue_clamp_release_gate(
+                close_elapsed, clamp_arm_error,
+                clamp_left_grip, clamp_right_grip)
+            if clamp_gate is not None:
+                clamp_diag = (
+                    f"gate={clamp_gate} arm_error={clamp_arm_error:.4f}rad "
+                    f"grips=({clamp_left_grip},{clamp_right_grip})")
+                if clamp_gate == "fallback-timeout":
+                    self.get_logger().warn(
+                        "[dual-tissue-clamp] feedback did not satisfy the "
+                        f"early-release gate; {clamp_diag}")
                 self.dual_lift_use_arm = False
                 if self.shelf_level == "top":
                     # 顶层：slide 已 pin 在最高位无法再升，改用双臂同步抬升
@@ -7172,7 +7541,8 @@ class ShelfPickController(Node):
                         self.get_logger().info(
                             f"[dual-tissue-clamp] lateral squeeze held for "
                             f"{close_elapsed:.2f}s; top shelf has no overhead "
-                            "board, performing the established arm lift")
+                            "board, performing the established arm lift; "
+                            f"{clamp_diag}")
                         self.start_dual_tissue_arm_lift_stage(0)
                     else:
                         self.get_logger().error(
@@ -7188,7 +7558,7 @@ class ShelfPickController(Node):
                         f"[dual-tissue-clamp] lateral squeeze held for "
                         f"{close_elapsed:.2f}s; lifting "
                         f"{self.shelf_level}-shelf tissue "
-                        "before horizontal retreat")
+                        f"before horizontal retreat; {clamp_diag}")
                     self.start_dual_tissue_slide_lift()
                 else:
                     self.get_logger().error(
@@ -7306,6 +7676,8 @@ class ShelfPickController(Node):
                     < GENERIC_CLOSE_STABLE_RANGE)
                 if close_elapsed >= GENERIC_CLOSE_DWELL_S or close_settled:
                     gripper = gripper_now
+                    shallow_limit = GENERIC_CAPTURE_MAX_GRIP_BY_KIND.get(
+                        self.target_kind)
                     message = (
                         f"[generic-grip] close settled; "
                         f"start={self.generic_close_start_grip} "
@@ -7320,6 +7692,17 @@ class ShelfPickController(Node):
                             message + "; empty-grasp signature observed; "
                             "grasp lost during close - aborting instead of "
                             "reporting a false success")
+                        self.set_selected_arm_target(
+                            self.pregrasp_arm_joints)
+                        self.set_state(STATE_ABORT)
+                    elif (gripper is not None
+                          and shallow_limit is not None
+                          and gripper >= shallow_limit):
+                        self.get_logger().error(
+                            message + "; shallow-grasp signature >= "
+                            f"{shallow_limit:.3f} observed for "
+                            f"{self.target_kind}; retrying instead of "
+                            "transporting an outer-fingertip hold")
                         self.set_selected_arm_target(
                             self.pregrasp_arm_joints)
                         self.set_state(STATE_ABORT)
@@ -7471,19 +7854,27 @@ class ShelfPickController(Node):
                             self.generic_top_retreat_arm_joints)
                         self.set_state(STATE_RETREAT)
                 elif self.shelf_level == "lower":
-                    # Lower goods use their own small slide lift.  A fixed
-                    # dwell keeps this branch independent of the middle-layer
-                    # convergence gates and avoids dragging the product over
-                    # the lower front rail at its original height.
+                    # Lower goods use their own small slide lift.  The 40 mm
+                    # slide motion normally settles within ~0.3 s; waiting out
+                    # the full fixed dwell adds nearly a second of pure idle
+                    # per order.  Gate the transition on measured convergence
+                    # (5 mm) after a short minimum, and keep the fixed dwell
+                    # as a safety ceiling when feedback is missing/unsettled.
                     self.des_slide = max(
                         SLIDE_MIN, self.slide_grasp - LOWER_LIFT_M)
-                    if lift_elapsed >= LOWER_LIFT_DWELL_S:
-                        measured_slide = self.joints.get("slide_joint")
+                    measured_slide = self.joints.get("slide_joint")
+                    lift_settled = (
+                        measured_slide is not None
+                        and lift_elapsed >= LOWER_LIFT_MIN_ELAPSED_S
+                        and abs(float(measured_slide) - self.des_slide)
+                        <= LOWER_LIFT_SETTLE_ERROR_M)
+                    if lift_settled or lift_elapsed >= LOWER_LIFT_DWELL_S:
                         self.get_logger().info(
                             f"[lower-front-lift] commanded "
                             f"{LOWER_LIFT_M:.3f}m upward slide motion; "
                             f"target_slide={self.des_slide:.3f} "
-                            f"measured_slide={measured_slide}; "
+                            f"measured_slide={measured_slide} "
+                            f"settled={int(lift_settled)}; "
                             "retracting horizontally")
                         self.set_selected_arm_target(
                             self.pregrasp_arm_joints)
@@ -7620,10 +8011,29 @@ class ShelfPickController(Node):
                         f"SUCCESS: removed {self.target_kind} from shelf; "
                         f"holding it with {self.grasp_arm} arm (ArUco "
                         f"ID={self.target_marker_id})")
-            lower_generic_done = (
-                not self.use_sphere_grasp
-                and self.shelf_level == "lower"
-                and self.now() - self.state_t0 >= LOWER_RETREAT_DWELL_S)
+            lower_generic_done = False
+            if (not self.use_sphere_grasp
+                    and self.shelf_level == "lower"):
+                elapsed_retreat = self.now() - self.state_t0
+                if elapsed_retreat >= LOWER_RETREAT_DWELL_S:
+                    lower_generic_done = True
+                else:
+                    # lower 层原来固定等满 2.5 s；和 top/middle 一样，只要
+                    # 实测 TCP 已明显退出货架前轨就提前判完成，避免抓取后
+                    # 原地干等造成“卡住”观感。
+                    actual_tcp = self.selected_tcp_world()
+                    clear_y = (
+                        self.target_world[1]
+                        - PRODUCT_BEHIND_MARKER_M
+                        - GENERIC_RETREAT_CLEAR_MARGIN_M)
+                    if (elapsed_retreat >= 1.0
+                            and actual_tcp is not None
+                            and actual_tcp[1] < clear_y):
+                        lower_generic_done = True
+                        self.get_logger().warn(
+                            f"[generic-retreat] lower TCP clear of the shelf "
+                            f"(y={actual_tcp[1]:.3f} < {clear_y:.3f}) after "
+                            f"{elapsed_retreat:.2f}s; treating as removed")
             established_profile_done = (
                 self.state == STATE_RETREAT
                 and not (
@@ -7776,10 +8186,13 @@ def parse_args():
         "--weights", default=str(DEFAULT_WEIGHTS),
         help="multi-class Ultralytics checkpoint (default: repository best.pt)")
     parser.add_argument(
-        "--confidence", type=float, default=0.45,
-        help="minimum YOLO confidence (default: 0.45)")
+        "--confidence", type=float, default=0.90,
+        help="minimum YOLO confidence (default: 0.90)")
     parser.add_argument(
-        "--device", choices=["auto", "cpu", "cuda"], default="auto")
+        "--device", choices=["auto", "cpu", "cuda"], default="cuda")
+    parser.add_argument(
+        "--max-inference-hz", type=float, default=8.0,
+        help="maximum YOLO source-frame rate (default: 8 Hz)")
     parser.add_argument(
         "--show", action="store_true", help="show the YOLO result window")
     parser.add_argument(
@@ -7802,6 +8215,8 @@ def parse_args():
     args = parser.parse_args()
     if not 0.0 <= args.confidence <= 1.0:
         parser.error("--confidence must be in [0, 1]")
+    if not 0.0 < args.max_inference_hz < float("inf"):
+        parser.error("--max-inference-hz must be finite and positive")
     if args.max_scan_cycles < 1:
         parser.error("--max-scan-cycles must be >= 1")
     return args
@@ -7827,7 +8242,8 @@ def main() -> None:
             backend="yolo", pub_res_img=True, device=args.device,
             weights=weights, target_kind=args.target_kind,
             confidence=args.confidence, show=False,
-            camera_names=("head",))
+            camera_names=("head",),
+            max_inference_hz=args.max_inference_hz)
         aruco_node = ArucoDetectNode(
             "head", marker_size=MARKER_SIZE_M, publish_tf=False,
             publish_result_image=True)

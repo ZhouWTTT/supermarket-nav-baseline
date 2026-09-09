@@ -59,8 +59,9 @@ def main() -> int:
     parser.add_argument("--target-time", type=int, default=600)
     parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--max-scan-cycles", type=int, default=2)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--inference-hz", type=float, default=12.0)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--confidence", type=float, default=0.90)
+    parser.add_argument("--inference-hz", type=float, default=8.0)
     parser.add_argument("--deadline-s", type=float, default=1800.0)
     args = parser.parse_args()
 
@@ -90,6 +91,11 @@ def main() -> int:
         "-e", "SUPERMARKET_ENABLE_RENDER=1",
         "-e", "SUPERMARKET_ENABLE_LIDAR=1",
         "-e", "SUPERMARKET_USE_GS=1",
+        "-e", "SUPERMARKET_RGB_CAMERAS=head",
+        "-e", "SUPERMARKET_RENDER_FPS=12",
+        "-e", "SUPERMARKET_GS_SEQUENTIAL=0",
+        "-e", "SUPERMARKET_WHEEL_LINEAR_ERROR_LIMIT_RADPS=4.5",
+        "-e", "SUPERMARKET_WHEEL_ANGULAR_ERROR_LIMIT_RADPS=2.5",
         "-e", "SUPERMARKET_RANDOMIZE=1",
         "-e", "SUPERMARKET_RANDOMIZE_OBSTACLES=1",
         *([] if obstacle_seed is None
@@ -98,11 +104,14 @@ def main() -> int:
         "-e", f"TORCH_EXTENSIONS_DIR={TORCH_CACHE}",
         *seed_env,
         "-v", "supermarket_sorting_cache:/root/.cache",
+        "-v", (
+            f"{REPO_ROOT / 'examples/supermarket_sorting/supermarket_sorting_server_speed.py'}:"
+            "/tmp/supermarket_sorting_server_speed.py:ro"),
         SERVER_IMAGE,
         "bash", "-lc",
         "cd /workspace/supermarket_sorting_task && "
         "source /opt/ros/humble/setup.bash && "
-        "python3 examples/supermarket_sorting/supermarket_sorting_server.py",
+        "python3 /tmp/supermarket_sorting_server_speed.py",
     ]
     code, out, err = run(server_args, timeout=30.0)
     if code != 0:
@@ -119,6 +128,7 @@ def main() -> int:
         "--memory-confirmations", "3",
         "--memory-confidence-threshold", "0.95",
         "--grab-policy", "nearest",
+        "--confidence", f"{args.confidence:g}",
         "--inference-hz", f"{args.inference_hz:g}",
         "--device", args.device,
         "--order-timeout", str(args.order_timeout),

@@ -1092,14 +1092,14 @@ def parse_args() -> argparse.Namespace:
         "--perception-worker", default=str(DEFAULT_PERCEPTION_WORKER))
     parser.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
     parser.add_argument(
-        "--device", choices=["auto", "cpu", "cuda"], default="auto")
+        "--device", choices=["auto", "cpu", "cuda"], default="cuda")
     parser.add_argument(
         "--no-persistent-perception", action="store_true",
         help="load YOLO/ArUco inside every order worker instead of reusing one "
              "runner-owned detector process")
-    parser.add_argument("--confidence", type=float, default=0.45)
+    parser.add_argument("--confidence", type=float, default=0.90)
     parser.add_argument(
-        "--inference-hz", type=float, default=12.0,
+        "--inference-hz", type=float, default=8.0,
         help="maximum YOLO source-frame rate during active scan states")
     parser.add_argument("--max-scan-cycles", type=int, default=2)
     parser.add_argument("--max-attempts", type=int, default=2)

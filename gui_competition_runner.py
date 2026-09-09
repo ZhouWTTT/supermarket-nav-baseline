@@ -229,8 +229,8 @@ class LauncherApp:
         self.confirmations_var = tk.IntVar(value=3)
         self.memory_conf_var = tk.DoubleVar(value=0.95)
         self.policy_var = tk.StringVar(value="nearest")
-        self.inference_hz_var = tk.DoubleVar(value=12.0)
-        self.device_var = tk.StringVar(value="cpu")
+        self.inference_hz_var = tk.DoubleVar(value=8.0)
+        self.device_var = tk.StringVar(value="cuda")
         self.order_timeout_var = tk.IntVar(value=300)
         self.match_timeout_var = tk.IntVar(value=3600)
         self.target_time_var = tk.IntVar(value=400)
@@ -548,7 +548,7 @@ class LauncherApp:
                 "-e", f"DISPLAY={os.environ.get('DISPLAY', '')}",
                 "-e", "MUJOCO_GL=glfw",
                 "-e", "SUPERMARKET_HEADLESS=0",
-                "-e", "SUPERMARKET_DISPLAY_CAMERA=top_gs",
+                "-e", "SUPERMARKET_FAST_MUJOCO_DISPLAY=1",
                 "-v", "/tmp/.X11-unix:/tmp/.X11-unix:rw",
             ])
         else:
@@ -557,6 +557,14 @@ class LauncherApp:
             "-e", "SUPERMARKET_ENABLE_RENDER=1",
             "-e", "SUPERMARKET_ENABLE_LIDAR=1",
             "-e", "SUPERMARKET_USE_GS=1",
+            # Fast Server profile: the baseline consumes only the head camera.
+            # Twelve rendered frames still feed 8 Hz inference, while avoiding
+            # two unused hand-camera GS passes and a second GS display pass.
+            "-e", "SUPERMARKET_RGB_CAMERAS=head",
+            "-e", "SUPERMARKET_RENDER_FPS=12",
+            "-e", "SUPERMARKET_GS_SEQUENTIAL=0",
+            "-e", "SUPERMARKET_WHEEL_LINEAR_ERROR_LIMIT_RADPS=4.5",
+            "-e", "SUPERMARKET_WHEEL_ANGULAR_ERROR_LIMIT_RADPS=2.5",
             "-e", "SUPERMARKET_RANDOMIZE=1",
             "-e", f"SUPERMARKET_RANDOMIZE_OBSTACLES={int(self.obstacles_var.get())}",
             "-e", f"SUPERMARKET_TASKS={','.join(self._tasks())}",
@@ -570,11 +578,14 @@ class LauncherApp:
             args.extend(["-e", f"SUPERMARKET_OBSTACLE_SEED={obstacle_seed}"])
         args.extend([
             "-v", "supermarket_sorting_cache:/root/.cache",
+            "-v", (
+                f"{REPO_ROOT / 'examples/supermarket_sorting/supermarket_sorting_server_speed.py'}:"
+                "/tmp/supermarket_sorting_server_speed.py:ro"),
             SERVER_IMAGE,
             "bash", "-lc",
             "cd /workspace/supermarket_sorting_task && "
             "source /opt/ros/humble/setup.bash && "
-            "python3 examples/supermarket_sorting/supermarket_sorting_server.py",
+            "python3 /tmp/supermarket_sorting_server_speed.py",
         ])
         return args
 

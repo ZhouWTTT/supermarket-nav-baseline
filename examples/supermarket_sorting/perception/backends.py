@@ -195,8 +195,8 @@ class YoloBackend:
     returns an empty list (graceful degradation; swap to BlobBackend instead).
     """
 
-    def __init__(self, ckpt_path: str, conf_thresh: float = 0.45,
-                 device: str = "auto", target_class: str | None = None):
+    def __init__(self, ckpt_path: str, conf_thresh: float = 0.90,
+                 device: str = "cuda", target_class: str | None = None):
         self.conf_thresh = conf_thresh
         self.model = None
         self.device = device

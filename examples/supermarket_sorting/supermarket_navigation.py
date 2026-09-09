@@ -762,8 +762,10 @@ class NavigationController:
         self.goal_yaw = None
         self.nav_goal_x = self.nav_goal_y = None
 
-        # Velocity limits
-        self.max_lin = 0.90
+        # Velocity limits.  Raise only the clear-path cruise ceiling: heading
+        # and corner scaling below still reduce curved motion, the final
+        # 0.60 m keeps its original cap, and obstacle braking is unchanged.
+        self.max_lin = 1.15
         # 导航行进最大角速度：2026-08-17 从 2.5 降至 2.0 rad/s，
         # 降低载货转弯时的甩动与商品滑落风险。
         self.max_ang = 2.0
