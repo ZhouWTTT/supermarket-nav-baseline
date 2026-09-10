@@ -129,8 +129,8 @@ def test_open_confirmation_must_be_continuous():
 def test_loaded_motion_speedups_remain_below_generic_limits():
     per_kind = _literal("PLACE_LOADED_ARM_MAX_STEP_BY_KIND_RAD")
 
-    assert per_kind["chengzi"] == 0.0070
-    assert per_kind["pingguo"] == 0.0070
+    assert per_kind["chengzi"] == 0.0055
+    assert per_kind["pingguo"] == 0.0055
     assert per_kind["maidong"] == 0.0045
     assert per_kind["heweidao"] == 0.0105
     assert per_kind["chengzi"] < _literal("PLACE_LOADED_ARM_MAX_STEP_RAD")

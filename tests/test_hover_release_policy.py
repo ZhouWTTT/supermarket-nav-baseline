@@ -42,6 +42,10 @@ def test_heweidao_uses_supported_low_release_with_backup():
     assert 0.0 <= raise_m - overtravel <= 0.010
 
 
+def test_heweidao_release_opens_gripper_past_normal_maximum():
+    assert _literal("HEWEIDAO_GRIP_OPEN_OVERSHOOT") == 1.20
+
+
 def test_only_spheres_require_bottom_at_table_for_release():
     source = SOURCE.read_text(encoding="utf-8")
     assert "_target_is_sphere_product()" in source

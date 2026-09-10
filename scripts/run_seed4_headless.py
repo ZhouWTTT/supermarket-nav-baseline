@@ -94,8 +94,6 @@ def main() -> int:
         "-e", "SUPERMARKET_RGB_CAMERAS=head",
         "-e", "SUPERMARKET_RENDER_FPS=12",
         "-e", "SUPERMARKET_GS_SEQUENTIAL=0",
-        "-e", "SUPERMARKET_WHEEL_LINEAR_ERROR_LIMIT_RADPS=4.5",
-        "-e", "SUPERMARKET_WHEEL_ANGULAR_ERROR_LIMIT_RADPS=2.5",
         "-e", "SUPERMARKET_RANDOMIZE=1",
         "-e", "SUPERMARKET_RANDOMIZE_OBSTACLES=1",
         *([] if obstacle_seed is None
@@ -105,13 +103,13 @@ def main() -> int:
         *seed_env,
         "-v", "supermarket_sorting_cache:/root/.cache",
         "-v", (
-            f"{REPO_ROOT / 'examples/supermarket_sorting/supermarket_sorting_server_speed.py'}:"
-            "/tmp/supermarket_sorting_server_speed.py:ro"),
+            f"{REPO_ROOT / 'examples/supermarket_sorting/supermarket_sorting_server_render.py'}:"
+            "/tmp/supermarket_sorting_server_render.py:ro"),
         SERVER_IMAGE,
         "bash", "-lc",
         "cd /workspace/supermarket_sorting_task && "
         "source /opt/ros/humble/setup.bash && "
-        "python3 /tmp/supermarket_sorting_server_speed.py",
+        "python3 /tmp/supermarket_sorting_server_render.py",
     ]
     code, out, err = run(server_args, timeout=30.0)
     if code != 0:

@@ -1,12 +1,12 @@
-"""Regression tests for safe blocked-release recovery during placement.
+"""Regression tests for relaxed in-table release during placement.
 
-A release can be blocked because the chassis drifts horizontally while the
-slide lowers a product onto the delivery table.  The controller must never
-respond by sweeping the clamped product sideways at near-table height (that
-knocked over neighbouring goods in past runs); it has to raise back to the
-verified overhead height, re-centre there, and only then descend again.  As a
-last resort after bounded retries it may release in place while the product is
-still supported on the table.
+The chassis can drift while the slide lowers a product onto the delivery
+table, leaving the TCP a few centimetres off the assigned slot.  The referee
+only requires the final position inside the delivery box, so the controller
+must never sweep the clamped product sideways at low height, raise-and-retry
+for minutes, or fail the order over a small offset -- it releases in place as
+soon as the TCP is over the delivery table (spheres still need a verified low
+bottom pose to avoid rolling).
 """
 
 from __future__ import annotations
@@ -20,25 +20,9 @@ SOURCE = (
     / "examples/supermarket_sorting/integrated_nav_pick_place.py"
 )
 
-REQUIRED_CONSTANTS = {
-    "PLACE_XY_REFINE_RETRY_TIMEOUT_S": 15.0,
-    "PLACE_BLOCKED_RELEASE_RAISE_RETRIES_MAX": 2,
-    "PLACE_BLOCKED_RELEASE_INPLACE_MAX_ERROR_M": 0.110,
-}
-
 
 def _tree():
     return ast.parse(SOURCE.read_text(encoding="utf-8"))
-
-
-def _literal(name: str):
-    for node in _tree().body:
-        if not isinstance(node, ast.Assign):
-            continue
-        if any(isinstance(target, ast.Name) and target.id == name
-               for target in node.targets):
-            return ast.literal_eval(node.value)
-    raise AssertionError(f"missing constant: {name}")
 
 
 def _methods():
@@ -52,41 +36,31 @@ def _methods():
     }
 
 
-def test_blocked_release_constants_exist_and_are_bounded():
-    for name, expected in REQUIRED_CONSTANTS.items():
-        assert _literal(name) == expected, name
-
-
-def test_raise_retry_helpers_exist():
-    methods = _methods()
-    for name in (
-            "_begin_blocked_release_raise",
-            "_place_raise_retry_tick",
-            "_blocked_release_inplace_safe"):
-        assert name in methods, name
-
-
-def test_blocked_release_never_refines_at_low_height():
-    """Stage-2 release-blocked path must use raise/retry or in-place release,
-    not an immediate low-height stage-1 horizontal correction."""
-    methods = _methods()
-    place_tick = methods["_place_tick"]
+def _self_calls(method_name: str):
+    method = _methods()[method_name]
     calls = []
-    for node in ast.walk(place_tick):
+    for node in ast.walk(method):
         if (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "self"):
             calls.append(node.func.attr)
-    assert "_begin_blocked_release_raise" in calls
-    assert "_blocked_release_inplace_safe" in calls
+    return calls
+
+
+def test_release_gate_directly_releases_when_over_table():
+    calls = _self_calls("_place_tick")
     assert "_place_contact_release" in calls
 
 
-def test_retry_stage_is_kept_loaded():
-    """Stage 6 (blocked-release raise) must keep holding the product and must
-    be treated as base-locked vertical motion, not a horizontal sweep."""
+def test_blocked_release_no_longer_retries_or_refines_low():
+    """The stage-2 gate must not fall back to raise/refine retries that made
+    off-slot placements fail; in-table poses release in place."""
+    calls = _self_calls("_place_tick")
+    assert "_begin_blocked_release_raise" not in calls
+    assert "_blocked_release_inplace_safe" not in calls
+
+
+def test_sphere_bottom_safety_is_kept():
     source = SOURCE.read_text(encoding="utf-8")
-    assert "self.place_stage == 6" in source
-    assert "and self.place_stage in {0, 1, 2, 6}" in source
-    assert "blocked_release_raise" in source
+    assert "sphere release bottom not verified" in source

@@ -349,6 +349,20 @@ CLOSE_RECHECK_ARUCO_PREFERENCE_S = 0.25
 REVISIT_POSE_COMMAND_TIMEOUT_S = 5.0
 CLOSE_RECHECK_XY_MAX_M = 0.12
 CLOSE_RECHECK_Z_MAX_M = 0.16
+# 三明治对左右(X)定位最敏感：楔形盒只要横向偏几毫米，夹爪就压不到盒侧、
+# 合爪实测停在 ≈0.97 的顶沿松夹。close-recheck 通过后，用复核期间对同一盒
+# 的深度世界 X 中位数把抓取目标与底盘对齐位横向挪到实测盒心，再做一次短距
+# ALIGN；深度点噪声大/样本不足时不做调整，避免把本来成功的复核拖坏。
+SANMINGZHI_LATERAL_RECHECK_MIN_SAMPLES = 3
+SANMINGZHI_LATERAL_RECHECK_SPREAD_MAX_M = 0.015
+# 左右位置是抓三明治成败的关键，5mm 死区仍可能让爪子压在盒棱上；收紧到
+# 2.5mm，只要复核测得盒心偏离槽位就做横向修正。
+SANMINGZHI_LATERAL_RECHECK_DEADBAND_M = 0.0025
+SANMINGZHI_LATERAL_RECHECK_MAX_ADJUST_M = 0.025
+# 开始收横向样本后的最长等待：3 个采样在 8Hz 下约 0.4s；等待超时仍不足则
+# 按原逻辑直接进入抓取，不让可选的横向精修拖慢或卡死复核（须小于
+# CLOSE_RECHECK_POSE_TIMEOUT_S，避免与换视角分支冲突）。
+SANMINGZHI_LATERAL_RECHECK_MAX_WAIT_S = 0.8
 
 SLIDE_REFERENCE_Z_M = 0.9235
 SLIDE_REFERENCE_COMMAND = 0.11
@@ -394,11 +408,9 @@ GENERIC_POST_CONTACT_EXTENSION_M = 0.050
 # 更深、夹得更稳，又避免 50mm 长前伸把罐子推倒。
 GENERIC_POST_EXTEND_M_BY_KIND = {"shupian": 0.025}
 # 核桃味刀越靠下夹持越稳定。利用已有的闭合前延伸段同步下降 10mm，
-# 不增加独立状态或停顿；三明治在顶沿/封口处夹持偏松（实测合爪后爪位仍
-# ≈0.97，即爪子没吃到 66mm 主体宽度），下降 6mm 让爪子贴住盒身。
+# 不增加独立状态或停顿；其余商品保持水平前伸。
 GENERIC_POST_EXTEND_Z_DROP_M_BY_KIND = {
     "heweidao": 0.010,
-    "sanmingzhi": 0.006,
 }
 # The extended middle/lower endpoint is outside the analytic arm envelope from
 # SCAN_Y once navigation tolerance is included.  Move only those non-spherical
@@ -919,17 +931,23 @@ GRIP_OPEN = 1.0
 GRIP_CLOSE = 0.08
 GENERIC_GRIP_CLOSE = 0.0
 GRIP_CLOSE_BY_CLASS = {"sanmingzhi": 0.16}
-# Keep the generic capture policy for sandwiches; lateral centering is handled
-# by the validated arm bias rather than a product-specific rejection.
-GENERIC_CAPTURE_MAX_GRIP_BY_KIND = {}
+# 三明治盒是楔形，随机偏航时合爪往往只压到棱角，爪位停在 ≈0.95~0.99
+# （对应盒体实际被斜夹，余量仅 1~2mm），这类持握带离货架后极易在中途滑脱。
+# 用合爪实测开度 >=0.95 判定浅夹，在货架侧直接中止并交给 runner 重试另一
+# 个候选盒，而不是把松夹带上路；0.91~0.94 的历史样本都能完成运输，不拦截。
+GENERIC_CAPTURE_MAX_GRIP_BY_KIND = {"sanmingzhi": 0.95}
 # 张爪命令步进 0.025→0.040：张开是离开货物的动作，无接触风险，放货后的
 # 1.0 s 释放停顿主要就是受此限速限制，提速后约省 0.3~0.4 s/单。
 GRIP_OPEN_MAX_STEP = 0.050
 # 合爪命令步进提到 0.012 rad/tick：接触前的手指合拢更快；接触后由
 # 货物/实测反馈停住，不受影响。
 GRIP_CLOSE_MAX_STEP = 0.012
-# heweidao 合爪过快会把杯子顶离卡位，保持旧版 0.006 慢速合爪。
-GRIP_CLOSE_MAX_STEP_BY_KIND = {"heweidao": 0.006}
+# heweidao 合爪过快会把杯子顶离卡位、三明治软质楔形盒快速合爪容易顶起带偏，
+# 两者都保持旧版 0.006 慢速合爪，让接触面有时间吃进盒身再抬升。
+GRIP_CLOSE_MAX_STEP_BY_KIND = {
+    "heweidao": 0.006,
+    "sanmingzhi": 0.006,
+}
 GENERIC_CLOSE_DWELL_S = 6.0
 GENERIC_EMPTY_GRIP_MARGIN = 0.02
 # Generic close is gated on the measured gripper instead of a fixed 6 s dwell:
@@ -982,14 +1000,20 @@ GRASP_TCP_Z_OFFSET_BY_KIND = {"kele": -0.010, "heweidao": -0.010}
 # 1-2cm（用户视角为偏左），把指令目标再往西（-x）10mm，右臂合计 -20mm；
 # 左臂不再往东补偿，保持目标点居中。球体与纸巾不走该补偿，不受影响。
 GRASP_TCP_X_OFFSET_BY_ARM = {"r": 0.003, "l": 0.000}
-# Do not add a sandwich-only lateral correction: the earlier trial introduced
-# a repeatable 6 mm bias and made the TCP land off-centre.
-SANMINGZHI_INWARD_X_OFFSET_BY_ARM_M = {}
+# ============================================================================
+# 三明治抓取的左右(X)傻瓜式补偿：在这里改数字。
+#   "l"（左臂）：负值 = 指令目标向左/西移动，-0.003 = 左移 3mm
+#   "r"（右臂）：正值 = 指令目标向右/东移动，+0.003 = 右移 3mm
+# 该偏移会同时作用到抓取目标 X 与底盘对齐 X，并叠加在通用右臂 +3mm
+# 补偿（GRASP_TCP_X_OFFSET_BY_ARM）之上。
+# ============================================================================
+SANMINGZHI_GRASP_X_SHIFT_BY_ARM_M = {"l": -0.007, "r": +0.0085}
 GRIPPER_MAX_OPENING_M = 0.080
 GRIP_PRESHAPE_CLEARANCE_M = 0.012
-# 三明治预张爪稍收一点（两侧余量 12→10 mm，preshape 0.975→0.950），
-# 让爪子更快贴住盒身而不是停在顶沿外围。
-GRIP_PRESHAPE_CLEARANCE_BY_KIND_M = {"sanmingzhi": 0.010}
+# 三明治沿用通用预张爪余量（preshape 0.975）：此前收到 0.950 后仍大量出现
+# 爪位停在 0.97 顶沿的情况，恢复到旧版开度以保留足够侧向余量，配合慢速合爪
+# 让爪子落位。
+GRIP_PRESHAPE_CLEARANCE_BY_KIND_M = {}
 GRIP_PRESHAPE_REACHED_TOLERANCE = 0.04
 
 STATE_GO_SCAN = "go_scan"
@@ -1059,7 +1083,7 @@ def grasp_tcp_x_offset(target_kind: str, grasp_arm: str) -> float:
     """Return the arm bias plus a shape-specific centring correction."""
     offset = GRASP_TCP_X_OFFSET_BY_ARM.get(grasp_arm, 0.0)
     if target_kind == "sanmingzhi":
-        offset += SANMINGZHI_INWARD_X_OFFSET_BY_ARM_M.get(grasp_arm, 0.0)
+        offset += SANMINGZHI_GRASP_X_SHIFT_BY_ARM_M.get(grasp_arm, 0.0)
     return offset
 
 
@@ -1308,6 +1332,8 @@ class ShelfPickController(Node):
         self.close_recheck = bool(close_recheck)
         self.recheck_marker_skips = set()
         self.recheck_confirmation_times = deque(maxlen=12)
+        # 三明治复核期间收集的 (time, world_x) 横向采样（仅 sanmingzhi 使用）。
+        self.sandwich_lateral_x_samples = deque(maxlen=24)
         self.recheck_last_yolo_stamp = None
         self.recheck_marker_candidate_id = None
         self.recheck_marker_candidate_count = 0
@@ -2546,6 +2572,7 @@ class ShelfPickController(Node):
         self.recheck_started_at = now
         self.recheck_pose_started_at = now
         self.recheck_confirmation_times.clear()
+        self.sandwich_lateral_x_samples.clear()
         self.recheck_last_yolo_stamp = None
         self.recheck_marker_candidate_id = None
         self.recheck_marker_candidate_count = 0
@@ -2608,6 +2635,14 @@ class ShelfPickController(Node):
                    and self.recheck_confirmation_times[0] < cutoff):
                 self.recheck_confirmation_times.popleft()
             self.recheck_confirmation_times.append(now)
+            if self.target_kind == "sanmingzhi":
+                lateral_world = self._detection_world(detection)
+                if lateral_world is not None:
+                    while (self.sandwich_lateral_x_samples
+                           and self.sandwich_lateral_x_samples[0][0] < cutoff):
+                        self.sandwich_lateral_x_samples.popleft()
+                    self.sandwich_lateral_x_samples.append(
+                        (now, float(lateral_world[0])))
             self.get_logger().info(
                 f"[close-recheck] marker={self.target_marker_id} "
                 f"kind={self.target_kind} source={source} "
@@ -2878,6 +2913,70 @@ class ShelfPickController(Node):
         return (len(self.recheck_confirmation_times)
                 >= CLOSE_RECHECK_CONFIRMATIONS)
 
+    def _sandwich_lateral_estimate(self) -> float | None:
+        """Return a stable median world-X for the rechecked sandwich, if any.
+
+        Only fresh close-view depth samples of the matched product count.
+        Depth can be noisy and the wedge front is asymmetric, so require at
+        least a few samples that agree; otherwise return None and keep the
+        original slot-centred grasp (no adjustment).
+        """
+        if self.target_kind != "sanmingzhi":
+            return None
+        if not self.sandwich_lateral_x_samples:
+            return None
+        cutoff = self.now() - CLOSE_RECHECK_WINDOW_S
+        xs = [
+            float(x) for (sample_t, x) in self.sandwich_lateral_x_samples
+            if sample_t >= cutoff]
+        if len(xs) < SANMINGZHI_LATERAL_RECHECK_MIN_SAMPLES:
+            return None
+        xs = np.asarray(xs, dtype=float)
+        if float(np.max(xs) - np.min(xs)) \
+                > SANMINGZHI_LATERAL_RECHECK_SPREAD_MAX_M:
+            return None
+        return float(np.median(xs))
+
+    def _apply_sandwich_lateral_recheck(self) -> float:
+        """Nudge the grasp target/base laterally toward the measured box X.
+
+        Returns the applied world-X correction (0 means nothing changed).
+        Keeps the existing arm/execution-offset bookkeeping: only the slot
+        centre moves, the arm's execution bias and base lateral bias stay
+        identical, so the IK chain and hold geometry remain as validated.
+        """
+        measured_x = self._sandwich_lateral_estimate()
+        self.sandwich_lateral_x_samples.clear()
+        if measured_x is None:
+            return 0.0
+        grasp_arm = str(self.grasp_arm)
+        execution_offset = grasp_tcp_x_offset(self.target_kind, grasp_arm)
+        if self.is_top_shelf and grasp_arm == "l":
+            execution_offset += TOP_LEFT_GRASP_X_BIAS_M
+        base_slot_x = float(self.target_world[0]) - execution_offset
+        correction = float(measured_x - base_slot_x)
+        if abs(correction) < SANMINGZHI_LATERAL_RECHECK_DEADBAND_M:
+            return 0.0
+        correction = float(np.clip(
+            correction,
+            -SANMINGZHI_LATERAL_RECHECK_MAX_ADJUST_M,
+            SANMINGZHI_LATERAL_RECHECK_MAX_ADJUST_M))
+        new_slot_x = base_slot_x + correction
+        new_target_x = new_slot_x + execution_offset
+        lateral_bias = (
+            ARM_LATERAL_BIAS_M if grasp_arm == "l" else -ARM_LATERAL_BIAS_M)
+        self.target_world[0] = float(np.clip(
+            new_target_x, NAV_X_MIN, NAV_X_MAX))
+        self.align_base_x = float(np.clip(
+            float(self.target_world[0]) + lateral_bias,
+            NAV_X_MIN, NAV_X_MAX))
+        self.get_logger().info(
+            f"[close-recheck] sanmingzhi lateral correction applied: "
+            f"measured_x={measured_x:.4f}m base_slot_x={base_slot_x:.4f}m "
+            f"dx={correction:.4f}m -> target_x={self.target_world[0]:.4f}m "
+            f"align_x={self.align_base_x:.4f}m")
+        return correction
+
     def _advance_recheck_pose(self) -> bool:
         """Move to the next view; return False when all views are exhausted."""
         if self.recheck_pose_index + 1 >= len(self.recheck_poses):
@@ -2885,6 +2984,7 @@ class ShelfPickController(Node):
         self.recheck_pose_index += 1
         self.recheck_pose_started_at = self.now()
         self.recheck_confirmation_times.clear()
+        self.sandwich_lateral_x_samples.clear()
         self.recheck_last_yolo_stamp = None
         self.recheck_marker_candidate_id = None
         self.recheck_marker_candidate_count = 0
@@ -2913,6 +3013,7 @@ class ShelfPickController(Node):
         self._recheck_passed = False
         self.recheck_poses = ()
         self.recheck_confirmation_times.clear()
+        self.sandwich_lateral_x_samples.clear()
         self.recheck_last_yolo_stamp = None
         self.recheck_marker_candidate_id = None
         self.recheck_marker_candidate_count = 0
@@ -7266,14 +7367,34 @@ class ShelfPickController(Node):
                 if (ready_elapsed
                         >= SCAN_CAMERA_STABLE_S
                         and self._recheck_confirmed()):
+                    # 三明治复核先攒横向采样：抓取成败主要取决于左右(X)对准。
+                    # 样本未收敛（<3 个或离散过大）时先继续看新帧，等满或
+                    # 超时后再放行，避免一次本来就成功的复核因缺深度被拖失败。
+                    if (self.target_kind == "sanmingzhi"
+                            and self.sandwich_lateral_x_samples
+                            and self._sandwich_lateral_estimate() is None
+                            and ready_elapsed
+                            < (SCAN_CAMERA_STABLE_S
+                               + SANMINGZHI_LATERAL_RECHECK_MAX_WAIT_S)):
+                        return
                     self._recheck_passed = True
                     self.recheck_confirmation_times.clear()
                     self.recheck_poses = ()
                     self.get_logger().info(
                         f"[close-recheck] PASS marker="
                         f"{self.target_marker_id} kind={self.target_kind}; "
-                        "proceeding to grasp")
-                    self._start_grasp_settle()
+                        "verifying lateral alignment")
+                    lateral_dx = self._apply_sandwich_lateral_recheck()
+                    if abs(lateral_dx) > 0.0:
+                        self.get_logger().info(
+                            "[close-recheck] lateral realign requested "
+                            f"dx={lateral_dx:.4f}m; re-aligning base before "
+                            "the grasp")
+                        self.set_state(STATE_ALIGN)
+                    else:
+                        self.get_logger().info(
+                            "[close-recheck] proceeding to grasp")
+                        self._start_grasp_settle()
                 elif (self.state == STATE_RECHECK
                       and ready_elapsed
                       >= (SCAN_CAMERA_STABLE_S
@@ -7676,6 +7797,8 @@ class ShelfPickController(Node):
                     < GENERIC_CLOSE_STABLE_RANGE)
                 if close_elapsed >= GENERIC_CLOSE_DWELL_S or close_settled:
                     gripper = gripper_now
+                    effective_close_step = GRIP_CLOSE_MAX_STEP_BY_KIND.get(
+                        self.target_kind, GRIP_CLOSE_MAX_STEP)
                     shallow_limit = GENERIC_CAPTURE_MAX_GRIP_BY_KIND.get(
                         self.target_kind)
                     message = (
@@ -7684,7 +7807,7 @@ class ShelfPickController(Node):
                         f"measured={gripper} command={close_command:.3f} "
                         f"elapsed={close_elapsed:.2f}s "
                         f"stage={self.generic_close_stage} "
-                        f"close_step={GRIP_CLOSE_MAX_STEP:.3f}rad/tick")
+                        f"close_step={effective_close_step:.3f}rad/tick")
                     if (gripper is not None
                             and gripper
                             <= close_command + GENERIC_EMPTY_GRIP_MARGIN):

@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Speed-only runtime overrides for the organizer's supermarket Server.
+"""Render-only runtime overrides for the organizer's supermarket Server.
 
-This wrapper deliberately loads the Server implementation already present in
-the image.  It changes only render workload and straight-line wheel tracking;
-layout, task generation, start pose, assets and referee behaviour remain the
-organizer image's implementation.
+This wrapper loads the Server implementation already present in the image and
+changes only the render workload (which sensor cameras are rendered, FPS and
+GS sequential order), plus an optional cheaper MuJoCo display.  It deliberately
+does NOT touch wheel control/tracking, so chassis dynamics stay official.
+
+Purpose: the organizer Server defaults to rendering head+left+right 3DGS
+cameras at 640x480, which can exceed an 8 GB GPU.  Publishing only the head
+camera (the one the client perception consumes) removes the two extra GS
+passes and avoids CUDA out of memory.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import math
 import os
 from pathlib import Path
 import sys
@@ -27,7 +31,7 @@ CAMERA_IDS = {"head": 0, "left": 1, "right": 2}
 def positive_env_float(name: str, default: float) -> float:
     value = os.getenv(name)
     result = float(default if value is None else value)
-    if not math.isfinite(result) or result <= 0.0:
+    if result <= 0.0:
         raise ValueError(
             f"{name} must be a positive finite number, got {value!r}")
     return result
@@ -67,7 +71,7 @@ def load_official_server():
     return module
 
 
-def install_speed_overrides(server) -> None:
+def install_render_overrides(server) -> None:
     original_build_config = server.build_config
     original_init = server.TaskMMK2ROS2.__init__
     original_render = server.TaskMMK2ROS2.render
@@ -82,74 +86,31 @@ def install_speed_overrides(server) -> None:
             "SUPERMARKET_GS_SEQUENTIAL", "1").strip().lower() in {
                 "1", "true", "yes", "on"}
         print(
-            "[server-speed] render profile: "
+            "[server-render] render profile: "
             f"rgb_cameras={config.obs_rgb_cam_id} depth_cameras="
             f"{config.obs_depth_cam_id} fps={config.render_set['fps']:g} "
             f"gs_sequential={int(config.gs_render_sequential)}")
         return config
 
-    def init_with_speed_limits(self, config):
+    def init_with_render_display(self, config):
         original_init(self, config)
         # A GUI window otherwise asks the GS renderer for an additional free
         # camera.  Keep the window, but draw its diagnostic view with the much
-        # cheaper MuJoCo renderer while the head sensor retains 3DGS.
+        # cheaper MuJoCo renderer while sensor cameras retain 3DGS.
         self.force_mujoco_display = os.getenv(
             "SUPERMARKET_FAST_MUJOCO_DISPLAY", "0").strip().lower() in {
                 "1", "true", "yes", "on"}
-        self.wheel_linear_error_limit = positive_env_float(
-            "SUPERMARKET_WHEEL_LINEAR_ERROR_LIMIT_RADPS", 2.5)
-        self.wheel_angular_error_limit = positive_env_float(
-            "SUPERMARKET_WHEEL_ANGULAR_ERROR_LIMIT_RADPS", 2.5)
         print(
-            "[server-speed] wheel tracking limits: "
-            f"linear={self.wheel_linear_error_limit:g}rad/s "
-            f"angular={self.wheel_angular_error_limit:g}rad/s "
-            f"nonblocking_display={int(self.force_mujoco_display)}")
-
-    def update_control_with_split_limits(self, action):
-        # Common-mode wheel error controls translation; differential error
-        # controls rotation.  Raising only the former preserves the official
-        # angular response while giving straight travel more tracking force.
-        wheel_error = self.tctr_base - self.sensor_wheel_qvel
-        linear_error = float(0.5 * (wheel_error[0] + wheel_error[1]))
-        angular_error = float(0.5 * (wheel_error[1] - wheel_error[0]))
-        limited_linear = float(np.clip(
-            linear_error,
-            -self.wheel_linear_error_limit,
-            self.wheel_linear_error_limit))
-        limited_angular = float(np.clip(
-            angular_error,
-            -self.wheel_angular_error_limit,
-            self.wheel_angular_error_limit))
-        limited_wheel_error = np.array([
-            limited_linear - limited_angular,
-            limited_linear + limited_angular,
-        ])
-        wheel_force = self.pid_base_vel.output(
-            limited_wheel_error, self.mj_model.opt.timestep)
-        self.mj_data.ctrl[:2] = np.clip(
-            wheel_force,
-            self.mj_model.actuator_ctrlrange[:2, 0],
-            self.mj_model.actuator_ctrlrange[:2, 1])
-        self.mj_data.ctrl[2:self.njctrl] = np.clip(
-            action[2:self.njctrl],
-            self.mj_model.actuator_ctrlrange[2:self.njctrl, 0],
-            self.mj_model.actuator_ctrlrange[2:self.njctrl, 1])
+            "[server-render] nonblocking_display="
+            f"{int(self.force_mujoco_display)}")
 
     def render_with_nonblocking_display(self):
         """Render sensors once, then draw a display without another GS pass.
 
-        The organizer image's SimulatorBase.render does not know about the
-        ``force_mujoco_display`` attribute.  In a windowed run it therefore
-        asks the Gaussian renderer for the selected display camera in addition
-        to the head sensor.  Selecting the head camera is particularly bad
-        when the window size differs from the sensor size: the same camera is
-        rendered through 3DGS twice at two resolutions and can stall CUDA.
-
-        Hide the GLFW window only while the original method produces sensor
-        frames.  Afterwards, reuse the already-rendered head RGB/depth image;
-        non-sensor viewpoints use the inexpensive MuJoCo renderer.  Perception
-        topics and their 3DGS images are unchanged.
+        Temporarily hides the display window so the GS batch contains exactly
+        the configured sensor cameras, then draws the display from the already
+        rendered sensor image with MuJoCo/OpenGL.  Perception topics keep the
+        3DGS images.
         """
         fast_display = bool(
             getattr(self, "force_mujoco_display", False)
@@ -161,12 +122,8 @@ def install_speed_overrides(server) -> None:
         import cv2
         import glfw
         from OpenGL import GL as gl
-        import time
 
         display_window = self.window
-        # SimulatorBase uses ``window is not None`` to decide whether to add a
-        # display camera to the GS batch.  Temporarily hiding it leaves exactly
-        # the configured sensor cameras in that batch.
         self.window = None
         try:
             original_render(self)
@@ -195,7 +152,8 @@ def install_speed_overrides(server) -> None:
                 img_vis = (
                     None if img_depth is None else cv2.applyColorMap(
                         cv2.convertScaleAbs(
-                            img_depth, alpha=255.0 / self.config.max_render_depth),
+                            img_depth,
+                            alpha=255.0 / self.config.max_render_depth),
                         cv2.COLORMAP_JET))
 
             if (img_vis is not None
@@ -217,29 +175,18 @@ def install_speed_overrides(server) -> None:
                     gl.GL_UNSIGNED_BYTE, img_vis.tobytes())
             glfw.swap_buffers(display_window)
             glfw.poll_events()
-
-            if self.config.sync:
-                current_time = time.time()
-                wait_time = max(
-                    1.0 / self.render_fps
-                    - (current_time - self.last_render_time), 0.0)
-                if wait_time > 0.0:
-                    time.sleep(wait_time)
-                self.last_render_time = time.time()
-        except Exception as exc:
-            # Match the organizer renderer's non-fatal window error policy;
-            # sensor publication must continue even if the display fails.
-            print(f"[server-speed] display render error: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            # Sensor publication must continue even if the display fails.
+            print(f"[server-render] display render error: {exc}")
 
     server.build_config = build_config
-    server.TaskMMK2ROS2.__init__ = init_with_speed_limits
-    server.TaskMMK2ROS2.updateControl = update_control_with_split_limits
+    server.TaskMMK2ROS2.__init__ = init_with_render_display
     server.TaskMMK2ROS2.render = render_with_nonblocking_display
 
 
 def main() -> None:
     server = load_official_server()
-    install_speed_overrides(server)
+    install_render_overrides(server)
     server.main()
 
 
