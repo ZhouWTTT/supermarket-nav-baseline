@@ -106,12 +106,17 @@ class Harness(DeployPolicy):
         self.dual_surround_right_joints = np.zeros(6)
         self.dual_pregrasp_left_joints = None
         self.dual_pregrasp_right_joints = None
+        self.dual_deploy_unrolled_left_joints = None
+        self.dual_deploy_unrolled_right_joints = None
+        self.dual_deploy_stage = "final"
         self.tcp = {}
         self.dual_deploy_best_arm_error = None
         self.dual_deploy_best_slide_error = None
         self.dual_deploy_last_progress_at = None
         self.dual_deploy_extension_last_log = None
         self.state = "deploy"
+        self.state_t0 = 0.0
+        self.commands_ready_since = None
         self.logger = _Logger()
 
     def now(self):
@@ -212,3 +217,37 @@ def test_cartesian_pregrasp_fallback_rejects_unreached_arm():
     controller.advance_dual_tissue_deploy(5.0)
 
     assert controller.state == "deploy"
+
+
+def test_top_rolled_deploy_reaches_safe_unrolled_stage_before_insertion():
+    controller = Harness()
+    controller.dual_deploy_stage = "unrolled"
+    controller.dual_deploy_unrolled_left_joints = np.zeros(6)
+    controller.dual_deploy_unrolled_right_joints = np.zeros(6)
+    controller.dual_pregrasp_left_joints = np.ones(6)
+    controller.dual_pregrasp_right_joints = np.ones(6)
+    controller.arm_error = 0.0
+    controller.dual_commands_ready = lambda *_args: True
+    controller.clock = 2.0
+
+    controller.advance_dual_tissue_deploy(2.0)
+
+    assert controller.state == "deploy"
+    assert controller.dual_deploy_stage == "rolled"
+    assert np.allclose(controller.des_left_arm, np.ones(6))
+    assert np.allclose(controller.des_right_arm, np.ones(6))
+    assert controller.state_t0 == 2.0
+
+
+def test_final_rolled_deploy_starts_insertion_after_second_gate():
+    controller = Harness()
+    controller.dual_deploy_stage = "rolled"
+    controller.dual_pregrasp_left_joints = np.ones(6)
+    controller.dual_pregrasp_right_joints = np.ones(6)
+    controller.arm_error = 0.0
+    controller.dual_commands_ready = lambda *_args: True
+    controller.clock = 2.0
+
+    controller.advance_dual_tissue_deploy(2.0)
+
+    assert controller.state == "surround"
