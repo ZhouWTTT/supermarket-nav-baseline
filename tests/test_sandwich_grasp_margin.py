@@ -34,6 +34,7 @@ CONSTANTS = {
     "SANMINGZHI_LATERAL_RECHECK_DEADBAND_M",
     "SANMINGZHI_LATERAL_RECHECK_MAX_ADJUST_M",
     "SANMINGZHI_LATERAL_RECHECK_MAX_WAIT_S",
+    "CLOSE_RECHECK_DIRECT_HANDOFF_POSITION_TOLERANCE_M",
 }
 
 
@@ -120,3 +121,74 @@ def test_sandwich_lateral_recheck_is_bounded_and_conservative():
     assert POLICY["SANMINGZHI_LATERAL_RECHECK_DEADBAND_M"] == 0.0025
     assert 0.01 <= POLICY["SANMINGZHI_LATERAL_RECHECK_MAX_ADJUST_M"] <= 0.05
     assert 0.0 < POLICY["SANMINGZHI_LATERAL_RECHECK_MAX_WAIT_S"] <= 2.0
+
+
+def test_close_recheck_keeps_small_refinement_as_stop_and_grasp_handoff():
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    controller = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "ShelfPickController")
+    method = next(
+        node for node in controller.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_grasp_pose_needs_realign")
+    module = ast.fix_missing_locations(ast.Module(body=[ast.ClassDef(
+        name="AlignmentPolicy",
+        bases=[],
+        keywords=[],
+        body=[method],
+        decorator_list=[],
+    )], type_ignores=[]))
+    namespace = {
+        "np": np,
+        "YAW_NORTH": math.pi / 2.0,
+        "NAV_YAW_DEADBAND_RAD": 0.035,
+        "wrap_to_pi": lambda angle: (angle + math.pi) % (2.0 * math.pi) - math.pi,
+    }
+    exec(compile(module, str(SOURCE), "exec"), namespace)
+    policy = namespace["AlignmentPolicy"]()
+    policy.base_xy = np.array([1.47, 2.50], dtype=float)
+    policy.base_yaw = math.pi / 2.0 - 0.030
+    policy.align_base_x = 1.500
+    policy.align_base_y = 2.515
+
+    tolerance = POLICY[
+        "CLOSE_RECHECK_DIRECT_HANDOFF_POSITION_TOLERANCE_M"]
+    needs_realign, position_error, yaw_error = (
+        policy._grasp_pose_needs_realign(tolerance))
+
+    assert math.isclose(tolerance, 0.035)
+    assert position_error < tolerance
+    assert yaw_error < 0.035
+    assert needs_realign is False
+
+    policy.align_base_x = 1.515
+    needs_realign, position_error, _ = (
+        policy._grasp_pose_needs_realign(tolerance))
+    assert position_error > tolerance
+    assert needs_realign is True
+
+
+def test_lateral_recheck_uses_actual_pose_before_requesting_second_align():
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    controller = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "ShelfPickController")
+    tick = next(
+        node for node in controller.body
+        if isinstance(node, ast.FunctionDef) and node.name == "tick")
+    calls = {
+        node.func.attr
+        for node in ast.walk(tick)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+    }
+
+    assert "_grasp_pose_needs_realign" in calls
+    assert "_start_grasp_settle" in calls
+    assert any(
+        isinstance(node, ast.Name)
+        and node.id == "CLOSE_RECHECK_DIRECT_HANDOFF_POSITION_TOLERANCE_M"
+        for node in ast.walk(tick))

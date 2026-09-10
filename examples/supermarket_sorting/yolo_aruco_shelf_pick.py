@@ -349,10 +349,16 @@ CLOSE_RECHECK_ARUCO_PREFERENCE_S = 0.25
 REVISIT_POSE_COMMAND_TIMEOUT_S = 5.0
 CLOSE_RECHECK_XY_MAX_M = 0.12
 CLOSE_RECHECK_Z_MAX_M = 0.16
+# A direct shelf leg already converges to a 25 mm base-position envelope.
+# Close-view refinement can move the desired grasp centre by a few millimetres;
+# do not turn that harmless arm-reachable correction into a second chassis
+# manoeuvre.  The extra 10 mm is only a handoff envelope: corrections that put
+# the current base farther away still fall back to precision ALIGN.
+CLOSE_RECHECK_DIRECT_HANDOFF_POSITION_TOLERANCE_M = 0.035
 # 三明治对左右(X)定位最敏感：楔形盒只要横向偏几毫米，夹爪就压不到盒侧、
 # 合爪实测停在 ≈0.97 的顶沿松夹。close-recheck 通过后，用复核期间对同一盒
-# 的深度世界 X 中位数把抓取目标与底盘对齐位横向挪到实测盒心，再做一次短距
-# ALIGN；深度点噪声大/样本不足时不做调整，避免把本来成功的复核拖坏。
+# 的深度世界 X 中位数把抓取目标与底盘对齐位横向挪到实测盒心；若当前底盘
+# 仍在直达抓取包络内就由手臂吸收修正，仅在真实超差时再做短距 ALIGN。
 SANMINGZHI_LATERAL_RECHECK_MIN_SAMPLES = 3
 SANMINGZHI_LATERAL_RECHECK_SPREAD_MAX_M = 0.015
 # 左右位置是抓三明治成败的关键，5mm 死区仍可能让爪子压在盒棱上；收紧到
@@ -467,7 +473,11 @@ TOP_GRASP_TCP_FORWARD_M = 0.035
 # Lower-shelf sphere support remains intentionally disabled until that layer is
 # implemented and tested separately.
 SPHERE_RADIUS_M = {"pingguo": 0.035, "chengzi": 0.037}
-SPHERE_FINGER_ENGAGEMENT_M = 0.012
+# Move the first forward endpoint 8 mm deeper than the previous 12 mm
+# engagement.  This starts the sphere grasp with the wrist still ahead of the
+# centre (15 mm for an apple, 17 mm for an orange), while placing the fingers
+# farther around the near hemisphere before the fixed second extension.
+SPHERE_FINGER_ENGAGEMENT_M = 0.020
 # 球体取货前伸速度：主段适当提高，接近接触的终段慢速区和接触蠕行保持
 # 原值，保证夹持稳定。
 SPHERE_FAST_SPEED_MPS = 0.14
@@ -972,7 +982,7 @@ GENERIC_CLOSE_STAGE1_DWELL_S = 2.5
 # one finger catch and push it during the forward sweep.  For these goods,
 # close immediately at the contact point instead of extending first.
 # 脉动、可乐已移除出名单（v2 实测恢复正常 50mm 接触后前伸），口香糖保留。
-GENERIC_NO_POST_EXTEND_KINDS = {"kouxiangtang"}
+GENERIC_NO_POST_EXTEND_KINDS = {}
 # The generic front profiles keep the wrist at the product centre.  For short
 # goods (kouxiangtang is only ~5 mm above the middle board) the finger tips
 # then scrape or jam against the shelf board during the approach, deflecting
@@ -1007,7 +1017,7 @@ GRASP_TCP_X_OFFSET_BY_ARM = {"r": 0.003, "l": 0.000}
 # 该偏移会同时作用到抓取目标 X 与底盘对齐 X，并叠加在通用右臂 +3mm
 # 补偿（GRASP_TCP_X_OFFSET_BY_ARM）之上。
 # ============================================================================
-SANMINGZHI_GRASP_X_SHIFT_BY_ARM_M = {"l": -0.007, "r": +0.0085}
+SANMINGZHI_GRASP_X_SHIFT_BY_ARM_M = {"l": -0.0085, "r": +0.0085}
 GRIPPER_MAX_OPENING_M = 0.080
 GRIP_PRESHAPE_CLEARANCE_M = 0.012
 # 三明治沿用通用预张爪余量（preshape 0.975）：此前收到 0.950 后仍大量出现
@@ -1114,6 +1124,15 @@ def sphere_grasp_tcp_z(
             TOP_SHELF_SURFACE_Z_M
             + TOP_SPHERE_MIN_TCP_TARGET_CLEARANCE_M)
     return target_z
+
+
+def sphere_first_forward_tcp_y(
+        product_center_y: float, radius: float) -> float:
+    """Return the first sphere-forward TCP endpoint on the near hemisphere."""
+    return (
+        float(product_center_y)
+        - float(radius)
+        + SPHERE_FINGER_ENGAGEMENT_M)
 
 
 def wrap_to_pi(angle: float) -> float:
@@ -1406,6 +1425,9 @@ class ShelfPickController(Node):
         self.generic_top_retreat_arm_joints = None
         self.dual_pregrasp_left_joints = None
         self.dual_pregrasp_right_joints = None
+        self.dual_deploy_unrolled_left_joints = None
+        self.dual_deploy_unrolled_right_joints = None
+        self.dual_deploy_stage = "final"
         self.dual_lift_use_arm = False
         self.dual_lift_left_joints = None
         self.dual_lift_right_joints = None
@@ -2775,12 +2797,8 @@ class ShelfPickController(Node):
         self.target_marker_id = None
         self.target_physical_marker_id = None
         self._recheck_passed = False
-        position_error = float(np.linalg.norm(
-            self.base_xy - np.array([
-                self.align_base_x, self.align_base_y], dtype=float)))
-        yaw_error = abs(wrap_to_pi(YAW_NORTH - self.base_yaw))
-        needs_realign = (
-            position_error > 0.025 or yaw_error > NAV_YAW_DEADBAND_RAD)
+        needs_realign, position_error, yaw_error = (
+            self._grasp_pose_needs_realign(0.025))
         if needs_realign:
             self._reset_recheck_state_locked()
             self.set_state(STATE_ALIGN)
@@ -2976,6 +2994,20 @@ class ShelfPickController(Node):
             f"dx={correction:.4f}m -> target_x={self.target_world[0]:.4f}m "
             f"align_x={self.align_base_x:.4f}m")
         return correction
+
+    def _grasp_pose_needs_realign(
+            self, position_tolerance_m: float) -> tuple[bool, float, float]:
+        """Compare the measured chassis pose with the current grasp pose."""
+        position_error = float(np.linalg.norm(
+            self.base_xy - np.array([
+                self.align_base_x, self.align_base_y], dtype=float)))
+        yaw_error = abs(wrap_to_pi(YAW_NORTH - self.base_yaw))
+        return (
+            bool(position_error > position_tolerance_m
+                 or yaw_error > NAV_YAW_DEADBAND_RAD),
+            position_error,
+            yaw_error,
+        )
 
     def _advance_recheck_pose(self) -> bool:
         """Move to the next view; return False when all views are exhausted."""
@@ -4426,9 +4458,29 @@ class ShelfPickController(Node):
             z=tcp_z - self.dual_close_descent_m)
         left_reference = self.cmd_left_arm.copy()
         right_reference = self.cmd_right_arm.copy()
+        deploy_unrolled_left_joints = None
+        deploy_unrolled_right_joints = None
         try:
-            pre_left_joints, pre_right_joints = self.solve_kdl_both_world(
-                pre_left, pre_right, left_reference, right_reference)
+            if self.dual_side_rolled and self.shelf_level == "top":
+                # A direct neutral -> rolled interpolation can make the two
+                # top-shelf arms cross in front of the torso before either TCP
+                # reaches the external pregrasp (latest failures stalled with
+                # ~2.3 rad residual and ~0.4 m longitudinal error).  Reach the
+                # same safe, outside-shelf point unrolled first, then solve the
+                # rolled pose from that nearby branch and rotate in place.
+                deploy_unrolled_left_joints, deploy_unrolled_right_joints = (
+                    self.solve_kdl_both_world(
+                        pre_left, pre_right,
+                        left_reference, right_reference,
+                        top_wrist_rolled=False))
+                pre_left_joints, pre_right_joints = self.solve_kdl_both_world(
+                    pre_left, pre_right,
+                    deploy_unrolled_left_joints,
+                    deploy_unrolled_right_joints,
+                    top_wrist_rolled=True)
+            else:
+                pre_left_joints, pre_right_joints = self.solve_kdl_both_world(
+                    pre_left, pre_right, left_reference, right_reference)
             if self.dual_direct_probe:
                 surround_left, surround_right = pair(
                     probe_span_l, probe_span_r, insert_y)
@@ -4504,6 +4556,15 @@ class ShelfPickController(Node):
         self.dual_surround_unroll_right_joints = None
         self.dual_pregrasp_left_joints = pre_left_joints
         self.dual_pregrasp_right_joints = pre_right_joints
+        self.dual_deploy_unrolled_left_joints = (
+            None if deploy_unrolled_left_joints is None
+            else deploy_unrolled_left_joints.copy())
+        self.dual_deploy_unrolled_right_joints = (
+            None if deploy_unrolled_right_joints is None
+            else deploy_unrolled_right_joints.copy())
+        self.dual_deploy_stage = (
+            "unrolled"
+            if deploy_unrolled_left_joints is not None else "final")
         self.dual_surround_left_joints = surround_left_joints
         self.dual_surround_right_joints = surround_right_joints
         # Side columns retain their rolled wrist orientation; pass/unroll and
@@ -4521,8 +4582,14 @@ class ShelfPickController(Node):
         self.dual_clamp_right_joints = clamp_right_joints
         self.dual_retreat_left_joints = retreat_left_joints
         self.dual_retreat_right_joints = retreat_right_joints
-        self.des_left_arm = pre_left_joints.copy()
-        self.des_right_arm = pre_right_joints.copy()
+        self.des_left_arm = (
+            deploy_unrolled_left_joints.copy()
+            if deploy_unrolled_left_joints is not None
+            else pre_left_joints.copy())
+        self.des_right_arm = (
+            deploy_unrolled_right_joints.copy()
+            if deploy_unrolled_right_joints is not None
+            else pre_right_joints.copy())
         self.des_left_grip = DUAL_TISSUE_GRIP_COMMAND
         self.des_right_grip = DUAL_TISSUE_GRIP_COMMAND
         self.des_slide = self.slide_grasp
@@ -4547,7 +4614,8 @@ class ShelfPickController(Node):
             f"side_rolled={int(self.dual_side_rolled)} "
             f"roll_direction={'outward' if self.dual_top_wrist_inward else 'inward'} "
             f"roll_deg=({'-90,+90' if self.dual_top_wrist_inward else '+90,-90'}) "
-            f"contact_push={self.dual_contact_push_side}")
+            f"contact_push={self.dual_contact_push_side} "
+            f"deploy_stage={self.dual_deploy_stage}")
         if self.dual_direct_probe:
             self.get_logger().info(
                 "[dual-tissue-IK] direct probe defers clamp/retreat IK "
@@ -5295,7 +5363,8 @@ class ShelfPickController(Node):
         radius = SPHERE_RADIUS_M[self.target_kind]
         # Stop just inside the near surface.  The fingers then surround part of
         # the sphere without asking the wrist TCP to pass through its centre.
-        contact_world[1] -= radius - SPHERE_FINGER_ENGAGEMENT_M
+        contact_world[1] = sphere_first_forward_tcp_y(
+            self.target_world[1], radius)
         reference = (self.cmd_right_arm.copy() if self.grasp_arm == "r"
                      else self.cmd_left_arm.copy())
         try:
@@ -5771,8 +5840,16 @@ class ShelfPickController(Node):
         # remains blocked.
         cartesian_ready = False
         try:
-            left_pre = getattr(self, "dual_pregrasp_left_joints", None)
-            right_pre = getattr(self, "dual_pregrasp_right_joints", None)
+            unrolled_stage = (
+                getattr(self, "dual_deploy_stage", "final") == "unrolled")
+            left_pre = (
+                getattr(self, "dual_deploy_unrolled_left_joints", None)
+                if unrolled_stage
+                else getattr(self, "dual_pregrasp_left_joints", None))
+            right_pre = (
+                getattr(self, "dual_deploy_unrolled_right_joints", None)
+                if unrolled_stage
+                else getattr(self, "dual_pregrasp_right_joints", None))
             if left_pre is not None and right_pre is not None:
                 left_tcp = self.arm_tcp_world("left")
                 right_tcp = self.arm_tcp_world("right")
@@ -5795,22 +5872,42 @@ class ShelfPickController(Node):
             # Host-side tests and transient feedback gaps retain the original
             # joint/slide gate; production simply waits for the next sample.
             cartesian_ready = False
+        ready_mode = None
         if (deploy_elapsed >= DUAL_TISSUE_DEPLOY_DWELL_S
                 and cartesian_ready):
+            ready_mode = "Cartesian"
+        elif (deploy_elapsed >= DUAL_TISSUE_DEPLOY_DWELL_S
+              and deploy_ready):
+            ready_mode = "joint"
+        if ready_mode is not None:
+            if getattr(self, "dual_deploy_stage", "final") == "unrolled":
+                # Both TCPs are already at the external pregrasp.  Rotate to
+                # the final narrow-wrist targets without translating toward
+                # the shelf, and give this second bounded stage a fresh
+                # convergence/progress window.
+                self.des_left_arm = self.dual_pregrasp_left_joints.copy()
+                self.des_right_arm = self.dual_pregrasp_right_joints.copy()
+                self.dual_deploy_stage = "rolled"
+                self.state_t0 = now
+                self.commands_ready_since = None
+                self.dual_deploy_best_arm_error = None
+                self.dual_deploy_best_slide_error = None
+                self.dual_deploy_last_progress_at = None
+                self.dual_deploy_extension_last_log = None
+                self.get_logger().info(
+                    f"[dual-tissue-deploy] safe unrolled pregrasp stable "
+                    f"after {deploy_elapsed:.2f}s via {ready_mode} gate; "
+                    "rolling both wrists in place before insertion")
+                return
+            qualifier = (
+                " despite bounded joint residual"
+                if ready_mode == "Cartesian" else "")
             self.get_logger().info(
-                f"[dual-tissue-deploy] measured Cartesian pregrasp stable "
-                f"after {deploy_elapsed:.2f}s despite bounded joint residual; "
-                f"dual_arm_error={arm_error:.4f}rad; starting fixed surround "
-                "motion")
-            self.start_dual_tissue_surround()
-            return
-        if (deploy_elapsed >= DUAL_TISSUE_DEPLOY_DWELL_S
-                and deploy_ready):
-            self.get_logger().info(
-                f"[dual-tissue-deploy] measured pregrasp stable after "
-                f"{deploy_elapsed:.2f}s; dual_arm_error="
-                f"{arm_error:.4f}rad; starting fixed surround "
-                "motion")
+                f"[dual-tissue-deploy] measured "
+                f"{'Cartesian ' if ready_mode == 'Cartesian' else ''}"
+                f"pregrasp stable after {deploy_elapsed:.2f}s"
+                f"{qualifier}; dual_arm_error={arm_error:.4f}rad; "
+                "starting fixed surround motion")
             self.start_dual_tissue_surround()
             return
 
@@ -7386,11 +7483,24 @@ class ShelfPickController(Node):
                         "verifying lateral alignment")
                     lateral_dx = self._apply_sandwich_lateral_recheck()
                     if abs(lateral_dx) > 0.0:
-                        self.get_logger().info(
-                            "[close-recheck] lateral realign requested "
-                            f"dx={lateral_dx:.4f}m; re-aligning base before "
-                            "the grasp")
-                        self.set_state(STATE_ALIGN)
+                        needs_realign, position_error, yaw_error = (
+                            self._grasp_pose_needs_realign(
+                                CLOSE_RECHECK_DIRECT_HANDOFF_POSITION_TOLERANCE_M))
+                        if needs_realign:
+                            self.get_logger().info(
+                                "[close-recheck] lateral realign required "
+                                f"dx={lateral_dx:.4f}m pose_error="
+                                f"{position_error:.3f}m/{yaw_error:.3f}rad; "
+                                "re-aligning base before the grasp")
+                            self.set_state(STATE_ALIGN)
+                        else:
+                            self.get_logger().info(
+                                "[close-recheck] lateral correction remains "
+                                "inside direct-grasp handoff envelope "
+                                f"({position_error:.3f}m/{yaw_error:.3f}rad); "
+                                "keeping chassis stopped and proceeding to "
+                                "grasp")
+                            self._start_grasp_settle()
                     else:
                         self.get_logger().info(
                             "[close-recheck] proceeding to grasp")
