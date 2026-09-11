@@ -1013,6 +1013,27 @@ class CompetitionRunner(Node):
             f"{summary.get('count', 0)} failed={summary.get('failed', 0)} "
             f"elapsed={elapsed:.3f}s target={self.args.target_time:.1f}s "
             f"within_target={int(elapsed <= self.args.target_time)}")
+        if self.task is not None:
+            self.get_logger().info(
+                f"[order-final-summary] count={len(self.task.orders)}")
+            for order in self.task.orders:
+                order_summary = {
+                    "order_id": order.id,
+                    "kind": order.kind,
+                    "status": order.status,
+                    "attempts": order.attempts,
+                    # Sum only time spent by workers assigned to this order;
+                    # exclude time between retries while other orders run.
+                    "elapsed_s": round(
+                        self.order_active_elapsed_s.get(order.id, 0.0), 3),
+                    "failure_reasons": list(order.errors),
+                }
+                self.get_logger().info(
+                    "[order-final] "
+                    + json.dumps(
+                        order_summary,
+                        ensure_ascii=False,
+                        separators=(",", ":")))
 
     def _publish_stop(self) -> None:
         try:

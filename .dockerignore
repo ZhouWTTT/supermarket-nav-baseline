@@ -13,3 +13,5 @@
 # implementation available for development, but never copy it into the Client
 # submission image.
 examples/supermarket_sorting/supermarket_sorting_server.py
+examples/supermarket_sorting/referee.py
+examples/supermarket_sorting/obstacle_layout.py

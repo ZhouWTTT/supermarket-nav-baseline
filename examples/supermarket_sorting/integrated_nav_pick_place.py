@@ -421,6 +421,14 @@ PLACE_BASE_TO_SLOT_LONGITUDINAL_M = 0.62
 PLACE_CREEP_GOAL_TOLERANCE_M = 0.01
 PLACE_CREEP_YAW_GAIN = 2.0
 PLACE_CREEP_MAX_ANGULAR_RPS = 0.30
+# Put the chassis 0.20 m east of the assigned table slot when that does not
+# move the delivery approach too far east.  This shortens the large lateral
+# reach to the west slots while preserving the proven centre approach for the
+# two east slots.  The actual grasp arm is known before delivery navigation,
+# so a cheap IK precheck may select one of the bounded fallbacks below.
+PLACE_NAV_SLOT_X_OFFSET_M = 0.20
+PLACE_NAV_EAST_SWITCH_X_M = -1.70
+PLACE_NAV_IK_ARM_OFFSET_M = 0.20
 # The parent limiter permits 0.026 rad every 20 ms (about 1.3 rad/s) and can
 # apply that full step as soon as placement starts.  Ramp the loaded arm from
 # rest and cap it at the gentler shelf-contact rate so the held product is not
@@ -675,6 +683,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._route_leg_yaw_tolerance = None
         self.delivery_nav_stage = None
         self.delivery_direct_fallback_used = False
+        self._delivery_approach_x = None
+        self._delivery_approach_ik_prechecked = False
         self.scan_trunk_route_stage = None
         self.scan_trunk_route_done = False
         self.scan_direct_fallback_used = False
@@ -1504,6 +1514,11 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         else:
             self.place_world[0] = self._place_xy_base[0]
             self.place_world[1] = self._place_xy_base[1]
+        # Target changes happen before delivery navigation.  Invalidate any
+        # speculative approach choice so the actual product geometry and arm
+        # determine the one-time IK precheck.
+        self._delivery_approach_x = None
+        self._delivery_approach_ik_prechecked = False
 
     def _reroute_on_missing_direct_slot(self) -> bool:
         """Direct-slot hint pointed at the wrong place: switch orders.
@@ -2114,32 +2129,179 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             f"direct_single_leg=True")
 
     def _delivery_slot_goal(self) -> tuple[float, float, float]:
-        # A carried sphere remains about 0.70 m in front of the base.  Driving
-        # the chassis directly toward the westmost slot makes that protruding
-        # payload sweep to x=-2.40 while the base is still turning diagonally,
-        # which matches the repeated orange losses beside the west wall.  Aim
-        # every sphere at the proven table-centre approach instead, including
-        # lower-shelf fruit that uses the lower-front grasp path.
-        #
-        # Outer slots are an exception: table-centre parking made the loaded
-        # arm sweep across already-occupied inner slots (first maidong, then
-        # shupian) and knock goods over.  For the outer-left/outer-right slot,
-        # stop near the slot X so the arm mostly lowers in place instead of
-        # crossing other goods.  Non-spherical products already do this.
-        approach_x = (
-            float(DELIVERY_APPROACH[0])
-            if (self._target_is_sphere_product()
-                and (self.place_slot is None
-                     or int(self.place_slot) < PLACE_OUTER_SLOT_INDEX))
-            else float(self.place_world[0]))
-        if self._target_is_sphere_product():
-            approach_x = float(np.clip(
-                approach_x, pick.NAV_X_MIN, pick.NAV_X_MAX))
+        if self._delivery_approach_x is None:
+            self._delivery_approach_x = self._plan_delivery_approach_x()
         return (
-            approach_x,
+            float(self._delivery_approach_x),
             DELIVERY_APPROACH[1],
             DELIVERY_APPROACH[2],
         )
+
+    def _delivery_approach_x_candidates(self) -> tuple[float, ...]:
+        """Return at most three low-cost X candidates for the assigned slot.
+
+        The primary candidate implements the delivery rule directly: park
+        0.20 m east of the slot, unless that would pass x=-1.70, in which case
+        keep the established x=-1.80 centre approach.  Only a failed IK
+        precheck expands the work to the arm-aware and legacy candidates.
+        """
+        slot_x = float(self.place_world[0])
+        primary = slot_x + PLACE_NAV_SLOT_X_OFFSET_M
+        if primary > PLACE_NAV_EAST_SWITCH_X_M:
+            primary = float(DELIVERY_APPROACH[0])
+
+        arm = getattr(self, "grasp_arm", None)
+        arm_aware = slot_x + (
+            PLACE_NAV_IK_ARM_OFFSET_M
+            if arm == "r" else -PLACE_NAV_IK_ARM_OFFSET_M)
+        raw = (primary, arm_aware, float(DELIVERY_APPROACH[0]))
+        candidates = []
+        for value in raw:
+            value = float(np.clip(value, pick.NAV_X_MIN, pick.NAV_X_MAX))
+            if not any(abs(value - existing) < 1e-6
+                       for existing in candidates):
+                candidates.append(value)
+        return tuple(candidates)
+
+    def _predicted_place_base_y(self) -> float:
+        """Predict the southbound creep endpoint used by the IK precheck."""
+        distance_cap_y = float(DELIVERY_APPROACH[1] - self.place_creep_m)
+        slot_depth_y = float(
+            self.place_world[1] + PLACE_BASE_TO_SLOT_LONGITUDINAL_M)
+        # Y decreases while approaching the table, so the first (larger) stop
+        # coordinate reached by either guard is the expected endpoint.
+        return max(distance_cap_y, slot_depth_y)
+
+    @staticmethod
+    def _world_to_footprint_at_pose(
+            world: np.ndarray, base_x: float, base_y: float,
+            base_yaw: float) -> np.ndarray:
+        delta = np.asarray(world, dtype=float) - np.array(
+            [base_x, base_y, 0.0], dtype=float)
+        cosine, sine = math.cos(-base_yaw), math.sin(-base_yaw)
+        return np.array([
+            cosine * delta[0] - sine * delta[1],
+            sine * delta[0] + cosine * delta[1],
+            delta[2],
+        ])
+
+    def _solve_place_world_at_pose(
+            self, world: np.ndarray, reference: np.ndarray, slide: float,
+            base_x: float, base_y: float, base_yaw: float) -> np.ndarray | None:
+        """Solve placement IK at a predicted delivery base pose."""
+        target = np.eye(4)
+        if self.target_kind == "heweidao":
+            target[:3, :3] = pick.Rotation.from_euler(
+                "x", math.pi).as_matrix()
+        target[:3, 3] = self._world_to_footprint_at_pose(
+            world, base_x, base_y, base_yaw)
+        reference = np.asarray(reference, dtype=float)
+        ref_with_slide = np.concatenate(([slide], reference))
+        try:
+            if self.grasp_arm == "r":
+                solutions = self.kdl.inverse_kinematics(
+                    T_right=target, target_height=slide,
+                    ref_pos=ref_with_slide)
+            else:
+                solutions = self.kdl.inverse_kinematics(
+                    T_left=target, target_height=slide,
+                    ref_pos=ref_with_slide)
+        except Exception:  # noqa: BLE001 - candidate is only a precheck
+            return None
+        if solutions is None or len(solutions) == 0:
+            return None
+        candidates = [np.asarray(item[1:], dtype=float) for item in solutions]
+        return min(
+            candidates,
+            key=lambda item: float(np.max(np.abs(item - reference))))
+
+    def _place_ik_feasible_at_base_x(self, base_x: float) -> bool:
+        """Cheaply verify that a predicted base X has a safe place path."""
+        if (getattr(self, "grasp_arm", None) not in {"l", "r"}
+                or getattr(self, "use_dual_tissue_grasp", False)):
+            return True
+
+        measured = self.selected_arm_positions()
+        compact = np.asarray(
+            PLACE_RETREAT_ARM_R if self.grasp_arm == "r"
+            else PLACE_RETREAT_ARM_L, dtype=float)
+        refs = [measured]
+        if self.pregrasp_arm_joints is not None:
+            refs.append(np.asarray(self.pregrasp_arm_joints, dtype=float))
+        refs.append(compact)
+
+        target_x = float(self.place_world[0])
+        target_y = float(self.place_world[1])
+        xy_candidates = (
+            (target_x, target_y),
+            (target_x, target_y + PLACE_SLOT_IK_NUDGE_M),
+            (target_x, target_y - PLACE_SLOT_IK_NUDGE_M),
+            (target_x + PLACE_SLOT_IK_NUDGE_M, target_y),
+            (target_x - PLACE_SLOT_IK_NUDGE_M, target_y),
+        )
+        release_z = self._product_release_z()
+        approach_clearance = (
+            PLACE_APPROACH_CLEARANCE_OUTER_SLOT_M
+            if (self.place_slot is not None
+                and int(self.place_slot) >= PLACE_OUTER_SLOT_INDEX)
+            else PLACE_APPROACH_CLEARANCE_M)
+        minimum_approach_z = max(
+            self.place_min_approach_z,
+            release_z + approach_clearance)
+        z_candidates = tuple(
+            minimum_approach_z + offset for offset in (0.0, 0.02, 0.04))
+        slide_candidates = []
+        for slide in (self.slide_grasp, 0.20, 0.30, 0.35, 0.40, 0.45):
+            slide = float(np.clip(slide, pick.SLIDE_MIN, pick.SLIDE_MAX))
+            if not any(abs(slide - item) < 1e-6
+                       for item in slide_candidates):
+                slide_candidates.append(slide)
+
+        base_y = self._predicted_place_base_y()
+        base_yaw = -math.pi / 2.0
+        for x, y in xy_candidates:
+            for z in z_candidates:
+                descent = z - release_z
+                for slide in slide_candidates:
+                    if slide + descent > pick.SLIDE_MAX + 1e-6:
+                        continue
+                    world = np.array([x, y, z], dtype=float)
+                    for reference in refs:
+                        if self._solve_place_world_at_pose(
+                                world, reference, slide,
+                                base_x, base_y, base_yaw) is not None:
+                            return True
+        return False
+
+    def _plan_delivery_approach_x(self) -> float:
+        """Select the first predicted-reachable approach without route delay."""
+        candidates = self._delivery_approach_x_candidates()
+        chosen = candidates[0]
+        prechecked = False
+        try:
+            for candidate in candidates:
+                if self._place_ik_feasible_at_base_x(candidate):
+                    chosen = candidate
+                    prechecked = True
+                    break
+        except Exception as exc:  # noqa: BLE001 - preserve primary route
+            self.get_logger().warn(
+                "[nav→delivery] approach IK precheck unavailable; "
+                f"using primary x={chosen:.3f}: {type(exc).__name__}: {exc}")
+
+        self._delivery_approach_ik_prechecked = prechecked
+        if not prechecked:
+            self.get_logger().warn(
+                "[nav→delivery] no predicted place IK for bounded X "
+                f"candidates={list(candidates)}; using primary x={chosen:.3f} "
+                "and retaining the normal closed-gripper safety gate")
+        else:
+            self.get_logger().info(
+                "[nav→delivery] slot-offset approach selected "
+                f"x={chosen:.3f} primary={candidates[0]:.3f} "
+                f"candidates={list(candidates)} arm={self.grasp_arm} "
+                "predicted_place_ik=ok")
+        return float(chosen)
 
     def _delivery_watchdog_goal(self) -> tuple[float, float, float]:
         """Return the goal of the delivery leg that is actually active.
