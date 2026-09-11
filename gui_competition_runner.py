@@ -548,7 +548,7 @@ class LauncherApp:
                 "-e", f"DISPLAY={os.environ.get('DISPLAY', '')}",
                 "-e", "MUJOCO_GL=glfw",
                 "-e", "SUPERMARKET_HEADLESS=0",
-                "-e", "SUPERMARKET_FAST_MUJOCO_DISPLAY=1",
+                "-e", "SUPERMARKET_DISPLAY_CAMERA=top_gs",
                 "-v", "/tmp/.X11-unix:/tmp/.X11-unix:rw",
             ])
         else:
@@ -557,12 +557,6 @@ class LauncherApp:
             "-e", "SUPERMARKET_ENABLE_RENDER=1",
             "-e", "SUPERMARKET_ENABLE_LIDAR=1",
             "-e", "SUPERMARKET_USE_GS=1",
-            # Fast Server profile: the baseline consumes only the head camera.
-            # Twelve rendered frames still feed 8 Hz inference, while avoiding
-            # two unused hand-camera GS passes and a second GS display pass.
-            "-e", "SUPERMARKET_RGB_CAMERAS=head",
-            "-e", "SUPERMARKET_RENDER_FPS=12",
-            "-e", "SUPERMARKET_GS_SEQUENTIAL=0",
             "-e", "SUPERMARKET_RANDOMIZE=1",
             "-e", f"SUPERMARKET_RANDOMIZE_OBSTACLES={int(self.obstacles_var.get())}",
             "-e", f"SUPERMARKET_TASKS={','.join(self._tasks())}",
@@ -576,14 +570,11 @@ class LauncherApp:
             args.extend(["-e", f"SUPERMARKET_OBSTACLE_SEED={obstacle_seed}"])
         args.extend([
             "-v", "supermarket_sorting_cache:/root/.cache",
-            "-v", (
-                f"{REPO_ROOT / 'examples/supermarket_sorting/supermarket_sorting_server_render.py'}:"
-                "/tmp/supermarket_sorting_server_render.py:ro"),
             SERVER_IMAGE,
             "bash", "-lc",
             "cd /workspace/supermarket_sorting_task && "
             "source /opt/ros/humble/setup.bash && "
-            "python3 /tmp/supermarket_sorting_server_render.py",
+            "python3 examples/supermarket_sorting/supermarket_sorting_server.py",
         ])
         return args
 

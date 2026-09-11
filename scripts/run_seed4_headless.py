@@ -91,9 +91,6 @@ def main() -> int:
         "-e", "SUPERMARKET_ENABLE_RENDER=1",
         "-e", "SUPERMARKET_ENABLE_LIDAR=1",
         "-e", "SUPERMARKET_USE_GS=1",
-        "-e", "SUPERMARKET_RGB_CAMERAS=head",
-        "-e", "SUPERMARKET_RENDER_FPS=12",
-        "-e", "SUPERMARKET_GS_SEQUENTIAL=0",
         "-e", "SUPERMARKET_RANDOMIZE=1",
         "-e", "SUPERMARKET_RANDOMIZE_OBSTACLES=1",
         *([] if obstacle_seed is None
@@ -102,14 +99,11 @@ def main() -> int:
         "-e", f"TORCH_EXTENSIONS_DIR={TORCH_CACHE}",
         *seed_env,
         "-v", "supermarket_sorting_cache:/root/.cache",
-        "-v", (
-            f"{REPO_ROOT / 'examples/supermarket_sorting/supermarket_sorting_server_render.py'}:"
-            "/tmp/supermarket_sorting_server_render.py:ro"),
         SERVER_IMAGE,
         "bash", "-lc",
         "cd /workspace/supermarket_sorting_task && "
         "source /opt/ros/humble/setup.bash && "
-        "python3 /tmp/supermarket_sorting_server_render.py",
+        "python3 examples/supermarket_sorting/supermarket_sorting_server.py",
     ]
     code, out, err = run(server_args, timeout=30.0)
     if code != 0:
