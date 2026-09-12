@@ -839,6 +839,11 @@ class NavigationController:
         self._reverse_recovery_start_yaw = None
         self._reverse_recovery_started_at = 0.0
         self._reverse_recovery_trigger_s = 1.0
+        # A* failure is handled separately from a local lidar/arc block.  Keep
+        # retrying the planner for five active controller seconds before moving
+        # the chassis to create a new planning pose.
+        self._no_path_recovery_time = 0.0
+        self._no_path_recovery_trigger_s = 5.0
         self._reverse_recovery_no_progress_m = 0.03
         # Only a genuinely pinched heading_alignment should reverse: the base
         # is stuck turning while obstacles are within ~0.30 m (measured with
@@ -946,6 +951,7 @@ class NavigationController:
         self._arc_blocked_timer = 0.0
         self._reverse_recovery_phase = None
         self._reverse_recovery_blocked_time = 0.0
+        self._no_path_recovery_time = 0.0
         self._reverse_recovery_block_anchor_x = None
         self._reverse_recovery_block_anchor_y = None
         self._reverse_recovery_start_x = None
@@ -1045,9 +1051,14 @@ class NavigationController:
             return 0.0, 0.0, False
 
         # Plan periodically so newly observed boxes trigger a prompt detour.
-        need_replan = (not self.path or
-                       (now >= self._replan_hold_until and
-                        now - self._last_replan_time >= self._replan_interval))
+        # The first plan is immediate because _last_replan_time starts at -inf.
+        # When no path exists, retain the same 0.40 s cadence instead of running
+        # A* on every 50 Hz control tick during the five-second recovery wait.
+        replan_due = (
+            now - self._last_replan_time >= self._replan_interval)
+        need_replan = (
+            replan_due
+            and (not self.path or now >= self._replan_hold_until))
         if need_replan:
             self._last_replan_time = now
             new_path = self._try_plan_with_fallback(
@@ -1058,10 +1069,20 @@ class NavigationController:
                 self.path = []
                 self.cur_lin = self.cur_ang = 0.0
                 self.stop_reason = self._format_no_path_reason("no_path")
+                if self._maybe_start_no_path_recovery(
+                        self.stop_reason, base_x, base_y, base_yaw,
+                        laser_msg, now):
+                    self.stop_reason = (
+                        self._recovery_action or "reverse_recovery_start")
                 return 0.0, 0.0, False
 
         if not self.path:
             self.stop_reason = self._format_no_path_reason("no_path")
+            if self._maybe_start_no_path_recovery(
+                    self.stop_reason, base_x, base_y, base_yaw,
+                    laser_msg, now):
+                self.stop_reason = (
+                    self._recovery_action or "reverse_recovery_start")
             return 0.0, 0.0, False
 
         dx = self.nav_goal_x - base_x
@@ -1116,6 +1137,11 @@ class NavigationController:
                 self.cur_lin = self.cur_ang = 0.0
                 self.stop_reason = self._format_no_path_reason(
                     "stuck_no_path")
+                if self._maybe_start_no_path_recovery(
+                        self.stop_reason, base_x, base_y, base_yaw,
+                        laser_msg, now):
+                    self.stop_reason = (
+                        self._recovery_action or "reverse_recovery_start")
                 return 0.0, 0.0, False
             self._consider_new_path(new_path, base_x, base_y, force=True)
 
@@ -1319,6 +1345,7 @@ class NavigationController:
     def _install_path(self, path):
         self.path = path
         if path:
+            self._no_path_recovery_time = 0.0
             self.nav_goal_x, self.nav_goal_y = path[-1]
 
     @staticmethod
@@ -1581,6 +1608,26 @@ class NavigationController:
         if (self._reverse_recovery_blocked_time
                 < self._reverse_recovery_trigger_s):
             return False
+        return self._start_recovery_action(
+            reason, bx, by, byaw, laser_msg, now)
+
+    def _maybe_start_no_path_recovery(
+            self, reason, bx, by, byaw, laser_msg, now):
+        """Start local recovery after five continuous active seconds without A*."""
+        self._recovery_action = None
+        self._no_path_recovery_time += self.dt
+        if self._no_path_recovery_time < self._no_path_recovery_trigger_s:
+            return False
+        started = self._start_recovery_action(
+            reason, bx, by, byaw, laser_msg, now)
+        if started:
+            self._no_path_recovery_time = 0.0
+        return started
+
+    def _start_recovery_action(
+            self, reason, bx, by, byaw, laser_msg, now):
+        """Choose a safe rotate, lateral-waypoint, or reverse action."""
+        self._recovery_action = None
         if now < self._reverse_recovery_cooldown_until:
             return False
         # 先旋转改变朝向找安全方向；旋转搜索耗尽/次数用尽再走倒车。
@@ -1716,6 +1763,7 @@ class NavigationController:
     def _finish_reverse_recovery(self, bx, by, byaw, now):
         """Stop recovery, reset watchdogs and plan from the changed pose."""
         self._reverse_recovery_phase = None
+        self._no_path_recovery_time = 0.0
         self._reverse_recovery_start_x = None
         self._reverse_recovery_start_y = None
         self._reverse_recovery_start_yaw = None
@@ -2279,6 +2327,7 @@ class SupermarketNavigator:
         # snapshot as successful when the goal is eventually reached.
         if (self._cached_path_active
                 and self.controller.stop_reason in {
+                    "rotate_recovery_start",
                     "reverse_recovery_start",
                     "lateral_escape_replan",
                     "rotation_loop",

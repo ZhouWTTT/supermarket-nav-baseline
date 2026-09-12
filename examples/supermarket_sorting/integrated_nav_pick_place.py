@@ -177,10 +177,10 @@ PRODUCT_HALF_HEIGHT_M = {
 HEWEIDAO_PLACE_HALF_HEIGHT_M = 0.0525
 # The original target commanded a few millimetres beyond the geometric table
 # plane.  Heweidao's wide rim (95 mm > 最大张爪 80 mm) 不适合高空自由落体。
-# 最新日志中实际 TCP 比计划高约 17 mm，原 +4 mm 净空仍让杯口悬空，张爪后
-# 杯体继续卡在爪间。把计划底面下压 2 mm，由桌面可靠承托后再慢速垂直抽爪。
+# 在原“底面下压 2 mm”的目标上整体上抬 20 mm，改为杯口底面位于桌面上方
+# 18 mm。这样先在低空把夹爪完全张开，再垂直抽爪，避免继续向桌面施压。
 HEWEIDAO_PLACE_CONTACT_OVERTRAVEL_M = 0.006
-HEWEIDAO_PLACE_RELEASE_RAISE_M = 0.004
+HEWEIDAO_PLACE_RELEASE_RAISE_M = 0.024
 # Keep the wide tapered cup substantially slower than the shared descent, but
 # the latest successful run showed that 0.4 mm/tick spent another 2.36 s on a
 # 38 mm move.  A 0.6 mm/tick cap remains four times gentler than the generic
@@ -281,7 +281,11 @@ PLACE_VERTICAL_CLEAR_TIMEOUT_S = 5.0
 # the same height only drags the cup sideways while it is still between jaws.
 HEWEIDAO_RELEASE_OPEN_MIN_S = 1.0
 HEWEIDAO_RELEASE_OPEN_TIMEOUT_S = 3.0
-HEWEIDAO_RELEASE_GRIP_OPEN_MIN = 0.85
+# MuJoCo gripper actuator ctrlrange is [0, 1].  Command the physical maximum
+# explicitly and do not start the vertical extraction until feedback is very
+# close to that limit.
+HEWEIDAO_RELEASE_GRIP_COMMAND = 1.0
+HEWEIDAO_RELEASE_GRIP_OPEN_MIN = 0.99
 # Normal products used to wait a fixed two seconds after the open command.
 # Joint feedback shows boxes open in 0.14--0.28 s and spheres in about 1.1 s,
 # so leave the configurable dwell as a hard fallback and proceed once the
@@ -4118,8 +4122,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             f"slide={float(measured_slide):.3f}->{target_slide:.3f}")
 
     def _heweidao_place_release_tick(self, now: float) -> None:
-        """Open on the table, then lift vertically off the tapered cup."""
-        self._set_selected_grip(pick.GRIP_OPEN)
+        """Open fully at the low release pose, then lift off the tapered cup."""
+        self._set_selected_grip(HEWEIDAO_RELEASE_GRIP_COMMAND)
         if self._heweidao_release_phase is None:
             self._heweidao_release_phase = "opening"
             self._heweidao_release_phase_started_at = now
