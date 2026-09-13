@@ -63,6 +63,10 @@ def main() -> int:
     parser.add_argument("--confidence", type=float, default=0.90)
     parser.add_argument("--inference-hz", type=float, default=8.0)
     parser.add_argument("--deadline-s", type=float, default=1800.0)
+    parser.add_argument(
+        "--server-acceleration", action="store_true",
+        help="enable render-only Server acceleration (head RGB, 12 FPS, "
+             "batched GS); default keeps the official Server entry point")
     args = parser.parse_args()
 
     for name in (CLIENT_NAME, SERVER_NAME):
@@ -82,6 +86,19 @@ def main() -> int:
         orders = ",".join(f"product_{i:03d}" for i in indexes)
         seed_env = ["-e", f"SUPERMARKET_SEED={args.gui_seed}"]
         obstacle_seed = None
+    acceleration_args = []
+    server_script = (
+        "examples/supermarket_sorting/supermarket_sorting_server.py")
+    if args.server_acceleration:
+        acceleration_args = [
+            "-e", "SUPERMARKET_RGB_CAMERAS=head",
+            "-e", "SUPERMARKET_RENDER_FPS=12",
+            "-e", "SUPERMARKET_GS_SEQUENTIAL=0",
+            "-v", (
+                f"{REPO_ROOT / 'examples/supermarket_sorting/supermarket_sorting_server_render.py'}:"
+                "/tmp/supermarket_sorting_server_render.py:ro"),
+        ]
+        server_script = "/tmp/supermarket_sorting_server_render.py"
     server_args = [
         "docker", "run", "--rm", "-d", "--name", SERVER_NAME,
         "--gpus", "all", "--network", "host", "--ipc", "host",
@@ -99,11 +116,12 @@ def main() -> int:
         "-e", f"TORCH_EXTENSIONS_DIR={TORCH_CACHE}",
         *seed_env,
         "-v", "supermarket_sorting_cache:/root/.cache",
+        *acceleration_args,
         SERVER_IMAGE,
         "bash", "-lc",
         "cd /workspace/supermarket_sorting_task && "
         "source /opt/ros/humble/setup.bash && "
-        "python3 examples/supermarket_sorting/supermarket_sorting_server.py",
+        f"python3 {server_script}",
     ]
     code, out, err = run(server_args, timeout=30.0)
     if code != 0:

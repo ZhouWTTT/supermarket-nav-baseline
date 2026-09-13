@@ -1,15 +1,27 @@
 .git
+.github
 .claude
 .pytest_cache
 **/__pycache__
 **/*.pyc
 **/*.log
+logs
 **/dataset
 **/runs
 *.tar
 *.tar.gz
+*.md
+tests
 
 # The organizer runs the Server in an isolated image. Keep the local Server
-# implementation available for development, but never copy it into the Client
-# submission image.
+# implementation and optional runtime wrappers available for host-side
+# development, but never copy any of them into the Client submission image.
 examples/supermarket_sorting/supermarket_sorting_server.py
+examples/supermarket_sorting/supermarket_sorting_server_display.py
+examples/supermarket_sorting/supermarket_sorting_server_render.py
+
+# These host launchers create/configure Server containers.  The submission
+# image starts only scripts/run_baseline.sh and does not need Server control.
+gui_competition_runner.py
+scripts/run_gui_default_batch.py
+scripts/run_seed4_headless.py

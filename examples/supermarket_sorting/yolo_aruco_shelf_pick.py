@@ -448,11 +448,10 @@ LOWER_RETREAT_DWELL_S = 2.5
 # the measured TCP is clearly south of the shelf front rail.
 GENERIC_RETREAT_TIMEOUT_S = 8.0
 GENERIC_RETREAT_CLEAR_MARGIN_M = 0.02
-# The mobile base is velocity controlled, so publishing zero velocity does not
-# make it rigid against arm contact forces.  During top/middle/lower
-# manipulation keep the measured post-alignment longitudinal pose and yaw with
-# a soft, saturated odometry loop.  This does not gate, pause or replan the arm
-# trajectory.
+# Single-arm shelf manipulation must not turn chassis-pose error into another
+# approach motion: once deploy starts, publish an immediate zero wheel command
+# through withdrawal.  Dual-tissue handling retains the soft odometry loop
+# below because its legacy side extraction has an explicit chassis shift.
 MANIP_BASE_HOLD_LINEAR_KP = 2.0
 MANIP_BASE_HOLD_LINEAR_MAX_MPS = 0.10
 MANIP_BASE_HOLD_LINEAR_DEADBAND_M = 0.003
@@ -460,6 +459,14 @@ MANIP_BASE_HOLD_YAW_KP = 2.0
 MANIP_BASE_HOLD_YAW_MAX_RADPS = 0.30
 MANIP_BASE_HOLD_YAW_DEADBAND_RAD = 0.005
 MANIP_BASE_HOLD_LOG_PERIOD_S = 0.50
+# A zero wheel command cannot cancel a MuJoCo collision impulse.  If the
+# heweidao fingers touch the shelf/rail before closing, the reaction can rotate
+# the whole chassis while the arm controller still reports its relative joint
+# endpoint as reached.  Stop the open-gripper approach before that world-frame
+# error turns into a guaranteed off-centre close.  Normal heweidao runs stay
+# below 1 mm / 0.007 rad; the failed low approach reached 17 mm / 0.085 rad.
+HEWEIDAO_PRE_CLOSE_BASE_DRIFT_ABORT_M = 0.012
+HEWEIDAO_PRE_CLOSE_BASE_YAW_ABORT_RAD = 0.035
 SPHERE_PREGRASP_BACKOFF_M = 0.12
 # The IK endpoint is at the wrist, while the useful finger contact region is
 # behind it along the approach axis.  This top-profile-only transform places
@@ -485,12 +492,15 @@ SPHERE_TERMINAL_SPEED_MPS = 0.060
 SPHERE_TERMINAL_ZONE_M = 0.045
 SPHERE_OPEN_GRIP_DROP_CONTACT = 0.08
 SPHERE_CONTACT_CREEP_SPEED_MPS = 0.020
-# Seat the sphere 30 mm deeper than the generic 50 mm continuation so it is
-# held by the useful inner finger region instead of the tips.  This happens
-# after the sphere is already close enough to roll away from a sharp command,
-# so keep it at the same gentle speed as contact creep.  Generic/cylindrical
-# goods retain their original distance and faster fixed-trajectory setting.
+# Oranges still need the established deep seating motion so they are held by
+# the useful inner finger region instead of the tips.  Apples are smaller and
+# have occasionally been pushed/flicked away while the fully open gripper ran
+# the whole 80 mm continuation.  The latest 20 mm command produced only about
+# 5.5 mm of measured TCP advance before closure, so use 35 mm to absorb that
+# tracking residual while staying well below the old 80 mm motion.  Generic
+# and cylindrical goods retain their original distance and speed settings.
 SPHERE_POST_CONTACT_EXTENSION_M = 0.080
+SPHERE_POST_CONTACT_EXTENSION_BY_KIND_M = {"pingguo": 0.060}
 SPHERE_POST_EXTEND_SPEED_MPS = 0.020
 SPHERE_CONTACT_CREEP_TIMEOUT_S = 1.5
 SPHERE_CREEP_CAPTURE_GRIP_DROP = 0.15
@@ -970,6 +980,14 @@ GENERIC_CLOSE_STAGE1_MIN_S = 0.6
 GENERIC_CLOSE_STAGE1_STABLE_WINDOW_S = 0.35
 GENERIC_CLOSE_STAGE1_STABLE_RANGE = 0.020
 GENERIC_CLOSE_MIN_S = 1.2
+# A stable measured position is normally enough to end the close early.  It is
+# not enough for heweidao: contact with the wide tapered wall leaves feedback
+# near the open limit, so the old 1.2 s gate lifted while the slew-limited close
+# command was still building force.  Hold it stationary at the shelf longer
+# before lift/retreat/flip.
+GENERIC_CLOSE_MIN_BY_KIND_S = {
+    "heweidao": 2.5,
+}
 GENERIC_CLOSE_STABLE_WINDOW_S = 0.5
 GENERIC_CLOSE_STABLE_RANGE = 0.012
 # Generic close is split into two stages: close to a gentle intermediate
@@ -1001,9 +1019,11 @@ GENERIC_TCP_FINGER_CLEARANCE_BY_KIND_M = {
 # 避免指尖落在货架导轨/前缘高度，并对深度测量的偏低误差更宽容。球体
 # 使用下方独立高度策略，不走这个通用抬升。
 GRASP_TCP_Z_RAISE_M = 0.010
-# 球体（苹果/橙子）的目标 TCP 下移到球心下方 5mm，使夹爪落在赤道附近的
-# 最大截面，而不是夹住上半球。顶层另由较低但仍安全的独立净空下限保护。
+# 橙子的目标 TCP 保持在球心下方 5mm。苹果最近一次中层抓取的实测 TCP 比
+# 指令再低 9~15mm，已接近 L2 挡板；将苹果指令提高到球心上方 5mm，以抵消
+# 跟踪下偏，同时仍让实测夹持区域落在球体赤道附近。
 SPHERE_GRASP_TCP_Z_RAISE_M = -0.005
+SPHERE_GRASP_TCP_Z_RAISE_BY_KIND_M = {"pingguo": 0.005}
 # 按货物类型的抓取高度额外偏移（米）：负值降低。可乐、核桃味刀调低 1cm。
 GRASP_TCP_Z_OFFSET_BY_KIND = {"kele": -0.010, "heweidao": -0.010}
 # KDL/仿真运动学的 X 方向执行偏差：普通货物右臂 TCP 实测比指令偏东约
@@ -1017,12 +1037,12 @@ GRASP_TCP_X_OFFSET_BY_ARM = {"r": 0.003, "l": 0.000}
 # 该偏移会同时作用到抓取目标 X 与底盘对齐 X，并叠加在通用右臂 +3mm
 # 补偿（GRASP_TCP_X_OFFSET_BY_ARM）之上。
 # ============================================================================
-SANMINGZHI_GRASP_X_SHIFT_BY_ARM_M = {"l": -0.0085, "r": +0.0085}
+SANMINGZHI_GRASP_X_SHIFT_BY_ARM_M = {"l": -0.005, "r": +0.005}
 GRIPPER_MAX_OPENING_M = 0.080
 GRIP_PRESHAPE_CLEARANCE_M = 0.012
-# 三明治沿用通用预张爪余量（preshape 0.975）：此前收到 0.950 后仍大量出现
-# 爪位停在 0.97 顶沿的情况，恢复到旧版开度以保留足够侧向余量，配合慢速合爪
-# 让爪子落位。
+# 单臂抓取在探入前统一完全张爪，避免宽商品或定位残差让指尖提前碰到货物。
+# 双臂纸巾流程在 STATE_DEPLOY 中使用独立的 DUAL_TISSUE_GRIP_COMMAND，
+# 不受这里的单臂预张策略影响。
 GRIP_PRESHAPE_CLEARANCE_BY_KIND_M = {}
 GRIP_PRESHAPE_REACHED_TOLERANCE = 0.04
 
@@ -1079,14 +1099,9 @@ def dual_tissue_wrist_roll_pair(
 
 
 def grip_preshape_for_kind(target_kind: str) -> float:
-    """Return a geometry-aware open command before approaching a product."""
-    clearance = GRIP_PRESHAPE_CLEARANCE_BY_KIND_M.get(
-        target_kind, GRIP_PRESHAPE_CLEARANCE_M)
-    return float(np.clip(
-        (PRODUCT_GRASP_WIDTH_M[target_kind] + clearance)
-        / GRIPPER_MAX_OPENING_M,
-        GRIP_CLOSE + GENERIC_EMPTY_GRIP_MARGIN,
-        GRIP_OPEN))
+    """Fully open the gripper before every single-arm approach."""
+    del target_kind
+    return float(GRIP_OPEN)
 
 
 def grasp_tcp_x_offset(target_kind: str, grasp_arm: str) -> float:
@@ -1115,9 +1130,12 @@ def dual_tissue_clamp_release_gate(
 
 
 def sphere_grasp_tcp_z(
-        product_center_z: float, shelf_level: str) -> float:
+        product_center_z: float, shelf_level: str,
+        target_kind: str | None = None) -> float:
     """Return the lower, shelf-safe TCP height for a spherical product."""
-    target_z = float(product_center_z) + SPHERE_GRASP_TCP_Z_RAISE_M
+    raise_m = SPHERE_GRASP_TCP_Z_RAISE_BY_KIND_M.get(
+        target_kind, SPHERE_GRASP_TCP_Z_RAISE_M)
+    target_z = float(product_center_z) + raise_m
     if shelf_level == "top":
         target_z = max(
             target_z,
@@ -3262,12 +3280,18 @@ class ShelfPickController(Node):
         self.manip_base_hold_xy = self.base_xy.copy()
         self.manip_base_hold_yaw = float(self.base_yaw)
         self.manip_base_hold_last_log = 0.0
+        hold_mode = (
+            "soft-odometry" if self.use_dual_tissue_grasp else "hard-zero")
+        hold_detail = (
+            f"linear_limit={MANIP_BASE_HOLD_LINEAR_MAX_MPS:.3f}m/s "
+            f"yaw_limit={MANIP_BASE_HOLD_YAW_MAX_RADPS:.3f}rad/s"
+            if self.use_dual_tissue_grasp else
+            "wheel_command=(0.000m/s,0.000rad/s)")
         self.get_logger().info(
             f"[{self.shelf_level}-base-hold] captured reference base="
             f"{np.round(self.manip_base_hold_xy, 4)} "
-            f"yaw={self.manip_base_hold_yaw:.4f}; "
-            f"linear_limit={MANIP_BASE_HOLD_LINEAR_MAX_MPS:.3f}m/s "
-            f"yaw_limit={MANIP_BASE_HOLD_YAW_MAX_RADPS:.3f}rad/s")
+            f"yaw={self.manip_base_hold_yaw:.4f}; mode={hold_mode} "
+            f"{hold_detail}")
 
     def _deploy_base_nudge_retry(self, reason: str) -> bool:
         """部署期 pregrasp 未收敛：向前微调基座并回到 ALIGN 重新解算重试。
@@ -3407,15 +3431,57 @@ class ShelfPickController(Node):
         self._grasp_settle_started_at = self.now()
 
     def apply_manip_base_hold(self) -> None:
-        """Softly oppose top/middle/lower reaction forces; never block the arm."""
+        """Lock single-arm base motion; softly hold legacy dual grasps."""
         active_states = (
             STATE_TISSUE_ROTATE, STATE_DEPLOY, STATE_ARM_FORWARD,
             STATE_POST_EXTEND,
-            STATE_CLOSE, STATE_TRIAL_LIFT, STATE_LIFT)
+            STATE_CLOSE, STATE_TRIAL_LIFT, STATE_LIFT, STATE_RETREAT)
         if (self.shelf_level not in ("top", "middle", "lower")
                 or self.state not in active_states
                 or self.manip_base_hold_xy is None
                 or self.manip_base_hold_yaw is None):
+            return
+        if not self.use_dual_tissue_grasp:
+            # Do not merely slew the previous command toward zero: publish a
+            # hard zero on this tick so odometry-hold corrections cannot push
+            # a loaded finger farther into the shelf board or front posts.
+            self.set_twist(0.0, 0.0)
+            self.cmd_linear = 0.0
+            self.cmd_angular = 0.0
+            now = self.now()
+            drift_xy = self.base_xy - self.manip_base_hold_xy
+            drift_yaw = wrap_to_pi(
+                self.base_yaw - self.manip_base_hold_yaw)
+            heweidao_pre_close = bool(
+                getattr(self, "target_kind", None) == "heweidao"
+                and self.state in {
+                    STATE_DEPLOY, STATE_ARM_FORWARD, STATE_POST_EXTEND})
+            if (heweidao_pre_close
+                    and (np.linalg.norm(drift_xy)
+                         > HEWEIDAO_PRE_CLOSE_BASE_DRIFT_ABORT_M
+                         or abs(drift_yaw)
+                         > HEWEIDAO_PRE_CLOSE_BASE_YAW_ABORT_RAD)):
+                self.get_logger().error(
+                    "[heweidao-base-drift] collision reaction displaced "
+                    "the zero-command chassis before close; stopping the "
+                    "approach and retrying instead of closing off-centre "
+                    f"drift={float(np.linalg.norm(drift_xy)):.4f}m "
+                    f"yaw={drift_yaw:+.4f}rad")
+                if self.pregrasp_arm_joints is not None:
+                    self.set_selected_arm_target(self.pregrasp_arm_joints)
+                if self.grasp_arm == "r":
+                    self.des_right_grip = GRIP_OPEN
+                else:
+                    self.des_left_grip = GRIP_OPEN
+                self.set_state(STATE_ABORT)
+                return
+            if now - self.manip_base_hold_last_log >= (
+                    MANIP_BASE_HOLD_LOG_PERIOD_S):
+                self.manip_base_hold_last_log = now
+                self.get_logger().info(
+                    f"[{self.shelf_level}-base-lock] state={self.state} "
+                    f"drift_world={np.round(drift_xy, 4)}m "
+                    f"drift_yaw={drift_yaw:+.4f}rad command=(0.000,0.000)")
             return
         if (self.shelf_level == "top"
                 and self.use_dual_tissue_grasp
@@ -5355,7 +5421,7 @@ class ShelfPickController(Node):
         """Configure sphere geometry for the selected supported shelf layer."""
         pregrasp_world = self.target_world.copy()
         grasp_tcp_z = sphere_grasp_tcp_z(
-            self.target_world[2], self.shelf_level)
+            self.target_world[2], self.shelf_level, self.target_kind)
         pregrasp_world[2] = grasp_tcp_z
         pregrasp_world[1] -= SPHERE_PREGRASP_BACKOFF_M
         contact_world = self.target_world.copy()
@@ -6696,8 +6762,10 @@ class ShelfPickController(Node):
                 "unavailable; closing at the established sphere point")
             return False
         measured_joints = self.selected_arm_positions().copy()
+        extension_m = SPHERE_POST_CONTACT_EXTENSION_BY_KIND_M.get(
+            self.target_kind, SPHERE_POST_CONTACT_EXTENSION_M)
         extended_world = actual_tcp.copy()
-        extended_world[1] += SPHERE_POST_CONTACT_EXTENSION_M
+        extended_world[1] += extension_m
         try:
             extended_joints = self.solve_kdl_world(
                 extended_world, measured_joints)
@@ -6714,7 +6782,7 @@ class ShelfPickController(Node):
             f"[{self.shelf_level}-sphere-post-extend] prepared from measured "
             f"close point={np.round(actual_tcp, 4)} to "
             f"extended_close={np.round(extended_world, 4)} "
-            f"distance={SPHERE_POST_CONTACT_EXTENSION_M:.3f}m; "
+            f"kind={self.target_kind} distance={extension_m:.3f}m; "
             "gripper remains open")
         return True
 
@@ -7899,7 +7967,8 @@ class ShelfPickController(Node):
                         f"tcp={np.round(self.selected_tcp_world(), 4)}")
                 close_settled = (
                     self.generic_close_stage == 2
-                    and close_elapsed >= GENERIC_CLOSE_MIN_S
+                    and close_elapsed >= GENERIC_CLOSE_MIN_BY_KIND_S.get(
+                        self.target_kind, GENERIC_CLOSE_MIN_S)
                     and gripper_now is not None
                     and self.grip_range(
                         self.generic_close_grip_samples,
@@ -7909,6 +7978,8 @@ class ShelfPickController(Node):
                     gripper = gripper_now
                     effective_close_step = GRIP_CLOSE_MAX_STEP_BY_KIND.get(
                         self.target_kind, GRIP_CLOSE_MAX_STEP)
+                    effective_close_min = GENERIC_CLOSE_MIN_BY_KIND_S.get(
+                        self.target_kind, GENERIC_CLOSE_MIN_S)
                     shallow_limit = GENERIC_CAPTURE_MAX_GRIP_BY_KIND.get(
                         self.target_kind)
                     message = (
@@ -7917,6 +7988,7 @@ class ShelfPickController(Node):
                         f"measured={gripper} command={close_command:.3f} "
                         f"elapsed={close_elapsed:.2f}s "
                         f"stage={self.generic_close_stage} "
+                        f"minimum={effective_close_min:.2f}s "
                         f"close_step={effective_close_step:.3f}rad/tick")
                     if (gripper is not None
                             and gripper

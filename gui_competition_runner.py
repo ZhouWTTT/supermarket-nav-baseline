@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import json
 import os
@@ -191,8 +192,12 @@ def format_cell_details(document: dict[str, Any], key: str) -> str:
 
 
 class LauncherApp:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(
+            self, root: tk.Tk,
+            server_acceleration_default: bool = False) -> None:
         self.root = root
+        self.server_acceleration_default = bool(
+            server_acceleration_default)
         root.title("超市分拣：正式 Runner 与记忆矩阵")
         root.geometry("1120x790")
         root.minsize(900, 650)
@@ -222,7 +227,7 @@ class LauncherApp:
         panel.pack(fill="x", padx=10, pady=(10, 4))
 
         self.count_var = tk.IntVar(value=5)
-        self.seed_var = tk.StringVar()
+        self.seed_var = tk.StringVar(value="4")
         self.tasks_var = tk.StringVar()
         self.cycles_var = tk.IntVar(value=2)
         self.attempts_var = tk.IntVar(value=2)
@@ -237,11 +242,15 @@ class LauncherApp:
 
         self.obstacles_var = tk.BooleanVar(value=True)
         self.sim_window_var = tk.BooleanVar(value=True)
+        self.smooth_recording_var = tk.BooleanVar(value=True)
+        self.server_acceleration_var = tk.BooleanVar(
+            value=self.server_acceleration_default)
         self.yolo_window_var = tk.BooleanVar(value=False)
         self.record_everywhere_var = tk.BooleanVar(value=True)
         self.perception_always_var = tk.BooleanVar(value=True)
         self.dynamic_direct_var = tk.BooleanVar(value=True)
         self.close_recheck_var = tk.BooleanVar(value=True)
+        self.demo_navigation_stall_var = tk.BooleanVar(value=False)
 
         first = ttk.Frame(panel)
         first.pack(fill="x")
@@ -312,6 +321,14 @@ class LauncherApp:
             third, text="仿真窗口", variable=self.sim_window_var,
         ).pack(side="left", padx=(0, 10))
         ttk.Checkbutton(
+            third, text="流畅录制（头部视角）",
+            variable=self.smooth_recording_var,
+        ).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(
+            third, text="Server加速（仅头相机/12FPS）",
+            variable=self.server_acceleration_var,
+        ).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(
             third, text="YOLO窗口", variable=self.yolo_window_var,
         ).pack(side="left")
 
@@ -329,6 +346,10 @@ class LauncherApp:
         ttk.Checkbutton(
             fourth, text="ArUco优先近距复核（YOLO兜底）",
             variable=self.close_recheck_var,
+        ).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(
+            fourth, text="演示导航卡死",
+            variable=self.demo_navigation_stall_var,
         ).pack(side="left")
 
         buttons = ttk.Frame(panel)
@@ -504,7 +525,7 @@ class LauncherApp:
             messagebox.showerror("Docker 不可用", "宿主机未找到 docker 命令。")
             return False
         try:
-            self._seed()
+            seed = self._seed()
             values = (
                 self.cycles_var.get(), self.attempts_var.get(),
                 self.confirmations_var.get(), self.memory_conf_var.get(),
@@ -528,6 +549,19 @@ class LauncherApp:
         if not 0.0 <= float(values[3]) <= 1.0:
             messagebox.showerror("配置无效", "记忆置信度必须位于 0 到 1。")
             return False
+        if self.demo_navigation_stall_var.get():
+            if seed != 4:
+                messagebox.showerror(
+                    "演示配置无效",
+                    "演示导航卡死需要将随机种子固定为 4。",
+                )
+                return False
+            if not self.obstacles_var.get():
+                messagebox.showerror(
+                    "演示配置无效",
+                    "演示导航卡死需要开启随机障碍物。",
+                )
+                return False
         return True
 
     @staticmethod
@@ -536,6 +570,9 @@ class LauncherApp:
             run_command(["xhost", "+local:docker"], timeout=3.0)
 
     def _server_args(self) -> list[str]:
+        sensor_display = bool(
+            self.sim_window_var.get() and self.smooth_recording_var.get())
+        server_acceleration = bool(self.server_acceleration_var.get())
         args = [
             "docker", "run", "--rm", "-d", "--name", SERVER_NAME,
             "--gpus", "all", "--network", "host", "--ipc", "host",
@@ -548,9 +585,12 @@ class LauncherApp:
                 "-e", f"DISPLAY={os.environ.get('DISPLAY', '')}",
                 "-e", "MUJOCO_GL=glfw",
                 "-e", "SUPERMARKET_HEADLESS=0",
-                "-e", "SUPERMARKET_DISPLAY_CAMERA=top_gs",
                 "-v", "/tmp/.X11-unix:/tmp/.X11-unix:rw",
             ])
+            if sensor_display:
+                args.extend([
+                    "-e", "SUPERMARKET_DISPLAY_CAMERA_ID=0",
+                ])
         else:
             args.extend(["-e", "MUJOCO_GL=egl", "-e", "SUPERMARKET_HEADLESS=1"])
         args.extend([
@@ -562,19 +602,47 @@ class LauncherApp:
             "-e", f"SUPERMARKET_TASKS={','.join(self._tasks())}",
             "-e", f"TORCH_EXTENSIONS_DIR={TORCH_CACHE}",
         ])
+        if server_acceleration:
+            args.extend([
+                "-e", "SUPERMARKET_RGB_CAMERAS=head",
+                "-e", "SUPERMARKET_RENDER_FPS=12",
+                "-e", "SUPERMARKET_GS_SEQUENTIAL=0",
+            ])
         seed = self._seed()
         if seed is not None:
             args.extend(["-e", f"SUPERMARKET_SEED={seed}"])
-        obstacle_seed = os.environ.get("SUPERMARKET_OBSTACLE_SEED", "").strip()
+        # The recording fault targets a real box in the layout derived from
+        # product seed 4. Pin its derived obstacle seed as well so an ambient
+        # override cannot silently move the box away from the scripted path.
+        obstacle_seed = (
+            "1000007" if self.demo_navigation_stall_var.get() else
+            os.environ.get("SUPERMARKET_OBSTACLE_SEED", "").strip())
         if obstacle_seed:
             args.extend(["-e", f"SUPERMARKET_OBSTACLE_SEED={obstacle_seed}"])
+        if server_acceleration:
+            wrapper_name = "supermarket_sorting_server_render.py"
+        elif sensor_display:
+            wrapper_name = "supermarket_sorting_server_display.py"
+        else:
+            wrapper_name = None
+        if wrapper_name is not None:
+            args.extend([
+                "-v", (
+                    f"{REPO_ROOT / 'examples/supermarket_sorting' / wrapper_name}:"
+                    f"/tmp/{wrapper_name}:ro"),
+            ])
+            server_script = f"/tmp/{wrapper_name}"
+        else:
+            server_script = (
+                "examples/supermarket_sorting/"
+                "supermarket_sorting_server.py")
         args.extend([
             "-v", "supermarket_sorting_cache:/root/.cache",
             SERVER_IMAGE,
             "bash", "-lc",
             "cd /workspace/supermarket_sorting_task && "
             "source /opt/ros/humble/setup.bash && "
-            "python3 examples/supermarket_sorting/supermarket_sorting_server.py",
+            f"python3 {server_script}",
         ])
         return args
 
@@ -598,6 +666,8 @@ class LauncherApp:
             (self.record_everywhere_var.get(), "--record-everywhere"),
             (self.perception_always_var.get(), "--perception-always-on"),
             (self.yolo_window_var.get(), "--show"),
+            (self.demo_navigation_stall_var.get(),
+             "--demo-navigation-stall"),
         ):
             if enabled:
                 runner.append(flag)
@@ -945,9 +1015,21 @@ class LauncherApp:
         self.root.destroy()
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Launch the supermarket Server/Runner control GUI")
+    parser.add_argument(
+        "--server-acceleration", action="store_true",
+        help="start the GUI with optional render-only Server acceleration "
+             "enabled (head RGB only, 12 FPS, batched GS rendering)")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     root = tk.Tk()
-    LauncherApp(root)
+    LauncherApp(
+        root, server_acceleration_default=args.server_acceleration)
     root.mainloop()
 
 

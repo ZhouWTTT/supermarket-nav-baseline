@@ -80,7 +80,6 @@ def configure_display_camera(node):
         "operator": "diagnostic_operator",
         "follow": "diagnostic_follow",
         "top": "diagnostic_top",
-        "top_gs": "diagnostic_top",
         "top_dual": "diagnostic_top",
         "left": "lft_handeye",
         "right": "rgt_handeye",
@@ -97,7 +96,7 @@ def configure_display_camera(node):
         try:
             camera_id = node.camera_names.index(selected)
         except ValueError as exc:
-            valid = "free, operator, follow, top, top_gs, top_dual, head, left, right, " + ", ".join(node.camera_names)
+            valid = "free, operator, follow, top, top_dual, head, left, right, " + ", ".join(node.camera_names)
             raise ValueError(
                 f"Unknown SUPERMARKET_DISPLAY_CAMERA={requested!r}; valid values: {valid}"
             ) from exc

@@ -885,6 +885,10 @@ class NavigationController:
         # Replanning/progress state
         self._last_replan_time = float('-inf')
         self._replan_interval = 0.40
+        # A failed full-map A* search is substantially more expensive than a
+        # normal path-validity update.  Leave a full second for fresh ROS
+        # feedback and lidar clearing before retrying an empty path.
+        self._no_path_replan_interval = 1.00
         self._replan_hold_until = float('-inf')
         self._path_improvement_ratio = 0.02
         self._best_goal_dist = float('inf')
@@ -1045,9 +1049,18 @@ class NavigationController:
             return 0.0, 0.0, False
 
         # Plan periodically so newly observed boxes trigger a prompt detour.
-        need_replan = (not self.path or
-                       (now >= self._replan_hold_until and
-                        now - self._last_replan_time >= self._replan_interval))
+        # An empty path must obey a longer interval after its first attempt.
+        # Otherwise a disconnected costmap runs a full A* search on every
+        # control tick, starving ROS feedback callbacks precisely when fresh
+        # lidar/odometry is needed to clear the transient obstacle layer.
+        first_plan = not math.isfinite(self._last_replan_time)
+        replan_interval = (
+            self._replan_interval
+            if self.path else self._no_path_replan_interval)
+        need_replan = (
+            first_plan
+            or (now >= self._replan_hold_until
+                and now - self._last_replan_time >= replan_interval))
         if need_replan:
             self._last_replan_time = now
             new_path = self._try_plan_with_fallback(
@@ -1055,14 +1068,14 @@ class NavigationController:
             if new_path is not None:
                 self._consider_new_path(new_path, base_x, base_y)
             elif not self.path or not self._path_valid(base_x, base_y):
-                self.path = []
-                self.cur_lin = self.cur_ang = 0.0
-                self.stop_reason = self._format_no_path_reason("no_path")
-                return 0.0, 0.0, False
+                return self._no_path_stop(
+                    "no_path", base_x, base_y, base_yaw,
+                    laser_msg, now)
 
         if not self.path:
-            self.stop_reason = self._format_no_path_reason("no_path")
-            return 0.0, 0.0, False
+            return self._no_path_stop(
+                "no_path", base_x, base_y, base_yaw,
+                laser_msg, now)
 
         dx = self.nav_goal_x - base_x
         dy = self.nav_goal_y - base_y
@@ -1112,11 +1125,9 @@ class NavigationController:
             self._last_progress_time = now
             self._best_goal_dist = dist_to_goal
             if new_path is None:
-                self.path = []
-                self.cur_lin = self.cur_ang = 0.0
-                self.stop_reason = self._format_no_path_reason(
-                    "stuck_no_path")
-                return 0.0, 0.0, False
+                return self._no_path_stop(
+                    "stuck_no_path", base_x, base_y, base_yaw,
+                    laser_msg, now)
             self._consider_new_path(new_path, base_x, base_y, force=True)
 
         lookahead = self._lookahead_dist(base_x, base_y, dist_to_goal)
@@ -1241,8 +1252,9 @@ class NavigationController:
 
         # ── no-path guard ──
         if not self.path and v == 0.0 and w == 0.0:
-            new_reason = new_reason or self._format_no_path_reason(
-                "no_path")
+            return self._no_path_stop(
+                "no_path", base_x, base_y, base_yaw,
+                laser_msg, now)
 
         self.stop_reason = new_reason
         if self._maybe_start_reverse_recovery(
@@ -1254,6 +1266,25 @@ class NavigationController:
         return v, w, False
 
     # ---- helpers ----
+    def _no_path_stop(self, prefix, bx, by, byaw, laser_msg, now):
+        """Stop for A* failure while still allowing bounded local recovery.
+
+        All no-path exits funnel through this method.  Previously the early
+        returns above bypassed ``_maybe_start_reverse_recovery`` entirely, so
+        a transient lidar barrier could leave the base publishing zero speed
+        forever.  Recovery remains confined to the randomized obstacle
+        corridor and retains the existing footprint/rear-clearance guards.
+        """
+        self.path = []
+        self.cur_lin = self.cur_ang = 0.0
+        reason = self._format_no_path_reason(prefix)
+        self.stop_reason = reason
+        if self._maybe_start_reverse_recovery(
+                reason, bx, by, byaw, laser_msg, now):
+            self.stop_reason = (
+                self._recovery_action or "reverse_recovery_start")
+        return 0.0, 0.0, False
+
     def _try_plan_with_fallback(self, bx, by, gx, gy):
         """Plan with full costmap; fall back to lidar-only on failure.
 
@@ -1538,6 +1569,11 @@ class NavigationController:
         """Enter measured straight backup after a persistent local block."""
         self._recovery_action = None
         recoverable = {"lidar_stop", "arc_blocked", "rotation_loop"}
+        corridor_no_path = bool(
+            isinstance(reason, str)
+            and (reason.startswith("no_path")
+                 or reason.startswith("stuck_no_path"))
+            and self._in_obstacle_corridor(bx, by))
         # 近障碍处的 heading_alignment 是"被夹住转不开"：狭窄通道/走廊内
         # 原地转向被前后障碍顶住（实测走廊里 lidar≈0.30m、w=2.0 全力转
         # 35s 只转 3°）。此时需要倒退脱困后重规划；开阔地的大转角对齐是
@@ -1547,7 +1583,7 @@ class NavigationController:
                 self.lidar_clearance, self.depth_clearance_val)
             if composite < self._heading_alignment_recover_dist:
                 recoverable = recoverable | {"heading_alignment"}
-        if reason not in recoverable:
+        if reason not in recoverable and not corridor_no_path:
             self._reverse_recovery_blocked_time = max(
                 0.0,
                 self._reverse_recovery_blocked_time - 2.0 * self.dt)

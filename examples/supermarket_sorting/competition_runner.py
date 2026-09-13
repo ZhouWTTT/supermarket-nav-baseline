@@ -356,6 +356,8 @@ class CompetitionRunner(Node):
             command.append("--no-close-recheck")
         if self.args.perception_always_on:
             command.append("--perception-always-on")
+        if self.args.demo_navigation_stall:
+            command.append("--demo-navigation-stall")
         # The first physically delivered item occupies slot zero.  Keep that
         # worker alive after placement so it travels back to shelf A before
         # the next order starts — the second worker therefore begins from the
@@ -1145,6 +1147,10 @@ def parse_args() -> argparse.Namespace:
         "--perception-always-on", action="store_true",
         help="keep persistent or worker-local perception enabled throughout "
              "the match")
+    parser.add_argument(
+        "--demo-navigation-stall", action="store_true",
+        help="recording aid for GUI seed 4: make loaded delivery workers "
+             "rotate and remain stuck at a real obstacle")
     parser.add_argument(
         "--order-timeout", type=float, default=300.0,
         help="per-order timeout in seconds; 0 disables it (default: 300)")

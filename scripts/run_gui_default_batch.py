@@ -16,6 +16,7 @@ For each requested seed it:
 Usage::
 
     python3 scripts/run_gui_default_batch.py --seeds 101,202,303
+    python3 scripts/run_gui_default_batch.py --server-acceleration
 """
 
 from __future__ import annotations
@@ -77,7 +78,22 @@ def cleanup():
         run(["docker", "rm", "-f", name], timeout=20.0)
 
 
-def start_server(seed: int, orders: str):
+def start_server(
+        seed: int, orders: str,
+        server_acceleration: bool = False):
+    acceleration_args = []
+    server_script = (
+        "examples/supermarket_sorting/supermarket_sorting_server.py")
+    if server_acceleration:
+        acceleration_args = [
+            "-e", "SUPERMARKET_RGB_CAMERAS=head",
+            "-e", "SUPERMARKET_RENDER_FPS=12",
+            "-e", "SUPERMARKET_GS_SEQUENTIAL=0",
+            "-v", (
+                f"{REPO_ROOT / 'examples/supermarket_sorting/supermarket_sorting_server_render.py'}:"
+                "/tmp/supermarket_sorting_server_render.py:ro"),
+        ]
+        server_script = "/tmp/supermarket_sorting_server_render.py"
     server_args = [
         "docker", "run", "--rm", "-d", "--name", SERVER_NAME,
         "--gpus", "all", "--network", "host", "--ipc", "host",
@@ -95,11 +111,12 @@ def start_server(seed: int, orders: str):
         "-e", f"SUPERMARKET_TASKS={orders}",
         "-e", f"TORCH_EXTENSIONS_DIR={TORCH_CACHE}",
         "-v", "supermarket_sorting_cache:/root/.cache",
+        *acceleration_args,
         SERVER_IMAGE,
         "bash", "-lc",
         "cd /workspace/supermarket_sorting_task && "
         "source /opt/ros/humble/setup.bash && "
-        "python3 examples/supermarket_sorting/supermarket_sorting_server.py",
+        f"python3 {server_script}",
     ]
     return run(server_args, timeout=40.0)
 
@@ -192,7 +209,9 @@ def save_logs(dest: Path):
         (dest / out).write_text(logs + ("\n--- stderr ---\n" + err if err else ""))
 
 
-def run_one(seed: int, out_root: Path, deadline_s: float) -> dict:
+def run_one(
+        seed: int, out_root: Path, deadline_s: float,
+        server_acceleration: bool = False) -> dict:
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     dest = out_root / f"{stamp}_seed{seed}"
     orders = generate_tasks(COUNT, seed)
@@ -200,7 +219,8 @@ def run_one(seed: int, out_root: Path, deadline_s: float) -> dict:
 
     cleanup()
     baseline = newest_summary_baseline()
-    code, _out, err = start_server(seed, orders)
+    code, _out, err = start_server(
+        seed, orders, server_acceleration=server_acceleration)
     if code != 0:
         print(f"[seed {seed}] server start failed: {err}", flush=True)
         cleanup()
@@ -237,6 +257,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds", default="101,202,303,404,505,606,707")
     parser.add_argument("--deadline-s", type=float, default=1500.0)
+    parser.add_argument(
+        "--server-acceleration", action="store_true",
+        help="enable render-only Server acceleration (head RGB, 12 FPS, "
+             "batched GS); default keeps the official Server entry point")
     parser.add_argument("--out", default=str(REPO_ROOT / "logs" / "gui_default_batch"))
     args = parser.parse_args()
 
@@ -248,7 +272,9 @@ def main() -> int:
     for i, seed in enumerate(seeds, 1):
         print(f"=== run {i}/{len(seeds)} seed {seed} "
               f"{dt.datetime.now():%F %T} ===", flush=True)
-        res = run_one(seed, out_root, args.deadline_s)
+        res = run_one(
+            seed, out_root, args.deadline_s,
+            server_acceleration=args.server_acceleration)
         results.append(res)
         print(f"[seed {seed}] result: {json.dumps(res, ensure_ascii=False)}",
               flush=True)
