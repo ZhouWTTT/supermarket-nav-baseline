@@ -485,23 +485,23 @@ SPHERE_RADIUS_M = {"pingguo": 0.035, "chengzi": 0.037}
 # centre (15 mm for an apple, 17 mm for an orange), while placing the fingers
 # farther around the near hemisphere before the fixed second extension.
 SPHERE_FINGER_ENGAGEMENT_M = 0.020
-# 球体取货前伸速度：主段适当提高，接近接触的终段慢速区和接触蠕行保持
-# 原值，保证夹持稳定。
-SPHERE_FAST_SPEED_MPS = 0.14
-SPHERE_TERMINAL_SPEED_MPS = 0.060
+# 球体取货的主段、接近接触的终段、接触蠕行和接触后继续前伸统一限速
+# 0.030 m/s，避免各阶段切换时出现速度突变。
+SPHERE_FAST_SPEED_MPS = 0.030
+SPHERE_TERMINAL_SPEED_MPS = 0.030
 SPHERE_TERMINAL_ZONE_M = 0.045
 SPHERE_OPEN_GRIP_DROP_CONTACT = 0.08
-SPHERE_CONTACT_CREEP_SPEED_MPS = 0.020
+SPHERE_CONTACT_CREEP_SPEED_MPS = 0.030
 # Oranges still need the established deep seating motion so they are held by
 # the useful inner finger region instead of the tips.  Apples are smaller and
 # have occasionally been pushed/flicked away while the fully open gripper ran
 # the whole 80 mm continuation.  The latest 20 mm command produced only about
 # 5.5 mm of measured TCP advance before closure, so use 35 mm to absorb that
-# tracking residual while staying well below the old 80 mm motion.  Generic
-# and cylindrical goods retain their original distance and speed settings.
+# tracking residual while staying well below the old 80 mm motion.  Product-
+# specific extension distances remain unchanged; only the speed is unified.
 SPHERE_POST_CONTACT_EXTENSION_M = 0.080
 SPHERE_POST_CONTACT_EXTENSION_BY_KIND_M = {"pingguo": 0.060}
-SPHERE_POST_EXTEND_SPEED_MPS = 0.020
+SPHERE_POST_EXTEND_SPEED_MPS = 0.030
 SPHERE_CONTACT_CREEP_TIMEOUT_S = 1.5
 SPHERE_CREEP_CAPTURE_GRIP_DROP = 0.15
 SPHERE_CREEP_MIN_ADVANCE_M = 0.002
@@ -575,22 +575,15 @@ LIFT_AMOUNT_M = 0.06
 # Generic goods use one fixed trajectory after visual localisation.  The
 # controller solves the contact endpoint once, then plays a monotonic eased
 # joint interpolation without measured-TCP correction, convergence gates, or
-# replanning.  Keeping the peak Cartesian-equivalent speed low prevents light
-# goods from being struck while eliminating feedback-induced shaking.
-# Established generic/sphere paths tolerate 0.090 m/s: runs at 0.050~0.080
-# completed with no grasp error, and the fixed trajectory stays well below
-# speeds that pushed goods. Thin sandwiches use their dedicated 0.036 m/s
-# approach below so their open fingers still have time to settle laterally.
-GENERIC_DIRECT_FORWARD_SPEED_MPS = 0.090
+# replanning.  All single-arm goods now share a 0.030 m/s peak Cartesian-
+# equivalent speed; tissue keeps its separate dual-arm profile below.
+GENERIC_DIRECT_FORWARD_SPEED_MPS = 0.030
 GENERIC_DIRECT_FORWARD_SPEED_BY_KIND_MPS = {
-    "sanmingzhi": 0.036,
-    # heweidao 的夹持余量很小（实测合爪后爪位仍≈1.0，靠开张限位卡住杯体），
-    # 快前伸/快张爪会把杯子推离原位导致运输中滑脱；恢复旧版已验证的
-    # 0.050 前伸速度。
-    "heweidao": 0.050,
+    "sanmingzhi": 0.030,
+    "heweidao": 0.030,
 }
-# 接触后 50 mm 的“张爪继续前伸”段在 0.090 m/s 下插值时长约 0.83 s；最短
-# 时长压到 1.2 s 仍保留平滑缓动与稳定窗口。
+# 接触后“张爪继续前伸”段仍保留最短 1.2 s 插值时长，
+# 距离较长时由 0.030 m/s 峰值限速自动延长。
 GENERIC_DIRECT_FORWARD_MIN_DURATION_S = 1.2
 GENERIC_DIRECT_FORWARD_MIN_DURATION_BY_KIND_S = {
     # 三明治沿用旧 2.5 s：开爪横向稳定需要时间。
