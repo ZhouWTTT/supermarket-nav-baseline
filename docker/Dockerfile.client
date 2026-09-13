@@ -1,5 +1,8 @@
 FROM crpi-1pzq998p9m7w0auy.cn-hangzhou.personal.cr.aliyuncs.com/challengecup/supermarket_sorting_final:client
 
+LABEL org.opencontainers.image.title="Supermarket Sorting Client" \
+      org.opencontainers.image.description="Client-only submission compatible with the unmodified organizer Server"
+
 WORKDIR /workspace/baseline
 COPY . /workspace/baseline
 
