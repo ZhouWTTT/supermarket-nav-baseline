@@ -3,7 +3,7 @@
 
 Runs INSIDE the Docker container (needs gsplat + discoverse + a GPU).  Builds
 the retail_competition scene with the 3D Gaussian Splatting renderer on (same
-config path as supermarket_sorting_server.build_config), places the MMK2 camera
+config path as the retail_competition scene builder), places the MMK2 camera
 near the shelf row, renders the head camera, and auto-labels visible products.
 
 Auto-labelling (no manual boxes)
@@ -95,7 +95,7 @@ BOX_HALF_BY_KIND = {
 
 
 # ---------------------------------------------------------------------------
-# scene construction (mirrors supermarket_sorting_server.build_config)
+# scene construction (mirrors the retail_competition scene config)
 # ---------------------------------------------------------------------------
 def _local_robot_gs_model_dict():
     out = {}

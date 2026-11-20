@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
-"""Optional render acceleration for the image-owned competition Server.
+"""Render-only runtime overrides for the organizer's supermarket Server.
 
-This wrapper deliberately changes only the Server render workload:
+This wrapper loads the Server implementation already present in the image and
+changes only the render workload (which sensor cameras are rendered, FPS and
+GS sequential order), plus an optional cheaper MuJoCo display.  It deliberately
+does NOT touch wheel control/tracking, so chassis dynamics stay official.
 
-* publish selected RGB observation cameras (accelerated default: head only),
-* render them at a configurable FPS (accelerated default: 12),
-* allow batched/non-sequential Gaussian rendering.
-
-Physics stepping, wheel control, task randomisation, referee state and lidar
-remain owned by the official Server module in the container.  Launchers select
-this wrapper only when their explicit ``server acceleration`` option is on;
-otherwise they execute the official entry point directly.
+Purpose: the organizer Server defaults to rendering head+left+right 3DGS
+cameras at 640x480, which can exceed an 8 GB GPU.  Publishing only the head
+camera (the one the client perception consumes) removes the two extra GS
+passes and avoids CUDA out of memory.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import math
 import os
 from pathlib import Path
 import sys
+
+import numpy as np
 
 
 OFFICIAL_SERVER = Path(
@@ -28,24 +28,18 @@ OFFICIAL_SERVER = Path(
 CAMERA_IDS = {"head": 0, "left": 1, "right": 2}
 
 
-def env_flag(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return bool(default)
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def positive_env_float(name: str, default: float) -> float:
     value = os.getenv(name)
     result = float(default if value is None else value)
-    if not math.isfinite(result) or result <= 0.0:
+    if result <= 0.0:
         raise ValueError(
             f"{name} must be a positive finite number, got {value!r}")
     return result
 
 
 def sensor_camera_ids() -> list[int]:
-    spec = os.getenv("SUPERMARKET_RGB_CAMERAS", "head").strip().lower()
+    spec = os.getenv(
+        "SUPERMARKET_RGB_CAMERAS", "head,left,right").strip().lower()
     names = [item.strip() for item in spec.split(",") if item.strip()]
     unknown = [name for name in names if name not in CAMERA_IDS]
     if unknown:
@@ -57,7 +51,7 @@ def sensor_camera_ids() -> list[int]:
         camera_id = CAMERA_IDS[name]
         if camera_id not in camera_ids:
             camera_ids.append(camera_id)
-    if CAMERA_IDS["head"] not in camera_ids:
+    if 0 not in camera_ids:
         raise ValueError(
             "SUPERMARKET_RGB_CAMERAS must include head for perception")
     return camera_ids
@@ -65,63 +59,129 @@ def sensor_camera_ids() -> list[int]:
 
 def load_official_server():
     if not OFFICIAL_SERVER.is_file():
-        raise FileNotFoundError(f"official Server not found: {OFFICIAL_SERVER}")
+        raise FileNotFoundError(
+            f"organizer Server not found: {OFFICIAL_SERVER}")
     sys.path.insert(0, str(OFFICIAL_SERVER.parent))
     spec = importlib.util.spec_from_file_location(
-        "official_supermarket_sorting_server", OFFICIAL_SERVER)
+        "organizer_supermarket_sorting_server", OFFICIAL_SERVER)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load official Server: {OFFICIAL_SERVER}")
+        raise RuntimeError(f"cannot load organizer Server: {OFFICIAL_SERVER}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
 def install_render_overrides(server) -> None:
-    """Install render-only overrides on an imported official Server module."""
     original_build_config = server.build_config
     original_init = server.TaskMMK2ROS2.__init__
+    original_render = server.TaskMMK2ROS2.render
 
     def build_config():
         config = original_build_config()
         config.obs_rgb_cam_id = sensor_camera_ids()
         config.render_set = dict(config.render_set)
         config.render_set["fps"] = positive_env_float(
-            "SUPERMARKET_RENDER_FPS", 12.0)
-        config.gs_render_sequential = env_flag(
-            "SUPERMARKET_GS_SEQUENTIAL", False)
+            "SUPERMARKET_RENDER_FPS", float(config.render_set["fps"]))
+        config.gs_render_sequential = os.getenv(
+            "SUPERMARKET_GS_SEQUENTIAL", "1").strip().lower() in {
+                "1", "true", "yes", "on"}
         print(
-            "[server-acceleration] enabled: "
-            f"rgb_cameras={config.obs_rgb_cam_id} "
-            f"depth_cameras={config.obs_depth_cam_id} "
-            f"fps={config.render_set['fps']:g} "
-            f"gs_sequential={int(config.gs_render_sequential)}; "
-            "physics_and_control=official")
+            "[server-render] render profile: "
+            f"rgb_cameras={config.obs_rgb_cam_id} depth_cameras="
+            f"{config.obs_depth_cam_id} fps={config.render_set['fps']:g} "
+            f"gs_sequential={int(config.gs_render_sequential)}")
         return config
 
-    def init_with_optional_sensor_display(self, config):
+    def init_with_render_display(self, config):
         original_init(self, config)
-        display_camera = os.getenv("SUPERMARKET_DISPLAY_CAMERA_ID")
-        if display_camera is None:
-            return
-        camera_id = int(display_camera)
-        rgb_camera_ids = tuple(config.obs_rgb_cam_id or ())
-        if camera_id not in rgb_camera_ids:
-            raise ValueError(
-                "display camera must already be an RGB observation camera; "
-                f"got {camera_id}, available={rgb_camera_ids}")
-        if not 0 <= camera_id < len(self.camera_names):
-            raise ValueError(
-                f"display camera id {camera_id} outside camera list "
-                f"0..{len(self.camera_names) - 1}")
-        self.cam_id = camera_id
-        self.camera_pose_changed = True
+        # A GUI window otherwise asks the GS renderer for an additional free
+        # camera.  Keep the window, but draw its diagnostic view with the much
+        # cheaper MuJoCo renderer while sensor cameras retain 3DGS.
+        self.force_mujoco_display = os.getenv(
+            "SUPERMARKET_FAST_MUJOCO_DISPLAY", "0").strip().lower() in {
+                "1", "true", "yes", "on"}
         print(
-            "[server-acceleration] display reuses sensor frame: "
-            f"camera={self.camera_names[camera_id]} id={camera_id} "
-            "additional_gs_pass=0")
+            "[server-render] nonblocking_display="
+            f"{int(self.force_mujoco_display)}")
+
+    def render_with_nonblocking_display(self):
+        """Render sensors once, then draw a display without another GS pass.
+
+        Temporarily hides the display window so the GS batch contains exactly
+        the configured sensor cameras, then draws the display from the already
+        rendered sensor image with MuJoCo/OpenGL.  Perception topics keep the
+        3DGS images.
+        """
+        fast_display = bool(
+            getattr(self, "force_mujoco_display", False)
+            and not self.config.headless
+            and self.window is not None)
+        if not fast_display:
+            return original_render(self)
+
+        import cv2
+        import glfw
+        from OpenGL import GL as gl
+
+        display_window = self.window
+        self.window = None
+        try:
+            original_render(self)
+        finally:
+            self.window = display_window
+
+        try:
+            if glfw.window_should_close(display_window):
+                self.running = False
+                return
+
+            window_width, window_height = self.get_current_window_size()
+            depth_mode = self.renderer._depth_rendering
+            if not depth_mode:
+                img_vis = self.img_rgb_obs_s.get(self.cam_id)
+                if img_vis is None:
+                    self.update_renderer_window_size(
+                        window_width, window_height)
+                    img_vis = self.getRgbImg(self.cam_id)
+            else:
+                img_depth = self.img_depth_obs_s.get(self.cam_id)
+                if img_depth is None:
+                    self.update_renderer_window_size(
+                        window_width, window_height)
+                    img_depth = self.getDepthImg(self.cam_id)
+                img_vis = (
+                    None if img_depth is None else cv2.applyColorMap(
+                        cv2.convertScaleAbs(
+                            img_depth,
+                            alpha=255.0 / self.config.max_render_depth),
+                        cv2.COLORMAP_JET))
+
+            if (img_vis is not None
+                    and (img_vis.shape[1], img_vis.shape[0])
+                    != (window_width, window_height)):
+                img_vis = cv2.resize(
+                    img_vis, (window_width, window_height),
+                    interpolation=cv2.INTER_LINEAR)
+
+            glfw.make_context_current(display_window)
+            fb_width, fb_height = glfw.get_framebuffer_size(display_window)
+            gl.glViewport(0, 0, fb_width, fb_height)
+            gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+            if img_vis is not None:
+                img_vis = np.ascontiguousarray(img_vis[::-1])
+                gl.glWindowPos2i(0, 0)
+                gl.glDrawPixels(
+                    img_vis.shape[1], img_vis.shape[0], gl.GL_RGB,
+                    gl.GL_UNSIGNED_BYTE, img_vis.tobytes())
+            glfw.swap_buffers(display_window)
+            glfw.poll_events()
+        except Exception as exc:  # noqa: BLE001
+            # Sensor publication must continue even if the display fails.
+            print(f"[server-render] display render error: {exc}")
 
     server.build_config = build_config
-    server.TaskMMK2ROS2.__init__ = init_with_optional_sensor_display
+    server.TaskMMK2ROS2.__init__ = init_with_render_display
+    server.TaskMMK2ROS2.render = render_with_nonblocking_display
 
 
 def main() -> None:

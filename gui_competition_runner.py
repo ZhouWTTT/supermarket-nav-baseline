@@ -325,7 +325,7 @@ class LauncherApp:
             variable=self.smooth_recording_var,
         ).pack(side="left", padx=(0, 10))
         ttk.Checkbutton(
-            third, text="Server加速（仅头相机/12FPS）",
+            third, text="Server加速（仅头相机/12FPS/低显存）",
             variable=self.server_acceleration_var,
         ).pack(side="left", padx=(0, 10))
         ttk.Checkbutton(
@@ -587,7 +587,13 @@ class LauncherApp:
                 "-e", "SUPERMARKET_HEADLESS=0",
                 "-v", "/tmp/.X11-unix:/tmp/.X11-unix:rw",
             ])
-            if sensor_display:
+            if server_acceleration:
+                # Reuse the already-rendered head sensor frame in the GUI
+                # instead of asking 3DGS for a second display-camera pass.
+                args.extend([
+                    "-e", "SUPERMARKET_FAST_MUJOCO_DISPLAY=1",
+                ])
+            elif sensor_display:
                 args.extend([
                     "-e", "SUPERMARKET_DISPLAY_CAMERA_ID=0",
                 ])
@@ -606,7 +612,9 @@ class LauncherApp:
             args.extend([
                 "-e", "SUPERMARKET_RGB_CAMERAS=head",
                 "-e", "SUPERMARKET_RENDER_FPS=12",
-                "-e", "SUPERMARKET_GS_SEQUENTIAL=0",
+                # Keep 3DGS sequential in the 8 GB profile.  Batched rendering
+                # can leave the CUDA YOLO process without enough VRAM.
+                "-e", "SUPERMARKET_GS_SEQUENTIAL=1",
             ])
         seed = self._seed()
         if seed is not None:

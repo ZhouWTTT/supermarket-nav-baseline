@@ -27,7 +27,6 @@ import json
 import math
 import pathlib
 import sys
-import threading
 import time
 
 import numpy as np
@@ -276,12 +275,17 @@ PLACE_XY_TIMEOUT_FALLBACK_TOLERANCE_M = 0.040
 PLACE_DESCENT_TIMEOUT_S = 10.0
 PLACE_VERTICAL_CLEARANCE_M = 0.070
 PLACE_VERTICAL_CLEAR_TIMEOUT_S = 5.0
-# Heweidao is placed upside down with its wide rim on the table.  Once the
-# gripper is open, lift it vertically off the narrow end; moving the base at
-# the same height only drags the cup sideways while it is still between jaws.
+# Heweidao's rim is wider than the gripper's nominal opening, so measured
+# gripper feedback reaching 1.0 does not prove the cup has cleared the fingers.
+# Command a small overshoot, then withdraw the fixed arm with the chassis
+# before lifting vertically.
 HEWEIDAO_RELEASE_OPEN_MIN_S = 1.0
 HEWEIDAO_RELEASE_OPEN_TIMEOUT_S = 3.0
-HEWEIDAO_RELEASE_GRIP_OPEN_MIN = 0.85
+HEWEIDAO_RELEASE_GRIP_OPEN_MIN = 0.98
+HEWEIDAO_GRIP_OPEN_OVERSHOOT = 1.20
+HEWEIDAO_RELEASE_BASE_BACKUP_DISTANCE_M = 0.150
+HEWEIDAO_RELEASE_BASE_BACKUP_SPEED_MPS = 0.12
+HEWEIDAO_RELEASE_BASE_BACKUP_TIMEOUT_S = 5.0
 # After the tapered cup has left the fingers, lift the gripping arm's TCP
 # vertically before any retreat/recovery motion.  Moving the arm rather than
 # the common slide makes the visible sequence unambiguous and keeps the other
@@ -354,20 +358,6 @@ NAV_LASER_STALE_S = 0.50           # fail safe if the 12 Hz scan stops
 NAV_STATE_STALE_S = 0.50           # odom/joints must also remain live
 FEEDBACK_LOSS_HARD_TIMEOUT_S = 10.0
 NAV_PROGRESS_LOG_S = 3.0
-# Recording-only fault injection for GUI seed 4.  The official Server derives
-# obstacle seed 1000007 from product seed 4; its northmost corridor box centre
-# is the fixed world coordinate below.  Drive toward that real box, stop on
-# lidar contact, then mimic several unsuccessful rotation recoveries.
-DEMO_NAV_SEED4_BOX_CENTER_XY = (-1.937351, 1.280177)
-DEMO_NAV_BOX_STOP_CLEARANCE_M = 0.55
-DEMO_NAV_BOX_CENTRE_STOP_DISTANCE_M = 0.75
-DEMO_NAV_BOX_APPROACH_SPEED_MPS = 0.28
-DEMO_NAV_BOX_APPROACH_TURN_MAX_RADPS = 0.55
-DEMO_NAV_STALL_TURN_SPEED_RADPS = 0.38
-DEMO_NAV_STALL_TURN_PHASE_S = 0.80
-DEMO_NAV_STALL_TURN_PHASES = (1.0, -1.0, 1.0, -1.0)
-DEMO_NAV_STALL_LOG_PERIOD_S = 1.0
-
 # Reusable delivery trunk.  Shelf-specific and slot-specific motion remains
 # live-planned on either side of the shared navigation anchors.
 DELIVERY_TRUNK_REVERSE_START = (
@@ -682,6 +672,9 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self.place_retreat_dwell_s = place_retreat_dwell_s
         self.return_west_after_place = bool(return_west_after_place)
         self.return_start_after_place = bool(return_start_after_place)
+        self.completion_file: str | None = None
+        self.completion_order_id: str | None = None
+        self._all_orders_completion_signalled = False
         self.placement_completed = False
         self.post_delivery_warnings: list[str] = []
         self.delivery_completed_by_drop = False
@@ -741,11 +734,6 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._route_leg_replans = 0
         self._route_leg_position_tolerance = None
         self._route_leg_yaw_tolerance = None
-        self.demo_navigation_stall_enabled = False
-        self.demo_navigation_stall_triggered = False
-        self._demo_navigation_stall_started_at = None
-        self._demo_navigation_stall_turn_phase = -1
-        self._demo_navigation_stall_last_log = 0.0
         self.delivery_nav_stage = None
         self.delivery_direct_fallback_used = False
         self.scan_trunk_route_stage = None
@@ -782,6 +770,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         self._place_grip_open_since = None
         self._heweidao_release_phase = None
         self._heweidao_release_phase_started_at = 0.0
+        self._heweidao_release_base_start_xy = None
         self._place_vertical_clear_mode = None
         self._place_slide_stall_snapshot = None
         self._place_stall_warn_log = 0.0
@@ -1800,8 +1789,6 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         v, w, reached = self.nav.update(
             self.base_xy[0], self.base_xy[1], self.base_yaw,
             laser_msg=self.laser_msg, time_now=now)
-        if self._demo_navigation_stall_tick(now):
-            return False, None
         self.set_twist(v, w)
         if not self._nav_memory_logged:
             self._nav_memory_logged = True
@@ -1905,90 +1892,6 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
                 f"route_leg:{self._route_leg_name}:{failure}", now=now)
             return False, failure
         return False, None
-
-    def _demo_navigation_stall_tick(self, now: float) -> bool:
-        """Approach the seed-4 box, imitate rotation recovery, then hold."""
-        if not self.demo_navigation_stall_enabled:
-            return False
-        eligible = (
-            self.flow_phase == "nav_to_delivery"
-            and self.delivery_nav_stage != "slot_refine")
-        if not eligible and not self.demo_navigation_stall_triggered:
-            return False
-
-        box_xy = np.asarray(DEMO_NAV_SEED4_BOX_CENTER_XY, dtype=float)
-        offset = box_xy - self.base_xy
-        box_distance = float(np.linalg.norm(offset))
-        target_yaw = math.atan2(float(offset[1]), float(offset[0]))
-        yaw_error = pick.wrap_to_pi(target_yaw - float(self.base_yaw))
-        clearance = float(self.nav.controller.lidar_clearance)
-
-        if not self.demo_navigation_stall_triggered:
-            box_ahead = abs(yaw_error) <= 0.40
-            reached_box_front = (
-                (box_ahead
-                 and clearance <= DEMO_NAV_BOX_STOP_CLEARANCE_M)
-                or box_distance <= DEMO_NAV_BOX_CENTRE_STOP_DISTANCE_M)
-            if not reached_box_front:
-                if abs(yaw_error) > 0.12:
-                    linear = 0.0
-                    angular = float(np.clip(
-                        1.8 * yaw_error,
-                        -DEMO_NAV_BOX_APPROACH_TURN_MAX_RADPS,
-                        DEMO_NAV_BOX_APPROACH_TURN_MAX_RADPS))
-                    # Do not coast toward the obstacle while aligning.
-                    self.cmd_linear = 0.0
-                else:
-                    linear = DEMO_NAV_BOX_APPROACH_SPEED_MPS
-                    angular = float(np.clip(
-                        1.2 * yaw_error, -0.30, 0.30))
-                self.set_twist(linear, angular)
-                if now - self._demo_navigation_stall_last_log >= (
-                        DEMO_NAV_STALL_LOG_PERIOD_S):
-                    self._demo_navigation_stall_last_log = now
-                    self.get_logger().info(
-                        "[demo-nav-stall] approaching seed-4 obstacle box "
-                        f"distance={box_distance:.2f}m "
-                        f"yaw_error={math.degrees(yaw_error):.1f}deg "
-                        f"lidar={clearance:.2f}m")
-                return True
-
-            self.demo_navigation_stall_triggered = True
-            self._demo_navigation_stall_started_at = now
-            self._demo_navigation_stall_turn_phase = -1
-            self.get_logger().error(
-                "[demo-nav-stall] blocked by seed-4 obstacle box; starting "
-                "unsuccessful rotation recovery attempts; "
-                f"pos=({self.base_xy[0]:.3f},{self.base_xy[1]:.3f}) "
-                f"box_distance={box_distance:.3f}m lidar={clearance:.3f}m "
-                f"leg={self._route_leg_name}")
-
-        elapsed = max(
-            0.0, now - float(self._demo_navigation_stall_started_at))
-        turn_phase = int(elapsed // DEMO_NAV_STALL_TURN_PHASE_S)
-        self.cmd_linear = 0.0
-        if turn_phase < len(DEMO_NAV_STALL_TURN_PHASES):
-            turn_direction = DEMO_NAV_STALL_TURN_PHASES[turn_phase]
-            self.set_twist(
-                0.0, turn_direction * DEMO_NAV_STALL_TURN_SPEED_RADPS)
-            if turn_phase != self._demo_navigation_stall_turn_phase:
-                self._demo_navigation_stall_turn_phase = turn_phase
-                self.get_logger().warn(
-                    "[demo-nav-stall] rotation recovery attempt "
-                    f"{turn_phase + 1}/{len(DEMO_NAV_STALL_TURN_PHASES)} "
-                    f"direction={'left' if turn_direction > 0 else 'right'}")
-        else:
-            self.set_twist(0.0, 0.0)
-            self.cmd_angular = 0.0
-        if now - self._demo_navigation_stall_last_log >= (
-                DEMO_NAV_STALL_LOG_PERIOD_S):
-            self._demo_navigation_stall_last_log = now
-            self.get_logger().warn(
-                "[demo-nav-stall] obstacle recovery remains stuck at "
-                f"({self.base_xy[0]:.3f},{self.base_xy[1]:.3f}) "
-                f"phase={min(turn_phase + 1, len(DEMO_NAV_STALL_TURN_PHASES))}/"
-                f"{len(DEMO_NAV_STALL_TURN_PHASES)}")
-        return True
 
     def _is_shelf_scan_transit(self, target: np.ndarray) -> bool:
         return bool(
@@ -3930,8 +3833,8 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
     @staticmethod
     def _tcp_over_delivery_table_official(tcp: np.ndarray | None) -> bool:
         """Whether the reference point lies above the tabletop per the
-        official referee ``delivery_box`` (referee.py), which has NO inset
-        margin: x ∈ [-2.42, -1.46], y ∈ [-3.63, -3.19].
+        official referee ``delivery_box``, which has NO inset margin:
+        x ∈ [-2.42, -1.46], y ∈ [-3.63, -3.19].
 
         Z is intentionally left unconstrained because this helper is used only
         to decide whether an empty wrist must clear vertically before neutral
@@ -4497,39 +4400,91 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             f"slide={float(measured_slide):.3f}->{target_slide:.3f}")
 
     def _heweidao_place_release_tick(self, now: float) -> None:
-        """Open on the table, then lift vertically off the tapered cup."""
-        self._set_selected_grip(pick.GRIP_OPEN)
+        """Open, withdraw the fixed arm with the base, then lift vertically."""
+        self._set_selected_grip(HEWEIDAO_GRIP_OPEN_OVERSHOOT)
         if self._heweidao_release_phase is None:
             self._heweidao_release_phase = "opening"
             self._heweidao_release_phase_started_at = now
             self.get_logger().info(
                 "[place-heweidao] table support verified; opening gripper "
-                "before the slow vertical unhook")
+                "before the fixed-arm chassis backup")
             return
 
+        elapsed = now - self._heweidao_release_phase_started_at
         measured_grip = self.selected_gripper_position()
         grip_open = (
             measured_grip is not None
             and math.isfinite(float(measured_grip))
             and float(measured_grip) >= HEWEIDAO_RELEASE_GRIP_OPEN_MIN)
 
-        if self._heweidao_release_phase != "opening":
+        if self._heweidao_release_phase == "opening":
+            if elapsed < HEWEIDAO_RELEASE_OPEN_MIN_S:
+                return
+            if not grip_open and elapsed < HEWEIDAO_RELEASE_OPEN_TIMEOUT_S:
+                return
+            if not grip_open:
+                self.get_logger().warn(
+                    "[place-heweidao] gripper did not reach full-open "
+                    "feedback while stationary; starting chassis backup to "
+                    "clear the tapered shoulder "
+                    f"grip={measured_grip}")
+            measured_slide = self.joints.get("slide_joint")
+            measured_arm = self.selected_arm_positions()
+            if (measured_slide is None
+                    or not math.isfinite(float(measured_slide))
+                    or not np.all(np.isfinite(measured_arm))):
+                raise RuntimeError(
+                    "heweidao release backup lacks arm/slide feedback")
+            self.place_arm_joints = measured_arm.copy()
+            self.set_selected_arm_target(measured_arm)
+            self.des_slide = float(measured_slide)
+            self.commands_ready_since = None
+            self._heweidao_release_phase = "base_backing"
+            self._heweidao_release_phase_started_at = now
+            self._heweidao_release_base_start_xy = self.base_xy.copy()
+            self.get_logger().info(
+                "[place-heweidao] holding arm/slide fixed and backing "
+                "chassis horizontally "
+                f"distance={HEWEIDAO_RELEASE_BASE_BACKUP_DISTANCE_M:.3f}m "
+                f"start_xy={np.round(self._heweidao_release_base_start_xy, 3)} "
+                f"measured_grip={measured_grip}")
+            return
+
+        if self._heweidao_release_phase != "base_backing":
             raise RuntimeError(
                 "invalid heweidao release phase "
                 f"{self._heweidao_release_phase!r}")
-        elapsed = now - self._heweidao_release_phase_started_at
-        if elapsed < HEWEIDAO_RELEASE_OPEN_MIN_S:
-            return
-        if not grip_open:
-            if elapsed < HEWEIDAO_RELEASE_OPEN_TIMEOUT_S:
-                return
+
+        if self._heweidao_release_base_start_xy is None:
             raise RuntimeError(
-                "heweidao gripper did not open before vertical release "
-                f"(measured_grip={measured_grip})")
-        self.get_logger().info(
-            "[place-heweidao] gripper open; lifting vertically without "
-            "dragging the cup sideways")
-        self._start_place_vertical_clear(now)
+                "heweidao release backup lacks its odometry start pose")
+        moved = float(np.linalg.norm(
+            self.base_xy - self._heweidao_release_base_start_xy))
+        if moved >= HEWEIDAO_RELEASE_BASE_BACKUP_DISTANCE_M:
+            self.set_twist(0.0, 0.0)
+            self.cmd_linear = 0.0
+            self.cmd_angular = 0.0
+            if not grip_open:
+                if elapsed < HEWEIDAO_RELEASE_BASE_BACKUP_TIMEOUT_S:
+                    return
+                raise RuntimeError(
+                    "heweidao gripper did not verify full-open feedback "
+                    "after chassis backup "
+                    f"(measured_grip={measured_grip}, moved={moved:.3f}m)")
+            self.get_logger().info(
+                "[place-heweidao] chassis backup complete with arm/slide "
+                f"fixed; moved={moved:.3f}m grip={float(measured_grip):.3f}; "
+                "starting vertical clearance")
+            self._start_place_vertical_clear(now)
+            return
+        if elapsed >= HEWEIDAO_RELEASE_BASE_BACKUP_TIMEOUT_S:
+            self.set_twist(0.0, 0.0)
+            raise RuntimeError(
+                "heweidao chassis release backup did not reach "
+                f"{HEWEIDAO_RELEASE_BASE_BACKUP_DISTANCE_M:.3f}m within "
+                f"{HEWEIDAO_RELEASE_BASE_BACKUP_TIMEOUT_S:.1f}s "
+                f"(moved={moved:.3f}m, measured_grip={measured_grip})")
+        self.set_twist(-HEWEIDAO_RELEASE_BASE_BACKUP_SPEED_MPS, 0.0)
 
     def _place_vertical_clear_tick(self, now: float) -> None:
         """Complete post-release vertical clearance with the base locked."""
@@ -4541,6 +4496,13 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             # jaws unchanged while lifting so opening fingers cannot sweep the
             # box; they open only after the chassis is clear of the table.
             self._hold_grasp_during_transport()
+        elif self.target_kind == "heweidao":
+            # Maintain the full-open bias through vertical clearance.
+            self._set_selected_grip(HEWEIDAO_GRIP_OPEN_OVERSHOOT)
+            if self.grasp_arm == "l":
+                self.des_right_grip = pick.GRIP_OPEN
+            else:
+                self.des_left_grip = pick.GRIP_OPEN
         else:
             self.des_left_grip = pick.GRIP_OPEN
             self.des_right_grip = pick.GRIP_OPEN
@@ -5361,6 +5323,7 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
 
     def _start_return_to_start(self, now: float) -> None:
         """Start the final-delivery return from the table to the start pose."""
+        self._signal_all_orders_completed(now)
         self._set_flow_phase("return_to_start")
         self._nav_goal = None
         self._nav_last_log = 0.0
@@ -5370,6 +5333,47 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
             "[return-start] final delivery complete; returning to start "
             f"goal=({START_POSE[0]:.3f},{START_POSE[1]:.3f},"
             f"{math.degrees(START_POSE[2]):.0f}deg)")
+
+    def configure_all_orders_completion_signal(
+            self, order_id: str, completion_file: str | None) -> None:
+        """Configure the atomic hand-off from delivery to final return."""
+        self.completion_order_id = str(order_id)
+        self.completion_file = completion_file
+
+    def _signal_all_orders_completed(self, now: float) -> None:
+        """Persist final delivery before entering the independent return."""
+        if self._all_orders_completion_signalled:
+            return
+        if not self.completion_file:
+            # Manual single-worker runs have no supervising runner.  They
+            # still retain the same phase boundary and human-facing log, but
+            # do not need the file handshake used to disable the runner's
+            # per-order timeout.
+            self._all_orders_completion_signalled = True
+            self.get_logger().info("All order completed")
+            return
+        slot = self.target_slot()
+        document = {
+            "schema_version": 1,
+            "milestone": "all_orders_completed",
+            "status": "delivered",
+            "order_id": self.completion_order_id,
+            "kind": self.target_kind,
+            "marker_id": self.target_marker_id,
+            "slot": None if slot is None else list(slot),
+            "slot_key": self.target_slot_key(),
+            "flow_phase": "return_to_start",
+            "signalled_at_monotonic": round(float(now), 3),
+        }
+        destination = pathlib.Path(self.completion_file)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        temporary.replace(destination)
+        self._all_orders_completion_signalled = True
+        self.get_logger().info("All order completed")
 
     def _return_to_start_tick(self, now: float) -> None:
         target = np.asarray(START_POSE[:2], dtype=float)
@@ -5514,6 +5518,10 @@ class IntegratedNavPickPlace(pick.ShelfPickController):
         """
         if self.place_stage == 0:
             return not self.place_creep_done
+        if (self.place_stage == 3
+                and self.target_kind == "heweidao"
+                and self._heweidao_release_phase == "base_backing"):
+            return True
         return self.place_stage == 5
 
     def smooth_commands(self) -> None:
@@ -5941,6 +5949,9 @@ def parse_args() -> argparse.Namespace:
         "--result-file",
         help="write a machine-readable worker result for competition_runner")
     parser.add_argument(
+        "--completion-file",
+        help="atomically signal final delivery before independent return")
+    parser.add_argument(
         "--exclude-marker-id", action="append", type=int, default=[],
         help="ignore a marker already delivered or failed in this match")
     parser.add_argument(
@@ -5994,8 +6005,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device", choices=["auto", "cpu", "cuda"], default="cuda")
     parser.add_argument(
-        "--show", action="store_true", help="show the YOLO result window")
-    parser.add_argument(
         "--max-scan-cycles", type=int, default=3)
     parser.add_argument(
         "--tcp-diagnostic-ground-truth", action="store_true")
@@ -6034,10 +6043,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-nav-during-scan", action="store_true",
         help="use the parent straight-line drive_to between scan stations")
-    parser.add_argument(
-        "--demo-navigation-stall", action="store_true",
-        help="recording aid for GUI seed 4: approach a real obstacle during "
-             "loaded delivery, try alternating turns, then remain stuck")
     parser.add_argument(
         "--scan-start-west", action="store_true",
         help="scan from the westmost shelf (A) first; used for orders after "
@@ -6137,17 +6142,6 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def _cv_gui_available() -> bool:
-    """True if this OpenCV build supports HighGUI windows (GTK etc.)."""
-    try:
-        import cv2
-        cv2.namedWindow("__cv_gui_probe__")
-        cv2.destroyWindow("__cv_gui_probe__")
-        return True
-    except cv2.error:
-        return False
-
-
 def _write_result(path: str | None, document: dict) -> None:
     if not path:
         return
@@ -6176,7 +6170,6 @@ def main() -> int:
 
     rclpy.init()
     nodes = []
-    spin_thread = None
     controller = None
     caught_error = None
     executor = MultiThreadedExecutor(num_threads=4)
@@ -6194,8 +6187,8 @@ def main() -> int:
             close_recheck=not args.no_close_recheck,
             return_west_after_place=args.return_west_after_place,
             return_start_after_place=args.return_start_after_place)
-        controller.demo_navigation_stall_enabled = bool(
-            args.demo_navigation_stall)
+        controller.configure_all_orders_completion_signal(
+            args.order_id, args.completion_file)
         controller.perception_always_on = bool(args.perception_always_on)
         controller.dynamic_direct_enabled = bool(args.dynamic_direct)
         controller.configure_external_perception(args.external_perception)
@@ -6246,55 +6239,25 @@ def main() -> int:
                 "using runner-owned persistent YOLO/ArUco perception")
         else:
             yolo_node = pick.KeleDetectNode(
-                backend="yolo", pub_res_img=args.show, device=args.device,
+                backend="yolo", pub_res_img=False, device=args.device,
                 # Multi-order scans publish every detected class so the
                 # controller can select one visible pending order.
                 weights=weights,
                 target_kind=(
                     None if args.formal_mode or args.candidate_kind
                     else args.target_kind),
-                confidence=args.confidence, show=False,
+                confidence=args.confidence,
                 camera_names=("head",),
                 max_inference_hz=args.max_inference_hz)
             aruco_node = pick.ArucoDetectNode(
                 "head", marker_size=pick.MARKER_SIZE_M, publish_tf=False,
-                publish_result_image=args.show)
+                publish_result_image=False)
             controller.configure_local_perception(yolo_node, aruco_node)
             nodes[0:0] = [yolo_node, aruco_node]
-        viewer = None
-        if args.show:
-            if _cv_gui_available():
-                viewer = pick.MainThreadResultViewer(controller)
-                nodes.append(viewer)
-            else:
-                # Official client image ships an OpenCV without GTK/HighGUI;
-                # the simulation window (server side) is still available.
-                controller.get_logger().warn(
-                    "OpenCV has no GUI support; skipping the YOLO window "
-                    "(the server-side simulation window still shows motion)")
         for node in nodes:
             executor.add_node(node)
 
-        if viewer is None:
-            executor.spin()
-        else:
-            def spin_in_background():
-                try:
-                    executor.spin()
-                except ExternalShutdownException:
-                    pass
-
-            spin_thread = threading.Thread(
-                target=spin_in_background,
-                name="ros2_executor", daemon=True)
-            spin_thread.start()
-            while rclpy.ok():
-                key = viewer.show()
-                if key in (ord("q"), 27):
-                    controller.get_logger().info(
-                        "q/Esc pressed in result window; stopping")
-                    rclpy.shutdown()
-                    break
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     except Exception as exc:  # noqa: BLE001 - worker must report the failure
@@ -6371,16 +6334,11 @@ def main() -> int:
             executor.shutdown()
         except Exception:  # noqa: BLE001 - result is already persisted
             pass
-        if spin_thread is not None:
-            spin_thread.join(timeout=2.0)
         for node in nodes:
             try:
                 node.destroy_node()
             except Exception:  # noqa: BLE001 - best-effort worker cleanup
                 pass
-        if args.show:
-            import cv2
-            cv2.destroyAllWindows()
     return 0 if delivered else 2
 
 

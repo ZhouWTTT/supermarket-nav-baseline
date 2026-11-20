@@ -36,9 +36,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ready-file", required=True,
         help="runner-owned readiness sentinel written after both nodes load")
-    parser.add_argument(
-        "--publish-result-images", action="store_true",
-        help="publish annotated YOLO/ArUco images for an explicit viewer")
     args = parser.parse_args()
     if not pathlib.Path(args.weights).is_file():
         parser.error(f"weights not found: {args.weights}")
@@ -65,12 +62,11 @@ def main() -> None:
     try:
         yolo_node = pick.KeleDetectNode(
             backend="yolo",
-            pub_res_img=args.publish_result_images,
+            pub_res_img=False,
             device=args.device,
             weights=str(pathlib.Path(args.weights).resolve()),
             target_kind=None,
             confidence=args.confidence,
-            show=False,
             camera_names=("head",),
             max_inference_hz=args.max_inference_hz,
         )
@@ -78,7 +74,7 @@ def main() -> None:
             "head",
             marker_size=pick.MARKER_SIZE_M,
             publish_tf=False,
-            publish_result_image=args.publish_result_images,
+            publish_result_image=False,
         )
         # Navigation and manipulation do not consume detections.  Keeping
         # YOLO active there competes with the GPU-rendered server for most of

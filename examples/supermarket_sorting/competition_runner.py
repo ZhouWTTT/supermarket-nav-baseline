@@ -114,6 +114,9 @@ class CompetitionRunner(Node):
         self.worker_started_at: float | None = None
         self.worker_started_wall_at: str | None = None
         self.worker_result_path: Path | None = None
+        self.worker_completion_path: Path | None = None
+        self.worker_completion_checkpoint: dict | None = None
+        self.worker_return_started_at: float | None = None
         self.current_order = None
         self.worker_candidate_kinds: set[str] = set()
         self.worker_stop_reason: str | None = None
@@ -227,16 +230,24 @@ class CompetitionRunner(Node):
             self.task_started_at is not None
             and now - self.task_started_at >= self.args.match_timeout)
         if self.worker is not None:
+            self._begin_independent_return_if_ready(now)
             return_code = self.worker.poll()
             if return_code is not None:
                 self._finish_worker(return_code)
-            elif match_expired:
+            elif (match_expired
+                  and self.worker_return_started_at is None):
                 self._request_worker_stop("match_timeout")
             elif (self.worker_terminate_at is not None
                   and now - self.worker_terminate_at >= 3.0):
                 self.get_logger().error("worker ignored SIGTERM; sending SIGKILL")
                 self.worker.kill()
+            elif (self.worker_return_started_at is not None
+                  and self.args.return_timeout > 0.0
+                  and now - self.worker_return_started_at
+                  >= self.args.return_timeout):
+                self._request_worker_stop("return_timeout")
             elif (self.args.order_timeout > 0.0
+                  and self.worker_return_started_at is None
                   and self.worker_started_at is not None
                   and now - self.worker_started_at >= self.args.order_timeout):
                 self._request_worker_stop("order_timeout")
@@ -286,8 +297,12 @@ class CompetitionRunner(Node):
             f"worker_{self.spawned_workers + 1:02d}_dispatch_"
             f"{order.source_index + 1:02d}_attempt_"
             f"{order.attempts + 1}.json")
+        completion_path = result_path.with_name(
+            result_path.stem + "_completion.json")
         if result_path.exists():
             result_path.unlink()
+        if completion_path.exists():
+            completion_path.unlink()
 
         same_order_drop_retry = (
             self.immediate_retry_order_id == order.id)
@@ -311,6 +326,7 @@ class CompetitionRunner(Node):
             "--device", self.args.device,
             "--max-scan-cycles", str(self.args.max_scan_cycles),
             "--result-file", str(result_path),
+            "--completion-file", str(completion_path),
             "--formal-mode",
             "--place-slot", str(place_slot),
         ]
@@ -356,8 +372,6 @@ class CompetitionRunner(Node):
             command.append("--no-close-recheck")
         if self.args.perception_always_on:
             command.append("--perception-always-on")
-        if self.args.demo_navigation_stall:
-            command.append("--demo-navigation-stall")
         # The first physically delivered item occupies slot zero.  Keep that
         # worker alive after placement so it travels back to shelf A before
         # the next order starts — the second worker therefore begins from the
@@ -421,14 +435,15 @@ class CompetitionRunner(Node):
             self.after_first_order_started and scan_hint_x is None)
         if scan_start_west:
             command.append("--scan-start-west")
-        if self.args.show:
-            command.append("--show")
 
         self.current_order = order
         self.worker_uses_external_perception = external_perception
         self.worker_candidate_kinds = set(candidate_kinds)
         self.spawned_workers += 1
         self.worker_result_path = result_path
+        self.worker_completion_path = completion_path
+        self.worker_completion_checkpoint = None
+        self.worker_return_started_at = None
         self.worker_started_at = time.monotonic()
         self.worker_started_wall_at = self._wall_time_now()
         self.worker_stop_reason = None
@@ -475,6 +490,9 @@ class CompetitionRunner(Node):
             self.worker_started_at = None
             self.worker_started_wall_at = None
             self.worker_result_path = None
+            self.worker_completion_path = None
+            self.worker_completion_checkpoint = None
+            self.worker_return_started_at = None
             self._write_summary("worker_start_failed")
             self._publish_stop()
 
@@ -586,8 +604,6 @@ class CompetitionRunner(Node):
             "--max-inference-hz", str(self.args.inference_hz),
             "--ready-file", str(self.perception_ready_path),
         ]
-        if self.args.show:
-            command.append("--publish-result-images")
         self.perception_ready_path.unlink(missing_ok=True)
         try:
             self.perception_worker = subprocess.Popen(
@@ -621,6 +637,42 @@ class CompetitionRunner(Node):
         except (OSError, json.JSONDecodeError) as exc:
             self.get_logger().error(f"cannot read worker result: {exc}")
             return {}
+
+    def _read_completion_checkpoint(self) -> dict:
+        path = self.worker_completion_path
+        if path is None or not path.exists():
+            return {}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, json.JSONDecodeError) as exc:
+            self.get_logger().error(
+                f"cannot read all-orders completion checkpoint: {exc}")
+            return {}
+
+    def _valid_completion_checkpoint(self, document: dict) -> bool:
+        order = self.current_order
+        return bool(
+            order is not None
+            and document.get("milestone") == "all_orders_completed"
+            and document.get("status") == "delivered"
+            and document.get("order_id") == order.id
+            and document.get("kind") in self.worker_candidate_kinds)
+
+    def _begin_independent_return_if_ready(self, now: float) -> None:
+        """Stop charging the final return against the completed order."""
+        if self.worker_return_started_at is not None:
+            return
+        checkpoint = self._read_completion_checkpoint()
+        if not self._valid_completion_checkpoint(checkpoint):
+            return
+        self.worker_completion_checkpoint = checkpoint
+        self.worker_return_started_at = float(now)
+        self.get_logger().info(
+            "[return-supervisor] completion checkpoint accepted; "
+            "independent return phase started; "
+            f"timeout={self.args.return_timeout:.1f}s order timeout disabled")
+        self._write_summary("all_orders_completed")
 
     @staticmethod
     def _wall_time_now() -> str:
@@ -711,6 +763,10 @@ class CompetitionRunner(Node):
     def _finish_worker(self, return_code: int) -> None:
         self._publish_perception_enabled(False)
         result = self._read_worker_result()
+        checkpoint = (
+            self.worker_completion_checkpoint
+            or self._read_completion_checkpoint())
+        checkpoint_delivered = self._valid_completion_checkpoint(checkpoint)
         drop_event = result.get("drop_event")
         if isinstance(drop_event, dict):
             self.get_logger().info(
@@ -718,16 +774,18 @@ class CompetitionRunner(Node):
                 + json.dumps(
                     drop_event, ensure_ascii=False, separators=(",", ":")))
         dispatch_order = self.current_order
-        order, reported_kind_valid = self._resolve_worker_order(result)
+        order_document = checkpoint if checkpoint_delivered else result
+        order, reported_kind_valid = self._resolve_worker_order(order_document)
         reported_delivered = (
-            return_code == 0
-            and result.get("status") == "delivered")
+            checkpoint_delivered
+            or (return_code == 0 and result.get("status") == "delivered"))
         delivered = bool(
             reported_delivered and reported_kind_valid and order is not None)
-        marker_id = result.get("marker_id")
+        marker_id = result.get(
+            "marker_id", checkpoint.get("marker_id"))
         if not isinstance(marker_id, int):
             marker_id = None
-        result_slot = result.get("slot")
+        result_slot = result.get("slot", checkpoint.get("slot"))
         if (not isinstance(result_slot, list)
                 or len(result_slot) != 3
                 or not all(isinstance(value, str) for value in result_slot)):
@@ -844,6 +902,9 @@ class CompetitionRunner(Node):
         self.worker_started_at = None
         self.worker_started_wall_at = None
         self.worker_result_path = None
+        self.worker_completion_path = None
+        self.worker_completion_checkpoint = None
+        self.worker_return_started_at = None
         self.current_order = None
         self.worker_uses_external_perception = False
         self.worker_candidate_kinds.clear()
@@ -948,6 +1009,27 @@ class CompetitionRunner(Node):
             f"{summary.get('count', 0)} failed={summary.get('failed', 0)} "
             f"elapsed={elapsed:.3f}s target={self.args.target_time:.1f}s "
             f"within_target={int(elapsed <= self.args.target_time)}")
+        if self.task is not None:
+            self.get_logger().info(
+                f"[order-final-summary] count={len(self.task.orders)}")
+            for order in self.task.orders:
+                order_summary = {
+                    "order_id": order.id,
+                    "kind": order.kind,
+                    "status": order.status,
+                    "attempts": order.attempts,
+                    # Sum only time spent by workers assigned to this order;
+                    # exclude time between retries while other orders run.
+                    "elapsed_s": round(
+                        self.order_active_elapsed_s.get(order.id, 0.0), 3),
+                    "failure_reasons": list(order.errors),
+                }
+                self.get_logger().info(
+                    "[order-final] "
+                    + json.dumps(
+                        order_summary,
+                        ensure_ascii=False,
+                        separators=(",", ":")))
 
     def _publish_stop(self) -> None:
         try:
@@ -1148,19 +1230,18 @@ def parse_args() -> argparse.Namespace:
         help="keep persistent or worker-local perception enabled throughout "
              "the match")
     parser.add_argument(
-        "--demo-navigation-stall", action="store_true",
-        help="recording aid for GUI seed 4: make loaded delivery workers "
-             "rotate and remain stuck at a real obstacle")
-    parser.add_argument(
         "--order-timeout", type=float, default=300.0,
         help="per-order timeout in seconds; 0 disables it (default: 300)")
+    parser.add_argument(
+        "--return-timeout", type=float, default=180.0,
+        help="independent return-to-start timeout after all orders are "
+             "physically delivered; 0 disables it (default: 180)")
     parser.add_argument("--match-timeout", type=float, default=570.0)
     parser.add_argument(
         "--target-time", type=float, default=400.0,
         help="performance target reported in summaries; does not stop motion")
     parser.add_argument("--runtime-dir", default="/tmp/supermarket_competition")
     parser.add_argument("--summary-file")
-    parser.add_argument("--show", action="store_true")
     args = parser.parse_args()
     if not Path(args.worker).is_file():
         parser.error(f"worker not found: {args.worker}")
@@ -1183,6 +1264,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("scan cycles, attempts, and confirmations must be >= 1")
     if args.order_timeout < 0.0:
         parser.error("--order-timeout must be >= 0")
+    if args.return_timeout < 0.0:
+        parser.error("--return-timeout must be >= 0")
     if args.match_timeout <= 0.0:
         parser.error("--match-timeout must be positive")
     if args.target_time <= 0.0:

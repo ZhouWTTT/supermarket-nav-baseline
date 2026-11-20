@@ -29,6 +29,7 @@ runner=(
     --inference-hz "${SUPERMARKET_INFERENCE_HZ:-8}"
     --device "${SUPERMARKET_DEVICE:-cuda}"
     --order-timeout "${SUPERMARKET_ORDER_TIMEOUT:-300}"
+    --return-timeout "${SUPERMARKET_RETURN_TIMEOUT:-180}"
     --match-timeout "${SUPERMARKET_MATCH_TIMEOUT:-3600}"
     --target-time "${SUPERMARKET_TARGET_TIME:-400}"
 )
@@ -51,10 +52,6 @@ if [ "${SUPERMARKET_CLOSE_RECHECK:-1}" = "1" ]; then
     runner+=(--close-recheck)
 else
     runner+=(--no-close-recheck)
-fi
-
-if [ "${SUPERMARKET_SHOW:-0}" = "1" ]; then
-    runner+=(--show)
 fi
 
 exec "${runner[@]}"

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """正式行走录入 + 记忆矩阵直达的连续多单超市分拣客户端。
 
-这是当前唯一的 GUI 多单客户端入口，在抓取订单前增加"逐架行走录入"阶段：
+这是一个可在终端命令行直接运行的多单客户端入口，在抓取订单前增加
+"逐架行走录入"阶段：
 
     阶段一（--record-first，默认开启）：
         完全按照正式版的行走流程：导航器逐架走到每个货架前的标准扫描站点
@@ -1328,17 +1329,6 @@ class ContinuousOrderController(IntegratedNavPickPlace):
             self.last_status_log = self.now()
 
 
-def _cv_gui_available() -> bool:
-    """True if this OpenCV build supports HighGUI windows (GTK etc.)."""
-    try:
-        import cv2
-        cv2.namedWindow("__cv_gui_probe__")
-        cv2.destroyWindow("__cv_gui_probe__")
-        return True
-    except cv2.error:
-        return False
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="continuous multi-order supermarket sorting client "
@@ -1362,8 +1352,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-inference-hz", type=float, default=8.0,
         help="maximum YOLO source-frame rate (default: 8 Hz)")
-    parser.add_argument("--show", action="store_true",
-                        help="show the YOLO result window")
     parser.add_argument("--max-scan-cycles", type=int, default=3)
     parser.add_argument("--tcp-diagnostic-ground-truth", action="store_true")
     parser.add_argument("--scan-skip-lower", action="store_true")
@@ -1450,19 +1438,18 @@ def main() -> None:
     nodes = []
     spin_thread = None
     controller = None
-    viewer = None
     try:
         # 一个 YOLO 节点发布全部货物类别，各订单控制器按自身 target_kind 过滤，
         # 避免每单重载模型。
         yolo_node = pick.KeleDetectNode(
-            backend="yolo", pub_res_img=True, device=args.device,
+            backend="yolo", pub_res_img=False, device=args.device,
             weights=weights, target_kind=None,
-            confidence=args.confidence, show=False,
+            confidence=args.confidence,
             camera_names=("head",),
             max_inference_hz=args.max_inference_hz)
         aruco_node = pick.ArucoDetectNode(
             "head", marker_size=pick.MARKER_SIZE_M, publish_tf=False,
-            publish_result_image=True)
+            publish_result_image=False)
         matrix_tracker = MemoryMatrixTracker(
             confirmations=args.matrix_confirmations)
         nodes += [yolo_node, aruco_node, matrix_tracker]
@@ -1703,7 +1690,7 @@ def main() -> None:
         def start_order(
                 kind: str, index: int, place_slot: int,
                 exclude_marker_ids=None, exclude_slots=None):
-            nonlocal controller, viewer
+            nonlocal controller
             ctrl = make_controller(
                 kind, index, place_slot,
                 exclude_marker_ids=exclude_marker_ids,
@@ -1711,8 +1698,6 @@ def main() -> None:
             executor.add_node(ctrl)
             nodes.append(ctrl)
             controller = ctrl
-            if viewer is not None:
-                viewer.controller = ctrl
             ctrl.get_logger().info(
                 f"[orders] START dispatch {index + 1}/{len(orders)}: {kind}; "
                 f"place_slot={place_slot + 1}/"
@@ -1767,17 +1752,6 @@ def main() -> None:
 
         start_next_order()
 
-        if args.show:
-            if _cv_gui_available():
-                viewer = pick.MainThreadResultViewer(controller)
-                executor.add_node(viewer)
-                nodes.append(viewer)
-            else:
-                # 官方 client 镜像的 OpenCV 无窗口支持，仿真窗口仍在 server 侧。
-                controller.get_logger().warn(
-                    "OpenCV has no GUI support; skipping the YOLO window "
-                    "(the server-side simulation window still shows motion)")
-
         controller.get_logger().info(
             f"[orders] 本批订单({len(orders)}单): " + " -> ".join(orders) +
             f"  seed={args.seed}")
@@ -1787,13 +1761,6 @@ def main() -> None:
         last_memory_reroute_check = 0.0
 
         while rclpy.ok():
-            if viewer is not None:
-                key = viewer.show()
-                if key in (ord("q"), 27):
-                    controller.get_logger().info(
-                        "q/Esc pressed in result window; stopping")
-                    rclpy.shutdown()
-                    break
             if controller is None:
                 time.sleep(0.02)
                 continue
@@ -2005,9 +1972,6 @@ def main() -> None:
                 node.destroy_node()
             except Exception:  # noqa: BLE001 - best-effort cleanup
                 pass
-        if args.show:
-            import cv2
-            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ The simulator server must already be running.  Example from the repo root::
 
     source /opt/ros/humble/setup.bash
     python3 examples/supermarket_sorting/yolo_aruco_shelf_pick.py \
-        --target-kind maidong --weights best.pt --show
+        --target-kind maidong --weights best.pt
 
 This example intentionally stops after removing the item from the shelf; it
 does not navigate to the delivery table.
@@ -45,13 +45,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 import rclpy
-from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation
-from sensor_msgs.msg import Image, JointState
+from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray, String
 
 
@@ -8390,96 +8389,6 @@ class ShelfPickController(Node):
             self.last_status_log = self.now()
 
 
-class MainThreadResultViewer(Node):
-    """Receive annotated YOLO images; render them only from the main thread.
-
-    Calling OpenCV HighGUI from a MultiThreadedExecutor callback can freeze the
-    GTK window and, more importantly, block all subsequent YOLO callbacks.  The
-    subscription callback therefore only stores the newest frame.  ``show`` is
-    invoked by ``main`` on Python's main thread.
-    """
-
-    WINDOW_NAME = "YOLO goods + shelf-pick status"
-
-    def __init__(self, controller: ShelfPickController):
-        super().__init__("yolo_shelf_pick_result_viewer")
-        self.controller = controller
-        self.bridge = CvBridge()
-        self.frame_lock = threading.Lock()
-        self.latest_frame = None
-        self.latest_frame_camera = "unknown"
-        self.latest_aruco = []
-        self.create_subscription(
-            Image, "/kele/result_image", self.image_cb, 5)
-        self.create_subscription(
-            String, "/aruco/head/detections", self.aruco_cb, 10)
-
-    def image_cb(self, message: Image) -> None:
-        frame = self.bridge.imgmsg_to_cv2(message, desired_encoding="bgr8")
-        frame_id = message.header.frame_id.lower()
-        camera_name = next(
-            (name for name in ("head", "left", "right")
-             if name in frame_id),
-            "unknown")
-        with self.frame_lock:
-            self.latest_frame = frame.copy()
-            self.latest_frame_camera = camera_name
-
-    def aruco_cb(self, message: String) -> None:
-        records = decode_list(message)
-        with self.frame_lock:
-            self.latest_aruco = records
-
-    def show(self) -> int:
-        with self.frame_lock:
-            frame = (None if self.latest_frame is None
-                     else self.latest_frame.copy())
-            frame_camera = self.latest_frame_camera
-            aruco_records = list(self.latest_aruco)
-        if frame is None:
-            # HighGUI still needs event pumping before the first ROS frame.
-            return cv2.waitKey(20) & 0xFF
-
-        target_marker = self.controller.target_marker_id
-        show_head_aruco = (
-            frame_camera == "head"
-            or frame_camera == "unknown")
-        for record in aruco_records if show_head_aruco else ():
-            try:
-                marker_id = int(record["id"])
-                corners = np.rint(np.asarray(
-                    record["corners"], dtype=float)).astype(np.int32).reshape(4, 2)
-            except (KeyError, TypeError, ValueError):
-                continue
-            color = ((0, 255, 255) if marker_id == target_marker
-                     else (255, 0, 255))
-            cv2.polylines(
-                frame, [corners.reshape(-1, 1, 2)], True,
-                color, 3, cv2.LINE_AA)
-            label_x = max(0, int(corners[:, 0].min()))
-            label_y = max(18, int(corners[:, 1].min()) - 7)
-            cv2.putText(
-                frame, f"ArUco ID={marker_id}", (label_x, label_y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2, cv2.LINE_AA)
-
-        marker = "none" if target_marker is None else str(target_marker)
-        grasp_profile = self.controller.grasp_profile_name()
-        status = (f"state={self.controller.state}  "
-                  f"view={frame_camera}  "
-                  f"target={self.controller.target_kind}  "
-                  f"profile={grasp_profile}  "
-                  f"lower_aruco={marker}")
-        text_y = frame.shape[0] - 10
-        cv2.rectangle(
-            frame, (0, frame.shape[0] - 34),
-            (frame.shape[1] - 1, frame.shape[0] - 1), (20, 20, 20), -1)
-        cv2.putText(
-            frame, status, (8, text_y), cv2.FONT_HERSHEY_SIMPLEX,
-            0.58, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.imshow(self.WINDOW_NAME, frame)
-        return cv2.waitKey(20) & 0xFF
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="YOLO coarse search + lower-ArUco localisation + shelf pick")
@@ -8498,8 +8407,6 @@ def parse_args():
     parser.add_argument(
         "--max-inference-hz", type=float, default=8.0,
         help="maximum YOLO source-frame rate (default: 8 Hz)")
-    parser.add_argument(
-        "--show", action="store_true", help="show the YOLO result window")
     parser.add_argument(
         "--max-scan-cycles", type=int, default=3,
         help="abort after this many complete shelf scans (default: 3)")
@@ -8537,16 +8444,12 @@ def main() -> None:
 
     rclpy.init()
     nodes = []
-    spin_thread = None
     executor = MultiThreadedExecutor(num_threads=4)
     try:
-        # Never call HighGUI from KeleDetectNode's executor callback.  When
-        # --show is requested, MainThreadResultViewer handles the same
-        # /kele/result_image stream from the process main thread instead.
         yolo_node = KeleDetectNode(
             backend="yolo", pub_res_img=True, device=args.device,
             weights=weights, target_kind=args.target_kind,
-            confidence=args.confidence, show=False,
+            confidence=args.confidence,
             camera_names=("head",),
             max_inference_hz=args.max_inference_hz)
         aruco_node = ArucoDetectNode(
@@ -8557,45 +8460,18 @@ def main() -> None:
             args.tcp_diagnostic_ground_truth, args.scan_skip_lower,
             close_recheck=not args.no_close_recheck)
         nodes = [yolo_node, aruco_node, controller]
-        viewer = None
-        if args.show:
-            viewer = MainThreadResultViewer(controller)
-            nodes.append(viewer)
         for node in nodes:
             executor.add_node(node)
 
-        if viewer is None:
-            executor.spin()
-        else:
-            def spin_in_background():
-                try:
-                    executor.spin()
-                except ExternalShutdownException:
-                    pass
-
-            spin_thread = threading.Thread(
-                target=spin_in_background,
-                name="ros2_executor", daemon=True)
-            spin_thread.start()
-            while rclpy.ok():
-                key = viewer.show()
-                if key in (ord("q"), 27):
-                    controller.get_logger().info(
-                        "q/Esc pressed in result window; stopping")
-                    rclpy.shutdown()
-                    break
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         if rclpy.ok():
             rclpy.shutdown()
         executor.shutdown()
-        if spin_thread is not None:
-            spin_thread.join(timeout=2.0)
         for node in nodes:
             node.destroy_node()
-        if args.show:
-            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

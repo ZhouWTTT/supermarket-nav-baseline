@@ -222,12 +222,11 @@ def foreground_depth_estimate(depth_img, bbox_xyxy, K, T_cam_world):
 
 class KeleDetectNode(Node):
     def __init__(self, backend="blob", pub_res_img=True, device="cuda",
-                 weights=None, target_kind=None, confidence=0.90, show=False,
+                 weights=None, target_kind=None, confidence=0.90,
                  camera_names=("head",), max_inference_hz=8.0):
         super().__init__("kele_detect")
         self.bridge = CvBridge()
         self.pub_res_img = pub_res_img
-        self.show = bool(show)
         self.camera_names = tuple(dict.fromkeys(camera_names))
         unknown = set(self.camera_names) - set(CAMERAS)
         if unknown or not self.camera_names:
@@ -553,9 +552,6 @@ class KeleDetectNode(Node):
             image_msg = self.bridge.cv2_to_imgmsg(vis, "bgr8")
             image_msg.header = msg.header
             self.img_pub.publish(image_msg)
-            if self.show:
-                cv2.imshow(f"YOLO product detections: {camera_name}", vis)
-                cv2.waitKey(1)
 
     def publish_detections(self, recs, stamp):
         msg = Detection3DArray()
@@ -592,8 +588,6 @@ def main():
                         help="publish only this checkpoint class name")
     parser.add_argument("--confidence", type=float, default=0.90,
                         help="minimum YOLO confidence (default: 0.90)")
-    parser.add_argument("--show", action="store_true",
-                        help="show a live window containing YOLO boxes")
     parser.add_argument("--cameras", nargs="+", choices=CAMERAS,
                         default=["head"],
                         help="RGB cameras used by the shared YOLO model")
@@ -606,7 +600,7 @@ def main():
     node = KeleDetectNode(backend=args.backend, pub_res_img=not args.no_result_image,
                           device=args.device, weights=args.weights,
                           target_kind=args.target_kind,
-                          confidence=args.confidence, show=args.show,
+                          confidence=args.confidence,
                           camera_names=args.cameras,
                           max_inference_hz=args.max_inference_hz)
     try:
@@ -615,8 +609,6 @@ def main():
         pass
     finally:
         node.destroy_node()
-        if args.show:
-            cv2.destroyAllWindows()
         rclpy.shutdown()
 
 

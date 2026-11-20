@@ -1481,7 +1481,7 @@ class NavigationController:
         desired = self._recovery_heading_target(bx, by, byaw)
         desired_delta = angdist(byaw, desired)
         desired_delta = max(
-            -math.radians(60.0),
+            -math.radians(90.0),
             min(math.radians(60.0), desired_delta))
         if abs(desired_delta) <= self._rotate_recovery_tolerance:
             if not self._in_obstacle_corridor(bx, by):
@@ -1506,8 +1506,8 @@ class NavigationController:
         candidate_deltas = []
         for delta in raw_candidates:
             delta = max(
-                -math.radians(60.0),
-                min(math.radians(60.0), delta))
+                -math.radians(90.0),
+                min(math.radians(90.0), delta))
             if (abs(delta) <= self._rotate_recovery_tolerance
                     or any(abs(angdist(existing, delta)) < 1e-6
                            for existing in candidate_deltas)):
